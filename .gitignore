@@ -1,0 +1,17 @@
+# 本地个人配置（站点清单不公开）
+domains.txt
+
+# 运行产物
+backup/
+last-report.txt
+result.csv
+*.bak
+
+# 第三方二进制（GPL-3.0，不随本仓库分发）
+cfst/
+cfst.exe
+CloudflareST.exe
+
+# 编辑器
+.vscode/
+.idea/

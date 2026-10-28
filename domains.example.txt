@@ -1,0 +1,18 @@
+# 域名列表示例
+#
+# 用法：把本文件复制为 domains.txt，然后填入你自己的域名（一行一个）。
+#
+#   copy domains.example.txt domains.txt
+#
+# 只填确认由 Cloudflare 代理的域名。检测方法：
+#
+#   curl -sI https://example.com | findstr /i "server:"
+#
+# 返回 "server: cloudflare" 才适合加入本列表。不是 CF 的站点填进来会被
+# "逐域名验证" 自动跳过，不会写坏，但也没有优化效果。
+#
+# 子域名是否也由 CF 代理需要单独确认；如果 www 和裸域都在用，建议都填。
+#
+# 示例（取消注释后使用）：
+# example.com
+# www.example.com

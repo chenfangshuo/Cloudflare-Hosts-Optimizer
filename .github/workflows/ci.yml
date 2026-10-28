@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'pt-cf-optimize.ps1'), [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error ("{0} line {1}: {2}" -f $_.ErrorId, $_.Extent.StartLineNumber, $_.Message) }
+            exit 1
+          }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          if ($issues) {
+            $issues | Format-Table -AutoSize
+            exit 1
+          }
+
+      - name: Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          $result = Invoke-Pester -Path ./tests -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
