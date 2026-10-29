@@ -441,6 +441,23 @@ function Write-ColoCache {
     }
 }
 
+function Get-CachableColos {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Candidates,
+        [int]$MinCount = 2,
+        [int]$Max = 6
+    )
+    # 只缓存有一定样本量的区域：稀有区域常常下一次就消失，
+    # 会让覆盖检查永远失败、缓存彻底失去意义
+    return @($Candidates | Where-Object { $_.Colo } |
+        Group-Object Colo |
+        Where-Object { $_.Count -ge $MinCount } |
+        Sort-Object @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } |
+        Select-Object -First $Max |
+        ForEach-Object { $_.Name })
+}
+
 function Test-ColoCoverage {
     [CmdletBinding()]
     param(

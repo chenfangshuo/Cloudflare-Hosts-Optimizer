@@ -404,9 +404,10 @@ function Invoke-Main {
 
     # 只有完整探测过一轮、且池子足够大才写缓存（提前结束时看到的是子集，写回会越缩越小；
     # 小池子本来就很快，缓存反而会把它覆盖成更窄的区域集合）。
-    # 只记录真正参与抽样决策的区域，避免个别稀有区域让下次的覆盖检查永远失败
+    # 只记录抽样里出现 ≥2 次的区域（最多 6 个）：稀有区域下次经常消失，
+    # 留着它会让覆盖检查永远失败，缓存等于没有
     if ($useCache -and $pool.Count -eq $probeTarget -and $probeTarget -ge 64) {
-        $observed = @($candidates | Where-Object { $_.Colo } | ForEach-Object { $_.Colo } | Select-Object -Unique)
+        $observed = @(Get-CachableColos -Candidates $candidates)
         if ($observed.Count -gt 0 -and -not (Write-ColoCache -Path $cacheFile -Colos $observed)) {
             Say "警告：机房缓存写入失败（$cacheFile），不影响本次结果。" 'Yellow'
         }

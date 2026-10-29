@@ -414,6 +414,24 @@ Describe '机房缓存' {
         Test-ColoCoverage -Rows $rows -Colos @('') | Should -BeFalse
     }
 
+    It '只缓存有样本量的区域，并限制数量' {
+        $c = @(
+            [pscustomobject]@{ Colo = 'SJC' }
+            [pscustomobject]@{ Colo = 'SJC' }
+            [pscustomobject]@{ Colo = 'SJC' }
+            [pscustomobject]@{ Colo = 'FRA' }   # 只出现一次 → 不缓存
+            [pscustomobject]@{ Colo = '' }      # 未识别 → 不缓存
+            [pscustomobject]@{ Colo = 'LAX' }
+            [pscustomobject]@{ Colo = 'LAX' }
+            [pscustomobject]@{ Colo = 'HKG' }
+            [pscustomobject]@{ Colo = 'HKG' }
+        )
+        Get-CachableColos -Candidates $c | Should -Be @('SJC', 'HKG', 'LAX')
+        Get-CachableColos -Candidates $c -Max 2 | Should -Be @('SJC', 'HKG')
+        Get-CachableColos -Candidates $c -MinCount 3 | Should -Be @('SJC')
+        Get-CachableColos -Candidates @() | Should -BeNullOrEmpty
+    }
+
     It '默认缓存路径在本地应用数据目录' {
         (Get-ColoCacheDefaultPath -Root $TestDrive) | Should -Match 'colo-cache\.json$'
     }
