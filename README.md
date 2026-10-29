@@ -54,6 +54,39 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 第一次运行约 **8–15 分钟**。`探测候选落地区域（256 个）` 本身就要几分钟，现在每 32 个
 会打印一次 `已探测 x/256`，不会看起来像卡死。各阶段耗时见[运行时间](#大概要跑多久)。
 
+## 准备域名
+
+`domains.txt` 每行一个域名，`#` 开头为注释；已加入 `.gitignore`，站点清单不会进入版本库。
+可以手动填写，也可以从下面这些来源导入：
+
+| 来源 | 命令 |
+| --- | --- |
+| PT-Depiler 备份（推荐） | `.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip'` |
+| Windows 代理旁路 | `.\Import-Domains.ps1 -Source ProxyBypass` |
+| 文本 | `.\Import-Domains.ps1 -Source Text -Path .\sites.txt` |
+| 剪贴板 | `.\Import-Domains.ps1 -Source Clipboard` |
+
+导入器不访问网络、不登录；PT-Depiler 备份只打开 `metadata.json`，**绝不读取**
+`cookies.json`、`userInfo.json`、`downloadHistory.json`。各来源的参数和注意事项见
+[docs/importing.md](docs/importing.md)。
+
+### 检查并合并（重要）
+
+导入默认只写 `domains.imported.txt`，**不会覆盖 `domains.txt`**。先打开这个文件逐行检查：
+
+- 只保留确认由 Cloudflare 代理的站点；
+- 代理旁路列表可能混有非 PT 域名（test-ipv6、Steam 等）；
+- 不确定的域名先留在列表里跑 `-DryRun`，看它是否被逐站验证跳过。
+
+确认后再合并：
+
+```powershell
+# 先备份、幂等、不会重复；不覆盖原有内容
+.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip' -Merge
+```
+
+也可以手工把需要的行复制进 `domains.txt`。**不要**把整份备份或整个旁路列表直接合并进去。
+
 ## 运行效果
 
 域名和部分数字已替换为示例；实际输出会多出扫描和测速的表格。
@@ -97,39 +130,6 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 5. 只有快 ≥15%（`-MinImprovementPct`）且 ≥30ms（`-MinImprovementMs`），或基线不可用/类别更差才切换。
 
 为什么这么设计、1034 回退、IPv6 取舍等，见 [docs/how-it-works.md](docs/how-it-works.md)。
-
-## 准备域名
-
-`domains.txt` 每行一个域名，`#` 开头为注释；已加入 `.gitignore`，站点清单不会进入版本库。
-可以手动填写，也可以从下面这些来源导入：
-
-| 来源 | 命令 |
-| --- | --- |
-| PT-Depiler 备份（推荐） | `.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip'` |
-| Windows 代理旁路 | `.\Import-Domains.ps1 -Source ProxyBypass` |
-| 文本 | `.\Import-Domains.ps1 -Source Text -Path .\sites.txt` |
-| 剪贴板 | `.\Import-Domains.ps1 -Source Clipboard` |
-
-导入器不访问网络、不登录；PT-Depiler 备份只打开 `metadata.json`，**绝不读取**
-`cookies.json`、`userInfo.json`、`downloadHistory.json`。各来源的参数和注意事项见
-[docs/importing.md](docs/importing.md)。
-
-### 检查并合并（重要）
-
-导入默认只写 `domains.imported.txt`，**不会覆盖 `domains.txt`**。先打开这个文件逐行检查：
-
-- 只保留确认由 Cloudflare 代理的站点；
-- 代理旁路列表可能混有非 PT 域名（test-ipv6、Steam 等）；
-- 不确定的域名先留在列表里跑 `-DryRun`，看它是否被逐站验证跳过。
-
-确认后再合并：
-
-```powershell
-# 先备份、幂等、不会重复；不覆盖原有内容
-.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip' -Merge
-```
-
-也可以手工把需要的行复制进 `domains.txt`。**不要**把整份备份或整个旁路列表直接合并进去。
 
 ## 大概要跑多久
 
