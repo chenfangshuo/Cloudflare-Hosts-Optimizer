@@ -18,21 +18,28 @@ git status --short
 pwsh -NoProfile -File .\scripts\Package-Release.ps1 -Version 0.3.5
 ```
 
-4. 打 tag 并推送：
+4. 打 tag 并推送。配置了 SSH 签名（`tag.gpgsign=true`）时，`git tag -a` 会自动签名：
 
 ```powershell
 git tag -a v0.3.5 -m "v0.3.5"
 git push origin v0.3.5
 ```
 
-5. 创建 GitHub Release，附上 zip 和 `.sha256`：
+本地验证签名（需要 `gpg.ssh.allowedSignersFile`）：
+
+```powershell
+git tag -v v0.3.5
+```
+
+5. 创建 GitHub Release，附上 zip 和 `.sha256`。发布说明放在仓库外（例如
+`release-notes-0.3.5.md`），不要把每次的说明文件提交进仓库：
 
 ```powershell
 gh release create v0.3.5 `
   .\dist\pt-cf-optimize-0.3.5.zip `
   .\dist\pt-cf-optimize-0.3.5.zip.sha256 `
   --title "v0.3.5" `
-  --notes-file .\docs\release-notes-0.3.5.md
+  --notes-file .\release-notes-0.3.5.md
 ```
 
 6. 检查 Actions 和 Release 页面；下载 zip 核对 SHA256：
