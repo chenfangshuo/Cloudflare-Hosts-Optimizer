@@ -101,8 +101,7 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 ## 准备域名
 
 `domains.txt` 每行一个域名，`#` 开头为注释；已加入 `.gitignore`，站点清单不会进入版本库。
-
-除了手工填写，也可以从这些来源导入：
+可以手动填写，也可以从下面这些来源导入：
 
 | 来源 | 命令 |
 | --- | --- |
@@ -115,7 +114,7 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 `cookies.json`、`userInfo.json`、`downloadHistory.json`。各来源的参数和注意事项见
 [docs/importing.md](docs/importing.md)。
 
-## 检查并合并（重要）
+### 检查并合并（重要）
 
 导入默认只写 `domains.imported.txt`，**不会覆盖 `domains.txt`**。先打开这个文件逐行检查：
 
