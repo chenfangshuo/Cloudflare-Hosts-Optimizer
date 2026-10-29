@@ -138,6 +138,7 @@ Do not merge an entire backup or bypass list without reviewing it.
 | --- | --- | --- |
 | CFST latency/loss scan | 1–3 min | `-NoCfst` built-in scan is faster but has less coverage |
 | Probe 256 candidate colos | 2–6 min | 6s timeout, 16 parallel; progress every 32 |
+| ↳ with a cache younger than 14 days | about 1 min | Stops early once last run's colos are covered; falls back to a full probe when stale or the colos changed |
 | Throughput quick test + final | 1–3 min | about 70MB of downloads |
 | Per-domain validation and re-check | 1–3 min | ~6–10 HEADs per domain, 400ms apart |
 
@@ -183,12 +184,14 @@ for latency/loss only; its download test is not used.
 | `-DryRun` | | Scan and verify only; do not modify hosts |
 | `-Plan` / `-PlanPath` | `.\plan.json` | Emit a JSON plan without modifying hosts |
 | `-Rollback` | | Restore hosts from the latest backup |
+| `-RollbackFrom` | latest | With `-Rollback`, restore a specific `hosts-*.bak` |
 | `-Prune` | | Remove managed entries no longer in the domain list |
 | `-NoCfst` | | Force the built-in scanner |
 | `-TopN` | 1 | Maximum IPs written per domain |
 | `-MinImprovementPct` | 15 | Minimum percentage improvement to switch |
 | `-MinImprovementMs` | 30 | Minimum absolute improvement (ms) to switch |
 | `-MaxDomainProbes` | 6 | Hard cap on candidate probes per domain |
+| `-NoColoCache` | | Ignore the colo cache and probe every candidate |
 | `-CfstPath` | auto | Path to `cfst.exe` (file or folder) |
 
 Full parameter list: [docs/parameters.md](docs/parameters.md).
@@ -201,7 +204,8 @@ Full parameter list: [docs/parameters.md](docs/parameters.md).
 - Failed domains keep their previous mapping; only explicit 1034/1003 drops it. Entries not
   in the current list are kept unless `-Prune` is used.
 - Writes use a mutex, a pre-commit hash check, a backup manifest, atomic replace and
-  read-back verification. `-Rollback` restores the latest backup.
+  read-back verification. `-Rollback` restores the latest backup; `-RollbackFrom` goes back
+  to an earlier one.
 
 Full rules: [docs/hosts-safety.md](docs/hosts-safety.md).
 

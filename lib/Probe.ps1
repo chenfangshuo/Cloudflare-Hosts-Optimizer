@@ -380,19 +380,103 @@ function Invoke-BuiltinLatencyScan {
     return @($probe | Where-Object { $_ -and $_.Ttfb -gt 0 -and $_.Loss -le 0.05 } | Sort-Object Ttfb)
 }
 
+function Get-ColoCacheDefaultPath {
+    [CmdletBinding()]
+    param([string]$Root)
+    # 缓存是运行产物，优先放在用户本地目录，避免脚本目录只读或位于同步盘
+    $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ($local) { return (Join-Path $local 'pt-cf-optimize\colo-cache.json') }
+    $fallback = if ($Root) { $Root } else { $PSScriptRoot }
+    return (Join-Path $fallback 'colo-cache.json')
+}
+
+function Read-ColoCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$MaxAgeDays = 14,
+        [datetime]$Now = (Get-Date)
+    )
+    # 任何异常都当成"没有缓存"：缓存只是加速，不能影响主流程
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $doc = Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json
+        if ([int]$doc.version -ne 1) { return $null }
+        $cols = @($doc.colos | Where-Object { $_ -match '^[A-Z]{3}$' } | Select-Object -Unique)
+        if ($cols.Count -eq 0) { return $null }
+        $updated = [datetime]::Parse([string]$doc.updatedAt, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        if (($Now.ToUniversalTime() - $updated.ToUniversalTime()).TotalDays -gt $MaxAgeDays) { return $null }
+        return [pscustomobject]@{ Colos = $cols; UpdatedAt = $updated }
+    } catch {
+        return $null
+    }
+}
+
+function Write-ColoCache {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$Colos
+    )
+    try {
+        $cols = @($Colos | Where-Object { $_ -match '^[A-Z]{3}$' } | Select-Object -Unique | Sort-Object)
+        if ($cols.Count -eq 0) { return $false }
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        }
+        $doc = [pscustomobject]@{
+            version   = 1
+            updatedAt = (Get-Date).ToUniversalTime().ToString('o')
+            colos     = $cols
+        }
+        $tmp = "$Path.tmp"
+        $doc | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmp -Encoding utf8
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        return $true
+    } catch {
+        # 缓存写不进去不影响本次结果
+        return $false
+    }
+}
+
+function Test-ColoCoverage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Rows,
+        [string[]]$Colos,
+        [int]$MinPerColo = 2
+    )
+    # 只有每个缓存区域都重新出现且数量够用，才允许提前结束探测
+    $list = @($Colos | Where-Object { $_ })
+    if ($list.Count -eq 0) { return $false }
+    foreach ($c in $list) {
+        $n = @($Rows | Where-Object { $_.Colo -eq $c }).Count
+        if ($n -lt $MinPerColo) { return $false }
+    }
+    return $true
+}
+
 function Resolve-Colo {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$CurlExe,
         [Parameter(Mandatory)]$Candidates,
         # 分批探测并在每批结束后回调，避免 256 个候选跑几分钟却没有任何输出
-        [scriptblock]$OnProgress
+        [scriptblock]$OnProgress,
+        # 上次观察到的区域；每批结束后若已覆盖就提前结束，减少重复探测
+        [string[]]$EarlyStopColos,
+        [int]$EarlyStopMinPerColo = 2,
+        [int]$EarlyStopMinProbe = 64,
+        # 每批探测多少个；调小便于测试
+        [ValidateRange(1, 128)][int]$ChunkSize = 32
     )
     $list = @($Candidates)
     $total = $list.Count
     $rows = [System.Collections.Generic.List[object]]::new()
     $start = Get-Date
-    $chunkSize = 32
+    $chunkSize = $ChunkSize
 
     for ($i = 0; $i -lt $total; $i += $chunkSize) {
         $last = [math]::Min($i + $chunkSize - 1, $total - 1)
@@ -413,6 +497,12 @@ function Resolve-Colo {
         if ($OnProgress) {
             $done = [math]::Min($i + $chunkSize, $total)
             & $OnProgress $done $total ((Get-Date) - $start).TotalSeconds
+        }
+
+        # 覆盖检查只在整批结束后做，保证结果是确定的；不满足就继续全量探测
+        if ($EarlyStopColos -and $rows.Count -ge $EarlyStopMinProbe -and
+            (Test-ColoCoverage -Rows $rows -Colos $EarlyStopColos -MinPerColo $EarlyStopMinPerColo)) {
+            break
         }
     }
     return @($rows)

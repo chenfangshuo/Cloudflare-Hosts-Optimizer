@@ -1,0 +1,101 @@
+name: Release
+
+# 打 v* tag 即发布：打包（git archive zip + SHA256）并创建 GitHub Release。
+# 发布说明取 CHANGELOG.md 里对应版本的小节；找不到时用自动生成的变更列表。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check tag and version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag -replace '^v', ''
+
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Tag $tag is not on main; refusing to release." }
+
+          $m = Select-String -Path ./pt-cf-optimize.ps1 -Pattern "ScriptVersion = '([0-9]+\.[0-9]+\.[0-9]+)'"
+          if (-not $m) { throw 'Cannot find $ScriptVersion in pt-cf-optimize.ps1.' }
+          $declared = $m.Matches[0].Groups[1].Value
+          if ($version -ne $declared) {
+            throw "Tag version $version does not match `$ScriptVersion $declared."
+          }
+          "Releasing version $version" | Write-Host
+
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'pt-cf-optimize.ps1'), [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error ("{0} line {1}: {2}" -f $_.ErrorId, $_.Extent.StartLineNumber, $_.Message) }
+            exit 1
+          }
+
+      - name: Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.0
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          $result = Invoke-Pester -Path ./tests -Output Normal -PassThru
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          ./scripts/Package-Release.ps1 -Version $version
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag -replace '^v', ''
+
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { "Release $tag already exists; nothing to do." | Write-Host; exit 0 }
+
+          $zip = (Get-ChildItem ./dist/*.zip | Select-Object -First 1).FullName
+          $sum = (Get-ChildItem ./dist/*.sha256 | Select-Object -First 1).FullName
+          if (-not $zip -or -not $sum) { throw 'Package output missing in dist/.' }
+
+          # 发布说明：CHANGELOG 里对应版本的小节 + 固定的安装提示
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $changelog = Get-Content ./CHANGELOG.md -Raw
+          $pattern = "(?ms)^##\s+$([regex]::Escape($version))\b.*?(?=^##\s|\z)"
+          $section = [regex]::Match($changelog, $pattern).Value.Trim()
+          $packageNote = @"
+
+          ### Package
+
+          Download ``pt-cf-optimize-$version.zip``, verify it against the attached ``.sha256``,
+          unzip and run
+          ``pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -DryRun``.
+          No installer; CFST is optional and not bundled.
+          "@
+          $body = if ($section) { $section + $packageNote } else { "v$version" + $packageNote }
+          Set-Content -LiteralPath $notesFile -Value $body -Encoding utf8
+
+          gh release create $tag $zip $sum --title $tag --verify-tag --notes-file $notesFile
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)." }

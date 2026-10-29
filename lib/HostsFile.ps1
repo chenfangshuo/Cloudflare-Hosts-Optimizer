@@ -518,6 +518,8 @@ function Invoke-HostsRollback {
         [Parameter(Mandatory)][string]$HostsPath,
         [Parameter(Mandatory)][string]$BackupDir,
         [string]$LegacyBackupDir,
+        # 指定要恢复的备份文件；不指定则用最近一次
+        [string]$BackupPath,
         [switch]$Force
     )
 
@@ -558,16 +560,39 @@ function Invoke-HostsRollback {
     }
 
     $baks = @($valid | Sort-Object Name -Descending)
-    if ($baks.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
 
-    $latest = $baks[0]
-    $manifestPath = "$($latest.FullName).json"
-    if (Test-Path -LiteralPath $manifestPath) {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-        if ($manifest.postHash) {
-            $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
-            if ($currentHash -ne $manifest.postHash -and -not $Force) {
-                throw 'hosts 在最后一次写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
+    if ($BackupPath) {
+        if (Test-Path -LiteralPath $BackupPath -PathType Container) {
+            $names = if ($baks.Count -gt 0) { ($baks | ForEach-Object { "  $($_.FullName)" }) -join "`n" } else { '（该目标的备份目录里没有可用备份）' }
+            throw "指定的路径是目录，需要用具体的 .bak 文件。可用备份：`n$names"
+        }
+        if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+            throw "指定的备份不存在：$BackupPath"
+        }
+        $latest = Get-Item -LiteralPath $BackupPath
+        $manifestPath = "$($latest.FullName).json"
+        if (-not (Test-Path -LiteralPath $manifestPath)) {
+            throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($latest.FullName)"
+        }
+        $sm = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $sameTarget = $false
+        if ($sm.hostsPath) {
+            try { $sameTarget = ([IO.Path]::GetFullPath($sm.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
+        }
+        if (-not $sameTarget) {
+            throw "该备份的目标是 '$($sm.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
+        }
+    } else {
+        if ($baks.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
+        $latest = $baks[0]
+        $manifestPath = "$($latest.FullName).json"
+        if (Test-Path -LiteralPath $manifestPath) {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($manifest.postHash) {
+                $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
+                if ($currentHash -ne $manifest.postHash -and -not $Force) {
+                    throw 'hosts 在最后一次写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
+                }
             }
         }
     }

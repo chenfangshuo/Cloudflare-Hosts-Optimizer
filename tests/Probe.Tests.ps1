@@ -362,3 +362,88 @@ Describe 'New-PlanDocument' {
         $p.Changed | Should -BeFalse
     }
 }
+
+Describe '机房缓存' {
+    It '写入后可以读回，去重并排序' {
+        $path = Join-Path $TestDrive 'colo-cache.json'
+        Write-ColoCache -Path $path -Colos @('SJC', 'LAX', 'SJC', '', 'HKG') | Should -BeTrue
+        $c = Read-ColoCache -Path $path
+        $c.Colos | Should -Be @('HKG', 'LAX', 'SJC')
+    }
+
+    It '过期缓存返回空' {
+        $path = Join-Path $TestDrive 'colo-old.json'
+        Write-ColoCache -Path $path -Colos @('SJC') | Out-Null
+        $doc = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $doc.updatedAt = '2020-01-01T00:00:00Z'
+        $doc | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding utf8
+        Read-ColoCache -Path $path -MaxAgeDays 14 | Should -BeNullOrEmpty
+        Read-ColoCache -Path $path -MaxAgeDays 0 | Should -BeNullOrEmpty
+    }
+
+    It '损坏或版本不符的缓存当作没有缓存' {
+        $bad = Join-Path $TestDrive 'colo-bad.json'
+        Set-Content -LiteralPath $bad -Value '{not json' -Encoding utf8
+        Read-ColoCache -Path $bad | Should -BeNullOrEmpty
+
+        $v2 = Join-Path $TestDrive 'colo-v2.json'
+        (@{ version = 2; updatedAt = (Get-Date).ToString('o'); colos = @('SJC') } | ConvertTo-Json) |
+            Set-Content -LiteralPath $v2 -Encoding utf8
+        Read-ColoCache -Path $v2 | Should -BeNullOrEmpty
+
+        Read-ColoCache -Path (Join-Path $TestDrive 'nope.json') | Should -BeNullOrEmpty
+    }
+
+    It '空区域列表不写缓存' {
+        $path = Join-Path $TestDrive 'colo-empty.json'
+        Write-ColoCache -Path $path -Colos @('', 'xx') | Should -BeFalse
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It '区域覆盖判断' {
+        $rows = @(
+            [pscustomobject]@{ Colo = 'SJC' }
+            [pscustomobject]@{ Colo = 'SJC' }
+            [pscustomobject]@{ Colo = 'LAX' }
+            [pscustomobject]@{ Colo = 'LAX' }
+        )
+        Test-ColoCoverage -Rows $rows -Colos @('SJC', 'LAX') | Should -BeTrue
+        Test-ColoCoverage -Rows $rows -Colos @('SJC', 'HKG') | Should -BeFalse
+        Test-ColoCoverage -Rows $rows -Colos @('SJC', 'LAX') -MinPerColo 3 | Should -BeFalse
+        Test-ColoCoverage -Rows $rows -Colos @() | Should -BeFalse
+        Test-ColoCoverage -Rows $rows -Colos @('') | Should -BeFalse
+    }
+
+    It '默认缓存路径在本地应用数据目录' {
+        (Get-ColoCacheDefaultPath -Root $TestDrive) | Should -Match 'colo-cache\.json$'
+    }
+}
+
+Describe 'Resolve-Colo 提前结束' {
+    BeforeAll {
+        # 假 curl：固定返回 SJC，用来验证提前结束和区域变化两条路径
+        $script:FakeCurl = Join-Path $TestDrive 'fake-curl.cmd'
+        "@echo off`r`necho colo=SJC`r`n" | Set-Content -LiteralPath $script:FakeCurl -Encoding ascii
+        $script:Candidates = @(1..8 | ForEach-Object {
+                [pscustomobject]@{ IP = "192.0.2.$_"; Loss = 0.0; Ttfb = 0.1 }
+            })
+    }
+
+    It '覆盖缓存区域后提前结束' {
+        $rows = @(Resolve-Colo -CurlExe $script:FakeCurl -Candidates $script:Candidates `
+                -EarlyStopColos @('SJC') -EarlyStopMinProbe 4 -ChunkSize 4)
+        $rows.Count | Should -Be 4
+        $rows[0].Colo | Should -Be 'SJC'
+    }
+
+    It '缓存区域没有出现时继续全量探测' {
+        $rows = @(Resolve-Colo -CurlExe $script:FakeCurl -Candidates $script:Candidates `
+                -EarlyStopColos @('HKG') -EarlyStopMinProbe 4 -ChunkSize 4)
+        $rows.Count | Should -Be 8
+    }
+
+    It '没有缓存时不提前结束' {
+        $rows = @(Resolve-Colo -CurlExe $script:FakeCurl -Candidates $script:Candidates -ChunkSize 4)
+        $rows.Count | Should -Be 8
+    }
+}

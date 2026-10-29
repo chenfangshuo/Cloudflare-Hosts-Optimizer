@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.7 - 2026-10-29
+
+### Added
+
+- 机房缓存（`-NoColoCache` / `-ColoCachePath` / `-ColoCacheMaxAgeDays`，默认 14 天）：
+  缓存上次观察到的落地区域，探测覆盖后提前结束，重复运行从几分钟降到约 1 分钟；
+  缓存过期、损坏或区域不再出现时自动退回全量探测。
+- `-Rollback` 支持 `-RollbackFrom <hosts-*.bak>`：最近一次备份已经写坏时，可以退回到
+  更早的备份；按 manifest 校验目标 hosts，缺少 manifest 或目标不符直接拒绝。
+- tag 触发的发布 workflow（`.github/workflows/release.yml`）：推送 `v*` tag 后自动
+  校验版本、跑测试、打包并创建 Release（zip + SHA256）；发布说明取 CHANGELOG 对应小节。
+
+### Changed
+
+- `docs/releasing.md` 更新为自动化流程，保留手动发布作为回退。
+- `docs/parameters.md`、`docs/how-it-works.md` 补充新参数和缓存行为。
+
 ## 0.3.6 - 2026-10-29
 
 ### Changed

@@ -253,6 +253,52 @@ Describe '写入与回滚' {
         (Get-Content $hostsA -Raw).Trim() | Should -Be 'current-a'
     }
 
+    It '可以指定较早的备份回滚' {
+        $tmp = Join-Path $TestDrive 'hosts-pick.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-pick'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $old = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        $new = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
+        foreach ($f in @($old, $new)) {
+            [IO.File]::WriteAllText("$f.json", (@{ hostsPath = $tmp } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        }
+
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $old | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'old'
+    }
+
+    It '指定目录而不是备份文件时报错并列出可用备份' {
+        $tmp = Join-Path $TestDrive 'hosts-dir.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-dir'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-cccccccc.bak'
+        [IO.File]::WriteAllText($bak, "x`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{ hostsPath = $tmp } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $dir } | Should -Throw '*可用备份*'
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'current'
+    }
+
+    It '拒绝没有 manifest 或目标不匹配的指定备份' {
+        $tmp = Join-Path $TestDrive 'hosts-nomf.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-nomf'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bare = Join-Path $dir 'hosts-20260101-000000-dddddddd.bak'
+        $other = Join-Path $dir 'hosts-20260201-000000-eeeeeeee.bak'
+        [IO.File]::WriteAllText($bare, "bare`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($other, "other`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$other.json", (@{ hostsPath = (Join-Path $TestDrive 'other-hosts.txt') } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $bare } | Should -Throw '*缺少 manifest*'
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $other } | Should -Throw '*不是当前 hosts*'
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'current'
+    }
+
     It '内容无变化时不写、不产生备份' {
         $tmp = Join-Path $TestDrive 'w3.txt'
         New-HostsFixture $tmp

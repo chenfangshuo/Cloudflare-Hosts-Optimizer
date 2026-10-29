@@ -28,6 +28,10 @@
 .PARAMETER Rollback
     用最近一次备份恢复 hosts。可在 domains.txt 缺失时使用。
 
+.PARAMETER RollbackFrom
+    与 -Rollback 同用：恢复指定备份（hosts-*.bak 文件），而不是最近一次。
+    只在最近一次备份已经写坏、需要退回更早状态时使用。
+
 .PARAMETER Version
     打印版本号并退出。
 
@@ -46,6 +50,15 @@
 
 .PARAMETER ExperimentalRanges
     允许扫描 CF 官方列表之外的实验网段（104.28.0.0/14）。
+
+.PARAMETER NoColoCache
+    不使用上次的机房缓存，每次都探测全部候选（默认使用缓存，最长 14 天）。
+
+.PARAMETER ColoCachePath
+    机房缓存文件路径，默认 %LOCALAPPDATA%\pt-cf-optimize\colo-cache.json。
+
+.PARAMETER ColoCacheMaxAgeDays
+    机房缓存的有效天数（0-365，默认 14）。0 表示不使用缓存。
 
 .PARAMETER TopN
     每个域名写入的 IP 数（1-3，默认 1）。hosts 不保证多行之间的故障转移。
@@ -107,6 +120,7 @@ param(
     [switch]$DryRun,
     [switch]$Plan,
     [switch]$Rollback,
+    [string]$RollbackFrom,
     [switch]$Version,
     [switch]$NoCfst,
     [switch]$Force,
@@ -114,6 +128,9 @@ param(
     [switch]$CheckResolved,
     [switch]$ExperimentalRanges,
     [switch]$DropUnreachable,
+    [switch]$NoColoCache,
+    [string]$ColoCachePath,
+    [ValidateRange(0, 365)][int]$ColoCacheMaxAgeDays = 14,
     [ValidateRange(1, 3)][int]$TopN = 1,
     [ValidateRange(1, 5)][int]$CandidatesPerDomain = 3,
     [ValidateRange(0, 5)][int]$BackfillCandidates = 1,
@@ -138,7 +155,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.6'
+$ScriptVersion = '0.3.7'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -238,11 +255,12 @@ function Invoke-Main {
     $planMode = [bool]$Plan -or [bool]$PlanPath
     $planFile = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
     if ($Rollback -and ($DryRun -or $planMode)) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
+    if ($RollbackFrom -and -not $Rollback) { Fail '-RollbackFrom 只能与 -Rollback 一起使用。' 2 }
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
         $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
-        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -Force:$Force
+        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -BackupPath $RollbackFrom -Force:$Force
         $flush = Clear-DnsCache
         Say "已恢复 hosts：$($r.Restored)" 'Green'
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
@@ -342,9 +360,28 @@ function Invoke-Main {
 
     # ---- 机房分层 ----
     $pool = @($latency | Select-Object -First ([int][math]::Min(256, $latency.Count)))
+    $probeTarget = $pool.Count
+
+    # 上次探测到的区域；覆盖这些区域后可以提前结束，省掉几分钟的重复探测
+    $useCache = -not $NoColoCache -and $ColoCacheMaxAgeDays -gt 0
+    $cacheFile = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    $cachedColos = @()
+    if ($useCache) {
+        $cached = Read-ColoCache -Path $cacheFile -MaxAgeDays $ColoCacheMaxAgeDays
+        if ($cached) {
+            $cachedColos = @($cached.Colos)
+            Say ("机房缓存：{0} 记录 {1} 个区域（{2}）。探测覆盖后提前结束。" -f
+                $cached.UpdatedAt.ToLocalTime().ToString('yyyy-MM-dd'),
+                $cachedColos.Count, ($cachedColos -join '/')) 'DarkGray'
+        } elseif (Test-Path -LiteralPath $cacheFile) {
+            Say '机房缓存已过期或无法读取，本次全量探测。' 'DarkGray'
+        }
+    }
+
     Say "探测候选落地区域（$($pool.Count) 个，可能需要几分钟，每 32 个打印一次进度）..." 'Cyan'
     try {
-        $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool -OnProgress {
+        $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool -EarlyStopColos $cachedColos `
+                -EarlyStopMinProbe ([int][math]::Max(64, $ThroughputCandidates * 2)) -OnProgress {
                 param($Done, $Total, $ElapsedSec)
                 $pct = if ($Total -gt 0) { [int](100 * $Done / $Total) } else { 100 }
                 Write-Progress -Activity '探测候选落地区域' -Status "$Done/$Total" -PercentComplete $pct
@@ -353,12 +390,27 @@ function Invoke-Main {
     } finally {
         Write-Progress -Activity '探测候选落地区域' -Completed
     }
+
+    if ($useCache -and $pool.Count -lt $probeTarget) {
+        Say ("已覆盖缓存区域，提前结束：探测 {0}/{1} 个候选。" -f $pool.Count, $probeTarget) 'DarkGray'
+    }
+
     $candidates = @(Select-Stratified -Candidates $pool -Count $ThroughputCandidates)
     $coloSummary = (@($candidates | Group-Object Colo | ForEach-Object {
                 $name = if ($_.Name) { $_.Name } else { '??' }
                 "$name x$($_.Count)"
             })) -join ', '
     Say "分层抽样 $($candidates.Count) 个（$coloSummary）" 'Gray'
+
+    # 只有完整探测过一轮、且池子足够大才写缓存（提前结束时看到的是子集，写回会越缩越小；
+    # 小池子本来就很快，缓存反而会把它覆盖成更窄的区域集合）。
+    # 只记录真正参与抽样决策的区域，避免个别稀有区域让下次的覆盖检查永远失败
+    if ($useCache -and $pool.Count -eq $probeTarget -and $probeTarget -ge 64) {
+        $observed = @($candidates | Where-Object { $_.Colo } | ForEach-Object { $_.Colo } | Select-Object -Unique)
+        if ($observed.Count -gt 0 -and -not (Write-ColoCache -Path $cacheFile -Colos $observed)) {
+            Say "警告：机房缓存写入失败（$cacheFile），不影响本次结果。" 'Yellow'
+        }
+    }
 
     # ---- 吞吐初测 ----
     $quick = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $candidates -Samples $ThroughputSamples -Bytes $ThroughputBytes -UrlTemplate $SpeedTestUrl -ThrottleLimit 6)

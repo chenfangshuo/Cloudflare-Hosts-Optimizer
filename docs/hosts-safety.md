@@ -39,3 +39,7 @@
 - 写入：全局互斥锁 → 提交前哈希检查 → 临时文件 → 原子替换 → 读回校验 → 刷新 DNS。
 - 如果 hosts 在最后一次写入后被其他程序改过，`-Rollback` 默认拒绝覆盖，`-Force` 才允许。
 - `-Rollback` 不依赖 `domains.txt`，域名清单丢失时仍可恢复。
+- `-Rollback -RollbackFrom <hosts-*.bak>` 恢复到指定的更早备份。它仍然校验 manifest：
+  缺少 manifest、或 manifest 里的 `hostsPath` 与当前目标不一致时直接拒绝；传目录会报错
+  并列出该目标的可用备份。指定备份时不再做 postHash 校验（那个校验只对“最近一次”有意义），
+  因为你是明确要退回某个历史状态。

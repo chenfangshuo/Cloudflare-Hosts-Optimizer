@@ -15,6 +15,7 @@ review-local.md
 backup/
 last-report.txt
 plan.json
+colo-cache.json
 result.csv
 *.bak
 

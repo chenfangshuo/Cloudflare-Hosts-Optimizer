@@ -9,6 +9,7 @@
 | `-Plan` | | 不修改 hosts，输出机器可读的 JSON 计划（默认 `.\plan.json`） |
 | `-PlanPath` | `.\plan.json` | `-Plan` 的 JSON 输出路径 |
 | `-Rollback` | | 用最近一次备份恢复 hosts（不依赖 domains.txt） |
+| `-RollbackFrom` | 最近一次 | 与 `-Rollback` 同用，恢复指定的 `hosts-*.bak`，用于退回更早状态 |
 | `-Version` | | 打印版本号并退出 |
 | `-NoCfst` | | 不查找 cfst.exe，强制内置扫描 |
 | `-Force` | | 回滚时允许覆盖被其他程序改过的 hosts；或允许在 TUN 环境下继续 |
@@ -23,6 +24,9 @@
 | `-MinImprovementPct` | 15 | 相对基线至少改善多少百分比才切换 |
 | `-MinImprovementMs` | 30 | 切换所需的最小绝对改善（毫秒），避免噪声内切换 |
 | `-DropUnreachable` | | 旧映射连接失败时也删除（默认保留并告警） |
+| `-NoColoCache` | | 不使用上次的机房缓存，每次全量探测 |
+| `-ColoCachePath` | `%LOCALAPPDATA%\pt-cf-optimize\colo-cache.json` | 机房缓存路径 |
+| `-ColoCacheMaxAgeDays` | 14 | 缓存有效天数；0 等于不使用 |
 | `-Domains` | | 直接指定域名（严格模式：拒绝 URL/端口/路径） |
 | `-DomainsFile` | `.\domains.txt` | 域名文件路径 |
 | `-CfstPath` | 自动查找 | cfst.exe 路径，可传文件或目录 |
@@ -57,4 +61,10 @@
 
 # 删除已经从 domains.txt 移除的历史条目
 .\pt-cf-optimize.ps1 -Prune
+
+# 回到更早的备份（先看备份目录里有哪些 hosts-*.bak）
+.\pt-cf-optimize.ps1 -Rollback -RollbackFrom 'C:\ProgramData\pt-cf-optimize\backup\hosts-20261029-040000-abcd1234.bak'
+
+# 强制每次全量探测机房（不使用缓存）
+.\pt-cf-optimize.ps1 -NoColoCache
 ```
