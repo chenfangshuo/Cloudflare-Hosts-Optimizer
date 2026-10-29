@@ -12,6 +12,7 @@
    - 没有：内置扫描，从 Cloudflare 官方 IPv4 段随机抽样，用
      `speed.cloudflare.com/cdn-cgi/trace` 探测。
    - 只保留丢包率 ≤5%、有响应的 IP，按延迟升序。
+   - 两条路径共用后续所有步骤；覆盖与测量方式的差异见 README 的对比表。
    - CFST 的输出写到本次运行独立的临时目录，不覆盖用户已有的 `result.csv`；
      数字用 `InvariantCulture` 解析，并校验丢包/延迟范围和 IP 是否属于允许网段。
 
