@@ -393,21 +393,25 @@ function Test-DomainIp {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Domain,
-        [Parameter(Mandatory)][string]$Ip,
+        [string]$Ip = '',
         [Parameter(Mandatory)][string]$CurlExe,
-        [int]$MaxTime = 8
+        [int]$MaxTime = 8,
+        # 基线探测：不指定 IP，走系统当前的 hosts/DNS 路径
+        [switch]$NoResolve
     )
-    $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve "${Domain}:443:$Ip" -Head -MaxTime $MaxTime
+    $resolveArg = if ($NoResolve) { $null } else { "${Domain}:443:$Ip" }
+    $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve $resolveArg -Head -MaxTime $MaxTime
 
+    $remoteOk = $NoResolve -or ($Ip -and $r.RemoteIp -eq $Ip)
     $class = 'bad'
-    if ($r.ExitCode -eq 0 -and $r.RemoteIp -eq $Ip) {
+    if ($r.ExitCode -eq 0 -and $remoteOk) {
         switch -Regex ($r.Http) {
             '^(200|204|301|302|303|307|308|401)$' { $class = 'ok' }
             '^(403|503)$' {
                 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('cf-body-' + [guid]::NewGuid().ToString('N') + '.txt')
                 try {
                     $null = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" `
-                        -Resolve "${Domain}:443:$Ip" -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191'
+                        -Resolve $resolveArg -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191'
                     $body = if (Test-Path -LiteralPath $tmp) { Get-Content -LiteralPath $tmp -Raw -ErrorAction SilentlyContinue } else { '' }
                     $cf = Get-CfErrorClass -Body $body
                     if ($cf -eq 'restricted') { $class = 'restricted' }
@@ -428,4 +432,48 @@ function Test-DomainIp {
         Ok = $ok; Http = $r.Http; Class = $class; Ttfb = $r.Ttfb
         Connect = $r.Connect; Tls = $r.Tls; RemoteIp = $r.RemoteIp; Exit = $r.ExitCode
     }
+}
+
+# 在"当前路径基线"和候选之间做选择。
+# Baseline: { IP, Ok, Class, Ttfb }；Candidates: { IP, Ok, Class, Ttfb, Source }
+function Select-DomainIp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Baseline,
+        [Parameter(Mandatory)][AllowEmptyCollection()]$Candidates,
+        [ValidateRange(0, 100)][int]$MinImprovementPct = 15
+    )
+
+    $ranked = @($Candidates | Where-Object { $_ -and $_.Ok -and $_.IP } |
+        Sort-Object @{ Expression = { if ($_.Class -eq 'ok') { 0 } else { 1 } } },
+                    @{ Expression = 'Ttfb'; Descending = $false })
+    $best = $ranked | Select-Object -First 1
+
+    if (-not $best) {
+        return [pscustomobject]@{ IP = $null; Changed = $false; Reason = 'no-working-candidate'; ImprovementPct = $null }
+    }
+    if (-not $Baseline -or -not $Baseline.Ok -or -not $Baseline.IP) {
+        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'baseline-failed'; ImprovementPct = $null }
+    }
+    if ($best.IP -eq $Baseline.IP) {
+        return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'baseline-is-best'; ImprovementPct = 0 }
+    }
+
+    $basePriority = if ($Baseline.Class -eq 'ok') { 0 } else { 1 }
+    $bestPriority = if ($best.Class -eq 'ok') { 0 } else { 1 }
+    if ($bestPriority -gt $basePriority) {
+        return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'baseline-class-better'; ImprovementPct = 0 }
+    }
+    if ($bestPriority -lt $basePriority) {
+        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'better-class'; ImprovementPct = $null }
+    }
+    if ($Baseline.Ttfb -le 0) {
+        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'baseline-no-ttfb'; ImprovementPct = $null }
+    }
+
+    $improvement = [math]::Round((($Baseline.Ttfb - $best.Ttfb) / $Baseline.Ttfb) * 100, 1)
+    if ($improvement -ge $MinImprovementPct) {
+        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'improved'; ImprovementPct = $improvement }
+    }
+    return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'below-threshold'; ImprovementPct = $improvement }
 }

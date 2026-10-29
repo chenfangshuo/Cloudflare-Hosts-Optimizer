@@ -17,6 +17,71 @@ Describe 'Get-CfErrorClass' {
     }
 }
 
+Describe 'Select-DomainIp' {
+    It '基线失败时选择最佳候选' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $false; Class = 'restricted'; Ttfb = 0.5 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.8 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15
+        $d.IP | Should -Be '2.2.2.2'
+        $d.Changed | Should -BeTrue
+        $d.Reason | Should -Be 'baseline-failed'
+    }
+
+    It '基线是最佳时不切换' {
+        $b = [pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.6 }
+        $c = @(
+            [pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.6 }
+            [pscustomobject]@{ IP = '3.3.3.3'; Ok = $true; Class = 'ok'; Ttfb = 0.7 }
+        )
+        $d = Select-DomainIp -Baseline $b -Candidates $c
+        $d.IP | Should -Be '2.2.2.2'
+        $d.Changed | Should -BeFalse
+    }
+
+    It '改善达到阈值才切换' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 1.0 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.8 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15
+        $d.IP | Should -Be '2.2.2.2'
+        $d.Changed | Should -BeTrue
+        $d.ImprovementPct | Should -Be 20
+    }
+
+    It '改善不足时保留基线' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 1.0 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.9 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15
+        $d.IP | Should -Be '1.1.1.1'
+        $d.Changed | Should -BeFalse
+        $d.Reason | Should -Be 'below-threshold'
+    }
+
+    It '候选类别更差时保留基线' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 0.9 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'waf'; Ttfb = 0.5 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c
+        $d.IP | Should -Be '1.1.1.1'
+        $d.Changed | Should -BeFalse
+    }
+
+    It '候选类别更好时切换' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'waf'; Ttfb = 0.6 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.9 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c
+        $d.IP | Should -Be '2.2.2.2'
+        $d.Changed | Should -BeTrue
+        $d.Reason | Should -Be 'better-class'
+    }
+
+    It '没有可用候选时返回空' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $false; Class = 'bad'; Ttfb = 0 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $false; Class = 'bad'; Ttfb = 0 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c
+        $d.IP | Should -BeNullOrEmpty
+        $d.Changed | Should -BeFalse
+    }
+}
+
 Describe 'Test-IpInCidr' {
     It '匹配网段内地址' {
         Test-IpInCidr -Ip '104.16.0.5' -Cidr '104.16.0.0/13' | Should -BeTrue

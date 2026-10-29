@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - 2026-10-29
+
+逐域名选择 + 基线对比。
+
+### Added
+
+- 全局决赛只取前 K 个候选（`-CandidatesPerDomain`，默认 3），每个域名独立测试。
+- 基线对比：以当前 hosts/DNS 路径为基线；只有候选快 ≥ `-MinImprovementPct`
+  （默认 15%），或基线失败/类别更差时才切换；否则保留基线。
+- 决策表：基线 IP/TTFB、选中 IP/TTFB、改善百分比、原因、Action（update/keep/dns/drop）。
+- 旧映射优先于 DNS 回退；受限时 DNS A 记录最多测 2 条。
+- `Select-DomainIp` 纯函数与 7 项单元测试（共 60 项）。
+
+### Changed
+
+- `-TopN` 现在表示切换后每个域名最多写入的 IP 数；未切换时保留基线。
+- 逐域名请求预算：典型约 5 次、最坏约 8 次 HEAD/域名（仍不登录、不带 Cookie）。
+
 ## 0.2.1 - 2026-10-29
 
 修复 Cloudflare Error 1034（Edge IP Restricted）导致的整站不可用。

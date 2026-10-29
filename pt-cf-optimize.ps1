@@ -80,6 +80,8 @@ param(
     [switch]$CheckResolved,
     [switch]$ExperimentalRanges,
     [ValidateRange(1, 3)][int]$TopN = 1,
+    [ValidateRange(1, 5)][int]$CandidatesPerDomain = 3,
+    [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
     [string[]]$Domains,
     [string]$DomainsFile,
     [string]$CfstPath,
@@ -96,7 +98,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.2.1'
+$ScriptVersion = '0.3.0'
 
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:RepoRoot = $Root
@@ -325,7 +327,7 @@ function Invoke-Main {
         Sort-Object @{ Expression = 'QuickSpeed'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false } |
         Select-Object -First $RefineTop)
 
-    $picks = @()
+    $globalCandidates = @()
     if ($promoted.Count -gt 0) {
         # 决赛：3 x 2MB，串行，避免互相抢带宽
         $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1 -MaxTime 15)
@@ -347,112 +349,129 @@ function Invoke-Main {
         $finalRows | Select-Object IP, Colo, Loss, Ttfb, SpeedMBps, Valid |
             Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
 
-        $picks = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
+        $globalCandidates = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
             Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false } |
-            Select-Object -First $TopN)
+            Select-Object -First $CandidatesPerDomain)
     } else {
-        Say '警告：没有候选通过吞吐初测，本次不更新 hosts（保留现有映射）。' 'Yellow'
+        Say '警告：没有候选通过吞吐初测，本次只做基线与兜底检查。' 'Yellow'
     }
 
     Say ''
-    Say '选定 IP：' 'Cyan'
-    if ($picks.Count -gt 0) {
-        $picks | Select-Object IP, Colo, Ttfb, SpeedMBps |
+    Say '全局候选（逐域名只从这里取前几个，按基线决定是否切换）：' 'Cyan'
+    if ($globalCandidates.Count -gt 0) {
+        $globalCandidates | Select-Object IP, Colo, Ttfb, SpeedMBps |
             Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
     } else {
         Say '  （无）' 'Yellow'
     }
     Say ''
 
-    # ---- 逐域名验证 ----
+    # ---- 逐域名选择：基线 = 当前 hosts/DNS 路径 ----
     $map = @{}
-    $verifyRows = @()
-    $restrictedDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-    if ($picks.Count -gt 0) {
-        Say '逐域名验证（每域名每 IP 1 次 HEAD）...' 'Cyan'
-        foreach ($d in $domainList) {
-            $passed = @()
-            $restrictedSeen = $false
-            foreach ($p in $picks) {
-                $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe
-                $verifyRows += [pscustomobject]@{
-                    Domain = $d; IP = $p.IP; Colo = $p.Colo; Http = $r.Http; Class = $r.Class
-                    Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
-                }
-                if ($r.Class -eq 'restricted') { $restrictedSeen = $true }
-                if ($r.Ok) {
-                    $priority = if ($r.Class -eq 'ok') { 0 } else { 1 }
-                    $passed += [pscustomobject]@{ IP = $p.IP; Ttfb = $r.Ttfb; Priority = $priority; Class = $r.Class }
-                }
-                Start-Sleep -Milliseconds $VerifyDelayMs
-            }
-            if ($passed.Count -gt 0) {
-                $ordered = @($passed | Sort-Object Priority, Ttfb | Select-Object -First $TopN | ForEach-Object { $_.IP })
-                $map[$d] = $ordered
-                $classes = (@($passed | ForEach-Object { $_.Class } | Select-Object -Unique) -join ',')
-                Say ("  {0,-24} OK  {1}  [{2}]" -f $d, ($ordered -join ', '), $classes) 'Green'
-            } else {
-                if ($restrictedSeen) { [void]$restrictedDomains.Add($d) }
-                Say ("  {0,-24} 未通过候选验证" -f $d) 'Yellow'
-            }
-        }
-        Say ''
-    }
-
-    # ---- 兜底顺序：可用的旧映射 > 该域名自己的 DNS A 记录 ----
+    $decisions = @()
     $invalidPrevious = @()
-    foreach ($d in $domainList) {
-        if ($map.ContainsKey($d)) { continue }
 
-        $prevIps = if ($previousMap.Contains($d)) { @($previousMap[$d] | Select-Object -Unique) } else { @() }
-        $working = @()
-        $prevRestricted = $false
-        foreach ($ip in $prevIps) {
-            $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
-            $verifyRows += [pscustomobject]@{
-                Domain = $d; IP = $ip; Colo = ''; Http = $r.Http; Class = $r.Class
-                Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
+    Say '逐域名验证与选择（基线 = 当前 hosts/DNS 路径）...' 'Cyan'
+    foreach ($d in $domainList) {
+        # 1) 基线：不指定 IP，走系统当前路径
+        $baseResult = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime 8
+        $baseline = [pscustomobject]@{
+            IP = $baseResult.RemoteIp; Ok = $baseResult.Ok
+            Class = $baseResult.Class; Ttfb = $baseResult.Ttfb
+        }
+        $baselineFromBlock = $previousMap.Contains($d)
+
+        # 2) 候选：全局前 K + 旧映射（去重）
+        $candidates = @()
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        if ($baseline.IP) { [void]$seen.Add($baseline.IP) }
+
+        foreach ($p in $globalCandidates) {
+            if ($seen.Contains($p.IP)) { continue }
+            $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime 8
+            $candidates += [pscustomobject]@{
+                IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'global'
             }
-            if ($r.Class -eq 'restricted') { $prevRestricted = $true }
-            if ($r.Ok) { $working += $ip }
+            [void]$seen.Add($p.IP)
             Start-Sleep -Milliseconds $VerifyDelayMs
         }
-        if ($working.Count -gt 0) {
-            $map[$d] = $working
-            Say ("  {0,-24} 旧映射可用，保留 {1}" -f $d, ($working -join ', ')) 'DarkGray'
-            continue
+
+        if ($baselineFromBlock) {
+            foreach ($ip in @($previousMap[$d] | Select-Object -Unique)) {
+                if ($seen.Contains($ip)) { continue }
+                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
+                $candidates += [pscustomobject]@{
+                    IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'previous'
+                }
+                [void]$seen.Add($ip)
+                Start-Sleep -Milliseconds $VerifyDelayMs
+            }
         }
 
-        # 该 zone 限制了边缘 IP（Error 1034）：回退到它自己的 DNS A 记录
-        if ($restrictedDomains.Contains($d) -or $prevRestricted) {
+        # 3) 受限（1034）且没有可用候选：回退到该域名自己的 DNS A 记录
+        $anyWorking = @($candidates | Where-Object { $_.Ok }).Count -gt 0
+        $anyRestricted = ($baseline.Class -eq 'restricted') -or
+            (@($candidates | Where-Object { $_.Class -eq 'restricted' }).Count -gt 0)
+        if (-not $anyWorking -and $anyRestricted) {
             $dnsIps = @(Resolve-DnsName -Name $d -Type A -DnsOnly -ErrorAction SilentlyContinue |
                     Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress } |
                     Select-Object -Unique | Select-Object -First 2)
-            $dnsWorking = @()
             foreach ($ip in $dnsIps) {
+                if ($seen.Contains($ip)) { continue }
                 $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
-                $verifyRows += [pscustomobject]@{
-                    Domain = $d; IP = $ip; Colo = ''; Http = $r.Http; Class = $r.Class
-                    Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
+                $candidates += [pscustomobject]@{
+                    IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'dns'
                 }
-                if ($r.Ok) {
-                    $priority = if ($r.Class -eq 'ok') { 0 } else { 1 }
-                    $dnsWorking += [pscustomobject]@{ IP = $ip; Ttfb = $r.Ttfb; Priority = $priority }
-                }
+                [void]$seen.Add($ip)
                 Start-Sleep -Milliseconds $VerifyDelayMs
-            }
-            if ($dnsWorking.Count -gt 0) {
-                $ordered = @($dnsWorking | Sort-Object Priority, Ttfb | Select-Object -First $TopN | ForEach-Object { $_.IP })
-                $map[$d] = $ordered
-                Say ("  {0,-24} 边缘受限，已回退到 DNS 记录 {1}" -f $d, ($ordered -join ', ')) 'Yellow'
-                continue
             }
         }
 
-        if ($prevIps.Count -gt 0) {
+        # 4) 选择：只有改善足够或基线失败才切换
+        $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
+
+        if ($decision.Changed -and $decision.IP) {
+            $ordered = @($decision.IP)
+            if ($TopN -gt 1) {
+                $extra = @($candidates | Where-Object { $_.Ok -and $_.IP -ne $decision.IP } |
+                    Sort-Object @{ Expression = { if ($_.Class -eq 'ok') { 0 } else { 1 } } },
+                                @{ Expression = 'Ttfb'; Descending = $false } |
+                    Select-Object -First ($TopN - 1) | ForEach-Object { $_.IP })
+                $ordered += $extra
+            }
+            $map[$d] = $ordered
+        } elseif (-not $decision.IP -and $baselineFromBlock) {
             $invalidPrevious += $d
-            Say ("  {0,-24} 旧映射已失效，将丢弃" -f $d) 'Yellow'
+        }
+
+        $action = if ($decision.Changed) { 'update' }
+                  elseif ($decision.IP) { if ($baselineFromBlock) { 'keep' } else { 'dns' } }
+                  elseif ($baselineFromBlock) { 'drop' }
+                  else { 'none' }
+
+        $chosenTtfb = $null
+        if ($decision.IP) {
+            $chosen = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
+            if ($chosen.Count -gt 0) { $chosenTtfb = [math]::Round($chosen[0].Ttfb, 2) }
+            elseif ($decision.IP -eq $baseline.IP) { $chosenTtfb = [math]::Round($baseline.Ttfb, 2) }
+        }
+        $decisions += [pscustomobject]@{
+            Domain     = $d
+            BaselineIP = $baseline.IP
+            BaseTTFB   = [math]::Round($baseline.Ttfb, 2)
+            ChosenIP   = $decision.IP
+            ChosenTTFB = $chosenTtfb
+            ImprovePct = $decision.ImprovementPct
+            Reason     = $decision.Reason
+            Action     = $action
+        }
+
+        if ($decision.Changed) {
+            Say ("  {0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $decision.Reason) 'Green'
+        } elseif ($decision.IP) {
+            Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $decision.IP, $decision.Reason) 'DarkGray'
+        } else {
+            Say ("  {0,-24} 无可用候选" -f $d) 'Yellow'
         }
     }
     Say ''
@@ -506,18 +525,18 @@ function Invoke-Main {
     }
 
     # ---- 报告 ----
-    if ($verifyRows.Count -gt 0) {
+    if ($decisions.Count -gt 0) {
         Say ''
-        Say '==== 验证结果 ====' 'Cyan'
-        $verifyRows | Select-Object Domain, IP, Colo, Http, Class, Ok, Ttfb |
-            Format-Table -AutoSize | Out-String -Width 220 | ForEach-Object { Say $_.TrimEnd() }
+        Say '==== 逐域名决策 ====' 'Cyan'
+        $decisions | Select-Object Domain, BaselineIP, BaseTTFB, ChosenIP, ChosenTTFB, ImprovePct, Reason, Action |
+            Format-Table -AutoSize | Out-String -Width 240 | ForEach-Object { Say $_.TrimEnd() }
     }
 
     Say ''
     Say '说明：' 'Cyan'
-    $failed = @($domainList | Where-Object { -not $map.ContainsKey($_) })
+    $failed = @($decisions | Where-Object { $_.Action -in @('drop', 'none') } | ForEach-Object { $_.Domain })
     if ($failed.Count -gt 0) {
-        Say '以下域名本次未验证通过，已保留旧映射（可能非 CF 或暂不可用）：' 'Yellow'
+        Say '以下域名没有可用候选（可能非 CF、不可用或边缘受限），未更新：' 'Yellow'
         foreach ($f in $failed) { Say "  - $f" 'DarkGray' }
     }
     Say 'hosts 只影响这些域名的网页/tracker；P2P 和 IPv6 对等连接不受影响。' 'DarkGray'

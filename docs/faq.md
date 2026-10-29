@@ -57,6 +57,18 @@ hosts 不是带优先级的故障转移配置。即使按 TTFB 顺序写多行�
 
 所以默认 `-TopN 1`。确实想写多个可以 `-TopN 2`，但请理解这不等于冗余。
 
+## 为什么每个站写入的 IP 不一样？
+
+全局吞吐排名只用于挑出前 K 个候选（`-CandidatesPerDomain`，默认 3）。
+每个域名会分别与它当前的 hosts/DNS 路径对比，选 TTFB 最好的那个；
+不同 zone 的路由和可用 IP 不同，所以结果可能不同。
+
+## 基线对比是什么？为什么有时不切换？
+
+基线 = 该域名当前的 hosts 映射（没有则走系统 DNS）。只有候选比基线快至少
+`-MinImprovementPct`（默认 15%），或基线失败/类别更差时才切换。这样可以避免在
+测量噪声范围内频繁改动。如果想让某个站强制换值，可以 `-MinImprovementPct 0`。
+
 ## 为什么下载速度没有变快？
 
 hosts 只影响这些域名的网页和 tracker 通告。PT 的 P2P 传输是 BitTorrent 直连，
@@ -128,7 +140,8 @@ hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16
 - 延迟扫描：每个候选几十字节的 trace 请求。
 - 吞吐初测：32 × 1MB ≈ 32MB。
 - 决赛：6 × 3 × 2MB ≈ 36MB。
-- 站点验证：每域名每 IP 1 次 HEAD，可忽略。
+- 站点验证：每域名 1 次基线 HEAD + 前 K 个候选 + 旧映射/DNS 回退，
+  典型约 5 次、最坏约 8 次 HEAD（HEAD 本身流量可忽略）。
 
 合计约 70MB，可通过 `-ThroughputCandidates`、`-ThroughputBytes`、`-RefineTop` 调整。
 
