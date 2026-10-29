@@ -1,0 +1,63 @@
+name: Bug report
+description: 报告可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **不要贴真实站点清单、passkey、Cookie、完整 URL 或完整 hosts 文件。**
+        用 `example.com` 替换域名，删除可识别你线路的 IP。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你预期是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 运行 ...
+        2. 看到 ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 运行 `.\pt-cf-optimize.ps1 -Version`
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: Windows 版本、PowerShell 版本、是否放了 cfst.exe
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关输出（已脱敏）
+      description: 粘贴 `-DryRun` 或 `-Plan` 的关键输出；不要带真实域名和 passkey。
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 已删除真实站点清单、passkey、Cookie 和完整 URL
+          required: true
+        - label: 已先运行 `-DryRun` 或 `-Plan`
+          required: true

@@ -645,6 +645,48 @@ function Resolve-SwitchConfirmation {
     }
 }
 
+# 根据决策、基线来源和候选来源确定动作。纯函数，便于测试 release/update/keep/dns。
+function Get-DomainAction {
+    [CmdletBinding()]
+    param(
+        $Decision,
+        [bool]$BaselineFromBlock,
+        [string]$ChosenSource,
+        $Baseline,
+        [switch]$DropUnreachable
+    )
+    if ($Decision -and $Decision.Changed -and $Decision.IP -and $ChosenSource -eq 'dns') { return 'release' }
+    if ($Decision -and $Decision.Changed -and $Decision.IP) { return 'update' }
+    if ($Decision -and $Decision.IP) {
+        if ($BaselineFromBlock) { return 'keep' }
+        return 'dns'
+    }
+    return Get-PreviousAction -HasPrevious:$BaselineFromBlock -Baseline $Baseline -Decision $Decision -DropUnreachable:$DropUnreachable
+}
+
+# 复核之后构造最终决策。复核中位数已经写回 baseline/best，本函数只负责
+# 选择 IP 和 Reason，便于测试“确认/未确认”。
+function Resolve-ConfirmedDecision {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Confirm,
+        [Parameter(Mandatory)]$Best,
+        [Parameter(Mandatory)][string]$BaselineIP
+    )
+    if ($Confirm.Switch) {
+        return [pscustomobject]@{
+            IP = $Best.IP; Changed = $true
+            Reason = $Confirm.Reason; ImprovementPct = $Confirm.Pct
+            BestIP = $Best.IP; BestTtfb = $Best.Ttfb
+        }
+    }
+    return [pscustomobject]@{
+        IP = $BaselineIP; Changed = $false
+        Reason = $Confirm.Reason; ImprovementPct = $Confirm.Pct
+        BestIP = $Best.IP; BestTtfb = $Best.Ttfb
+    }
+}
+
 # ProxyOverride 匹配。除了标准语法（精确域名或 *.example.com），也接受
 # 用户常见的非标准写法：带端口、以点开头（.example.com）。
 function Test-BypassStrict {
@@ -689,4 +731,38 @@ function Find-Cfst {
         }
     }
     return $null
+}
+
+# 组装机器可读的 -Plan 文档。纯函数，便于测试字段和结构。
+function New-PlanDocument {
+    [CmdletBinding()]
+    param(
+        [string]$Version,
+        [string]$HostsPath,
+        [AllowEmptyCollection()]$Decisions = @(),
+        [AllowEmptyCollection()]$Warnings = @(),
+        $FinalMap,
+        [bool]$Changed
+    )
+    $plan = [System.Collections.Generic.List[object]]::new()
+    if ($FinalMap) {
+        foreach ($k in @($FinalMap.Keys)) {
+            foreach ($ip in @($FinalMap[$k])) {
+                $plan.Add([pscustomobject]@{ IP = [string]$ip; Domain = [string]$k })
+            }
+        }
+    }
+    $warn = @($Warnings | Where-Object { $_ } | ForEach-Object {
+            [pscustomobject]@{ Domain = $_.Domain; Line = $_.Line; IP = $_.Ip; Kind = $_.Kind }
+        })
+    return [pscustomobject]@{
+        Version     = $Version
+        GeneratedAt = (Get-Date).ToString('o')
+        HostsPath   = $HostsPath
+        DryRun      = $true
+        Changed     = $Changed
+        Decisions   = @($Decisions)
+        Plan        = @($plan)
+        Warnings    = $warn
+    }
 }

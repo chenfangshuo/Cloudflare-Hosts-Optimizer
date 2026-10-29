@@ -27,6 +27,18 @@
 现在每 32 个会打印一次“已探测 x/256”，不是卡死。完整运行的耗时见 README 的
 “大概要跑多久”。
 
+## 有没有适合自动化的输出？
+
+有。用 `-Plan` 输出 JSON（不修改 hosts、不需要管理员）：
+
+```powershell
+.\pt-cf-optimize.ps1 -Plan -PlanPath .\plan.json
+```
+
+文件里包含 `Decisions`、`Plan`（最终 hosts 的完整 IP→域名映射，包含保留下来的旧条目）
+和 `Warnings`；`Decisions` 只包含本次实际验证的域名。定时运行的推荐方式见
+[docs/scheduling.md](scheduling.md)：非管理员跑 DryRun/Plan，人工确认后再正式写入。
+
 ## 怎么导入域名？
 
 四种来源：

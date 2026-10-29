@@ -289,3 +289,76 @@ Describe 'Test-BypassStrict' {
         Test-BypassStrict -Domain 'a.example.com' -Bypass 'a.example.com:443;<local>' | Should -BeTrue
     }
 }
+
+Describe 'Get-DomainAction' {
+    It 'DNS 候选胜出时 release' {
+        $dec = [pscustomobject]@{ IP = '2.2.2.2'; Changed = $true }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $true -ChosenSource 'dns' `
+            -Baseline ([pscustomobject]@{ Class = 'restricted'; Ok = $false }) | Should -Be 'release'
+    }
+    It '有改善且非 DNS 时 update' {
+        $dec = [pscustomobject]@{ IP = '2.2.2.2'; Changed = $true }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $true -ChosenSource 'global' `
+            -Baseline ([pscustomobject]@{ Class = 'ok'; Ok = $true }) | Should -Be 'update'
+    }
+    It '保留基线时按来源返回 keep 或 dns' {
+        $dec = [pscustomobject]@{ IP = '1.1.1.1'; Changed = $false }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $true -ChosenSource '' `
+            -Baseline ([pscustomobject]@{ Class = 'ok'; Ok = $true }) | Should -Be 'keep'
+        Get-DomainAction -Decision $dec -BaselineFromBlock $false -ChosenSource '' `
+            -Baseline ([pscustomobject]@{ Class = 'ok'; Ok = $true }) | Should -Be 'dns'
+    }
+    It '没有决策且旧映射受限时 drop' {
+        $dec = [pscustomobject]@{ IP = $null; Changed = $false }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $true -ChosenSource '' `
+            -Baseline ([pscustomobject]@{ Class = 'restricted'; Ok = $false }) | Should -Be 'drop'
+    }
+    It '没有决策时健康基线不因 DropUnreachable 删除' {
+        $dec = [pscustomobject]@{ IP = $null; Changed = $false }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $true -ChosenSource '' `
+            -Baseline ([pscustomobject]@{ Class = 'ok'; Ok = $true }) -DropUnreachable | Should -Be 'keep'
+    }
+    It '没有旧映射时 none' {
+        $dec = [pscustomobject]@{ IP = $null; Changed = $false }
+        Get-DomainAction -Decision $dec -BaselineFromBlock $false -ChosenSource '' `
+            -Baseline ([pscustomobject]@{ Class = 'bad'; Ok = $false }) | Should -Be 'none'
+    }
+}
+
+Describe 'Resolve-ConfirmedDecision' {
+    It '确认切换时选择候选' {
+        $c = [pscustomobject]@{ Switch = $true; Reason = 'confirmed'; Pct = 25 }
+        $b = [pscustomobject]@{ IP = '2.2.2.2'; Ttfb = 0.2 }
+        $d = Resolve-ConfirmedDecision -Confirm $c -Best $b -BaselineIP '1.1.1.1'
+        $d.IP | Should -Be '2.2.2.2'
+        $d.Changed | Should -BeTrue
+        $d.Reason | Should -Be 'confirmed'
+    }
+    It '未确认时回到基线' {
+        $c = [pscustomobject]@{ Switch = $false; Reason = 'not-confirmed'; Pct = 8 }
+        $b = [pscustomobject]@{ IP = '2.2.2.2'; Ttfb = 0.2 }
+        $d = Resolve-ConfirmedDecision -Confirm $c -Best $b -BaselineIP '1.1.1.1'
+        $d.IP | Should -Be '1.1.1.1'
+        $d.Changed | Should -BeFalse
+        $d.BestIP | Should -Be '2.2.2.2'
+    }
+}
+
+Describe 'New-PlanDocument' {
+    It '输出计划条目和告警' {
+        $dec = @([pscustomobject]@{ Domain = 'a.example'; Action = 'update' })
+        $fm = [ordered]@{ 'a.example' = @('1.2.3.4') }
+        $w = @([pscustomobject]@{ Domain = 'b.example'; Line = 7; Ip = '9.9.9.9'; Kind = 'restored' })
+        $p = New-PlanDocument -Version '0.0.0' -HostsPath 'hosts' -Decisions $dec -FinalMap $fm -Warnings $w -Changed $true
+        $p.Changed | Should -BeTrue
+        $p.Plan | Should -HaveCount 1
+        $p.Plan[0].IP | Should -Be '1.2.3.4'
+        $p.Warnings[0].Kind | Should -Be 'restored'
+        ($p | ConvertTo-Json -Depth 6) | Should -Match 'a.example'
+    }
+    It '没有映射时计划为空' {
+        $p = New-PlanDocument -Version '0.0.0' -HostsPath 'hosts' -Decisions @() -FinalMap ([ordered]@{}) -Warnings @() -Changed $false
+        $p.Plan | Should -HaveCount 0
+        $p.Changed | Should -BeFalse
+    }
+}

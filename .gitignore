@@ -14,8 +14,12 @@ review-local.md
 # 运行产物
 backup/
 last-report.txt
+plan.json
 result.csv
 *.bak
+
+# 发布构建产物
+dist/
 
 # 第三方二进制（GPL-3.0，不随本仓库分发）
 cfst/

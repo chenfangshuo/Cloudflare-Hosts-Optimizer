@@ -19,6 +19,12 @@
 .PARAMETER DryRun
     只扫描和验证，不修改 hosts。
 
+.PARAMETER Plan
+    不修改 hosts，生成机器可读的 JSON 计划（默认 .\plan.json），便于自动化和二次开发。
+
+.PARAMETER PlanPath
+    -Plan 的 JSON 输出路径。
+
 .PARAMETER Rollback
     用最近一次备份恢复 hosts。可在 domains.txt 缺失时使用。
 
@@ -99,6 +105,7 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    [switch]$Plan,
     [switch]$Rollback,
     [switch]$Version,
     [switch]$NoCfst,
@@ -120,6 +127,7 @@ param(
     [string]$SpeedTestUrl = 'https://speed.cloudflare.com/__down?bytes={bytes}',
     [string]$HostsPath,
     [string]$ReportPath,
+    [string]$PlanPath,
     [ValidateRange(1, 5)][int]$ScanSamples = 2,
     [ValidateRange(16, 512)][int]$MaxCandidates = 192,
     [ValidateRange(4, 64)][int]$ThroughputCandidates = 32,
@@ -130,7 +138,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.4'
+$ScriptVersion = '0.3.5'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -227,7 +235,9 @@ function Invoke-Main {
     $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
-    if ($Rollback -and $DryRun) { Fail '-Rollback 不能与 -DryRun 同时使用。' 2 }
+    $planMode = [bool]$Plan -or [bool]$PlanPath
+    $planFile = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
+    if ($Rollback -and ($DryRun -or $planMode)) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
@@ -262,7 +272,7 @@ function Invoke-Main {
     # 测速地址是参数错误，尽早失败，不要扫完几分钟才发现。
     try { $null = Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl } catch { Fail $_.Exception.Message 2 }
 
-    if (-not $DryRun) { Assert-AdminForPath $hostsPathResolved }
+    if (-not $DryRun -and -not $planMode) { Assert-AdminForPath $hostsPathResolved }
     $curlExe = Get-CurlExe
 
     Say ''
@@ -273,7 +283,7 @@ function Invoke-Main {
 
     Show-ProxyCheck -TargetDomains $domainList
     $tun = Test-TunAdapter
-    if ($tun -and -not $DryRun -and -not $Force) {
+    if ($tun -and -not $DryRun -and -not $planMode -and -not $Force) {
         Fail '检测到 TUN 网卡。为避免测速和访问走代理，已中止；确认风险后加 -Force 继续。' 3
     }
     Say ''
@@ -528,19 +538,7 @@ function Invoke-Main {
                 if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
                 if ($null -ne $confirm.BestMs) { $best[0].Ttfb = [double]$confirm.BestMs / 1000.0 }
 
-                if ($confirm.Switch) {
-                    $decision = [pscustomobject]@{
-                        IP = $best[0].IP; Changed = $true
-                        Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
-                        BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
-                    }
-                } else {
-                    $decision = [pscustomobject]@{
-                        IP = $baseline.IP; Changed = $false
-                        Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
-                        BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
-                    }
-                }
+                $decision = Resolve-ConfirmedDecision -Confirm $confirm -Best $best[0] -BaselineIP $baseline.IP
             }
         }
 
@@ -551,11 +549,10 @@ function Invoke-Main {
             if ($chosen0.Count -gt 0) { $chosenSource = $chosen0[0].Source }
         }
 
-        if ($decision.Changed -and $decision.IP -and $chosenSource -eq 'dns') {
-            # zone 只服务它自己的 IP（1034 类），写死反而会在换 IP 后失效：交还 DNS。
-            $action = 'release'
-            if ($baselineFromBlock) { $dropPrevious += $d }
-        } elseif ($decision.Changed -and $decision.IP) {
+        $action = Get-DomainAction -Decision $decision -BaselineFromBlock $baselineFromBlock `
+            -ChosenSource $chosenSource -Baseline $baseline -DropUnreachable:$DropUnreachable
+
+        if ($action -eq 'update') {
             $ordered = @($decision.IP)
             if ($TopN -gt 1) {
                 $chosenObj = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
@@ -569,12 +566,10 @@ function Invoke-Main {
                 $ordered += $extra
             }
             $map[$d] = $ordered
-            $action = 'update'
-        } elseif ($decision.IP) {
-            $action = if ($baselineFromBlock) { 'keep' } else { 'dns' }
-        } else {
-            $action = Get-PreviousAction -HasPrevious:$baselineFromBlock -Baseline $baseline -Decision $decision -DropUnreachable:$DropUnreachable
-            if ($action -eq 'drop') { $dropPrevious += $d }
+        } elseif ($action -eq 'release') {
+            if ($baselineFromBlock) { $dropPrevious += $d }
+        } elseif ($action -eq 'drop') {
+            $dropPrevious += $d
         }
 
         $chosenTtfb = $null
@@ -636,8 +631,12 @@ function Invoke-Main {
         Say '  如需真正交还 DNS，请手动删除或注释这些行。' 'DarkGray'
     }
 
-    if ($DryRun) {
-        Say 'DryRun：不修改 hosts。计划写入：' 'Cyan'
+    if ($DryRun -or $planMode) {
+        if ($planMode) {
+            Say 'Plan：不修改 hosts，输出 JSON 计划。计划写入：' 'Cyan'
+        } else {
+            Say 'DryRun：不修改 hosts。计划写入：' 'Cyan'
+        }
         if ($update.FinalMap.Count -eq 0) {
             Say '  （无变更）' 'Yellow'
         } else {
@@ -647,6 +646,21 @@ function Invoke-Main {
         }
         Say ''
         Say "变更检测：$(if ($update.Changed) { '会修改 hosts' } else { '内容无变化，不会写入' })" 'DarkGray'
+
+        if ($planMode) {
+            try {
+                $planDoc = New-PlanDocument -Version $ScriptVersion -HostsPath $hostsPathResolved `
+                    -Decisions $decisions -FinalMap $update.FinalMap -Warnings $update.Warnings -Changed $update.Changed
+                $planDir = Split-Path -Parent $planFile
+                if ($planDir -and -not (Test-Path -LiteralPath $planDir)) {
+                    New-Item -ItemType Directory -Path $planDir -Force | Out-Null
+                }
+                $planDoc | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $planFile -Encoding utf8
+                Say "JSON 计划：$planFile" 'Gray'
+            } catch {
+                Fail "写入 JSON 计划失败：$($_.Exception.Message)" 4
+            }
+        }
     } else {
         $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
         try {
@@ -709,7 +723,7 @@ function Invoke-Main {
 # 入口
 # ---------------------------------------------------------------------------
 $script:ReportPathResolved = $ReportPath
-if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Version -and -not $Rollback) {
+if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not $PlanPath -and -not $Version -and -not $Rollback) {
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
 

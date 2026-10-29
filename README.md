@@ -6,6 +6,8 @@
 
 Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 
+[English](README.en.md) · [下载发布包](https://github.com/chenfangshuo/pt-cf-optimize/releases)
+
 ## 快速开始
 
 **1）[准备域名](#准备域名)**
@@ -149,6 +151,9 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 .\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
 ```
 
+需要给面板或脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）；
+定时运行的推荐方式见 [docs/scheduling.md](docs/scheduling.md)。
+
 ## 安全边界（PT 站必看）
 
 - 不登录、不带 Cookie、不访问 announce URL、不读取 passkey；对目标站只做少量 HEAD
@@ -179,6 +184,8 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-DryRun` | | 只扫描和验证，不修改 hosts |
+| `-Plan` | | 不修改 hosts，输出机器可读的 JSON 计划 |
+| `-PlanPath` | `.\plan.json` | `-Plan` 的输出路径 |
 | `-Rollback` | | 用最近一次备份恢复 hosts（不依赖 domains.txt） |
 | `-Prune` | | 删除不再出现在域名列表中的历史托管映射 |
 | `-CheckResolved` | | 写入后解析每个域名，报告系统实际返回的地址 |
@@ -218,6 +225,9 @@ Invoke-Pester -Path .\tests -Output Detailed
 
 全部离线测试（临时目录、合成备份，不访问网络、不碰真实 hosts）；CI 在 `windows-latest`
 上运行语法检查、PSScriptAnalyzer 和 Pester。
+
+贡献前请看 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题用 [SECURITY.md](SECURITY.md)
+里的私密报告渠道，不要开公开 issue。
 
 ## 致谢
 

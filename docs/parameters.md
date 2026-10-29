@@ -6,6 +6,8 @@
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-DryRun` | | 只扫描和验证，不修改 hosts |
+| `-Plan` | | 不修改 hosts，输出机器可读的 JSON 计划（默认 `.\plan.json`） |
+| `-PlanPath` | `.\plan.json` | `-Plan` 的 JSON 输出路径 |
 | `-Rollback` | | 用最近一次备份恢复 hosts（不依赖 domains.txt） |
 | `-Version` | | 打印版本号并退出 |
 | `-NoCfst` | | 不查找 cfst.exe，强制内置扫描 |
@@ -40,6 +42,9 @@
 ```powershell
 # 只看计划，不写 hosts
 .\pt-cf-optimize.ps1 -DryRun
+
+# 输出 JSON 计划（供面板/脚本消费，不写 hosts）
+.\pt-cf-optimize.ps1 -Plan -PlanPath .\plan.json
 
 # 缩短运行时间
 .\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4

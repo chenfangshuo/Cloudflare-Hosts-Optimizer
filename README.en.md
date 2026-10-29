@@ -1,0 +1,219 @@
+# pt-cf-optimize
+
+Pick the fastest Cloudflare edge IPs and safely write them into the Windows hosts file,
+for Cloudflare-proxied sites such as PT trackers and forums.
+
+> No proxy, no login, no egress IP change. Strict hosts validation, incremental updates,
+> one-click rollback.
+
+Windows 10/11 · PowerShell 7+ · built-in `curl.exe` · CFST optional
+
+[中文说明](README.md) · [Releases](https://github.com/chenfangshuo/pt-cf-optimize/releases)
+
+> Detailed docs under `docs/` are currently in Chinese; commands and option names are
+> language-neutral.
+
+## Quick start
+
+**1) Prepare domains**
+
+Copy `domains.example.txt` to `domains.txt`; one domain per line. Only add sites you have
+confirmed are proxied by Cloudflare:
+
+```powershell
+curl.exe -sI https://example.com | findstr /i "server:"
+```
+
+`server: cloudflare` is a hint, not proof. Non-CF sites are skipped during per-domain
+validation.
+
+**2) Optional: add CFST (better coverage)**
+
+Download [CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest/releases) and put
+`cfst.exe` and `ip.txt` into a `cfst\` folder next to the script:
+
+```text
+pt-cf-optimize\
+  cfst\
+    cfst.exe
+    ip.txt
+```
+
+Without it the built-in scanner is used automatically.
+
+**3) Dry run** (no admin, no hosts changes)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -DryRun
+```
+
+**4) Apply** (elevated PowerShell)
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1
+```
+
+**5) Roll back**
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
+```
+
+A full run takes about **8–15 minutes**. The `probing candidate colos (256)` phase takes
+several minutes by itself; it prints progress every 32 candidates, so it is not stuck.
+
+## What a run looks like
+
+Domains and some numbers are placeholders; the real output also includes scan/throughput
+tables.
+
+```text
+==== Cloudflare IP optimization -> hosts ====
+hosts: C:\Windows\System32\drivers\etc\hosts
+domains: 12
+
+proxy: WinINET system proxy is enabled -> 127.0.0.1:7890
+  Note: all curl calls use --noproxy * and CFST clears proxy env vars; probes always go direct.
+
+probing candidate colos (256, may take a few minutes; progress every 32)...
+  probed 32/256 (38s)
+  probed 64/256 (79s)
+...
+per-domain validation (baseline = current hosts/DNS path)...
+  pt.example.com      switch 104.17.143.151 -> 162.159.160.5  [confirmed]
+  forum.example.org   keep   104.17.131.149  [below-threshold]
+
+hosts written (backup: C:\ProgramData\pt-cf-optimize\backup\hosts-...bak)
+```
+
+## How it picks IPs
+
+1. CFST (or the built-in scanner) filters candidates by latency/loss.
+2. Stratified sampling across edge colos, so candidates are not all HKG.
+3. Independent throughput test plus a 3 × 2MB final; only final results count.
+4. Each domain is checked with HEAD against its current hosts/DNS baseline; the baseline and
+   the chosen candidate are re-checked before switching.
+5. Switch only when the candidate is ≥15% and ≥30ms faster, or the baseline is broken or a
+   worse class (WAF/restricted).
+
+Design notes, 1034 fallback and the IPv4-only decision are in
+[docs/how-it-works.md](docs/how-it-works.md) (Chinese).
+
+## Domains, import and merge
+
+`domains.txt` is one domain per line; `#` starts a comment. It is gitignored, so your site
+list stays local. You can also import from:
+
+| Source | Command |
+| --- | --- |
+| PT-Depiler backup (recommended) | `.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip'` |
+| Windows proxy bypass | `.\Import-Domains.ps1 -Source ProxyBypass` |
+| Text file | `.\Import-Domains.ps1 -Source Text -Path .\sites.txt` |
+| Clipboard | `.\Import-Domains.ps1 -Source Clipboard` |
+
+The importer never accesses the network. PT-Depiler import only opens `metadata.json` and
+never reads `cookies.json`, `userInfo.json` or `downloadHistory.json`. See
+[docs/importing.md](docs/importing.md) for options.
+
+### Review and merge (important)
+
+Imports go to `domains.imported.txt`; **`domains.txt` is never overwritten**. Review the
+file first: keep only Cloudflare-proxied sites, and remember that a proxy bypass list may
+contain non-PT domains. Merge with:
+
+```powershell
+.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip' -Merge
+```
+
+`-Merge` backs up `domains.txt`, appends new domains and deduplicates; it is idempotent.
+Do not merge an entire backup or bypass list without reviewing it.
+
+## Runtime
+
+| Phase | Typical | Notes |
+| --- | --- | --- |
+| CFST latency/loss scan | 1–3 min | `-NoCfst` built-in scan is faster but has less coverage |
+| Probe 256 candidate colos | 2–6 min | 6s timeout, 16 parallel; progress every 32 |
+| Throughput quick test + final | 1–3 min | about 70MB of downloads |
+| Per-domain validation and re-check | 1–3 min | ~6–10 HEADs per domain, 400ms apart |
+
+To shorten a run:
+
+```powershell
+.\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
+.\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
+```
+
+For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts; see
+[docs/scheduling.md](docs/scheduling.md) for a safe scheduled DryRun pattern.
+
+## Safety
+
+- No login, no cookies, no announce URLs, no passkeys. Only a small number of HEAD requests
+  per domain (typically 6–10, at most 11; one IP is probed at most twice during the
+  pre-switch confirmation).
+- **Egress IP is unchanged** as long as these domains are in your proxy bypass list. The
+  script checks the WinINET bypass list and TUN adapters, but cannot detect every
+  PAC/WPAD/WinHTTP/WFP setup.
+- Clash/proxy can stay on: every curl call uses `--noproxy '*'` and CFST clears proxy
+  environment variables. Probes and speed tests always go direct.
+- Do not use VPNs, online IP-picking services or public reverse proxies to access PT sites.
+- hosts only affects HTTP/tracker resolution for these domains; **P2P and IPv6 peer
+  connections are unaffected**.
+
+See [docs/faq.md](docs/faq.md) for more.
+
+## CFST vs built-in scanner
+
+| | CFST (`cfst\cfst.exe`) | Built-in (`-NoCfst` / not found) |
+| --- | --- | --- |
+| Candidate source | 25 CIDRs from `ip.txt` | random sample of `-MaxCandidates` (default 192) |
+| Latency measurement | TCPing | HTTPS `cdn-cgi/trace` (includes TLS) |
+| Coverage | wider | limited sample |
+| Dependency | third-party GPL-3.0 binary | PowerShell + system `curl.exe` |
+
+Both share the same colo sampling, throughput final and per-domain selection. CFST is used
+for latency/loss only; its download test is not used.
+
+## Common options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-DryRun` | | Scan and verify only; do not modify hosts |
+| `-Plan` / `-PlanPath` | `.\plan.json` | Emit a JSON plan without modifying hosts |
+| `-Rollback` | | Restore hosts from the latest backup |
+| `-Prune` | | Remove managed entries no longer in the domain list |
+| `-NoCfst` | | Force the built-in scanner |
+| `-TopN` | 1 | Maximum IPs written per domain |
+| `-MinImprovementPct` | 15 | Minimum percentage improvement to switch |
+| `-MinImprovementMs` | 30 | Minimum absolute improvement (ms) to switch |
+| `-MaxDomainProbes` | 6 | Hard cap on candidate probes per domain |
+| `-CfstPath` | auto | Path to `cfst.exe` (file or folder) |
+
+Full parameter list: [docs/parameters.md](docs/parameters.md).
+
+## hosts safety
+
+- Only zero or exactly one BEGIN/END block is accepted; malformed markers abort the run.
+- Only ASCII/UTF-8 hosts files are supported. Multi-alias lines, IPv6 mappings and other
+  tools' managed blocks abort with a line number.
+- Failed domains keep their previous mapping; only explicit 1034/1003 drops it. Entries not
+  in the current list are kept unless `-Prune` is used.
+- Writes use a mutex, a pre-commit hash check, a backup manifest, atomic replace and
+  read-back verification. `-Rollback` restores the latest backup.
+
+Full rules: [docs/hosts-safety.md](docs/hosts-safety.md).
+
+## Development
+
+```powershell
+Import-Module Pester -MinimumVersion 5.0
+Invoke-Pester -Path .\tests -Output Detailed
+```
+
+All tests are offline; CI runs the parse check, PSScriptAnalyzer and Pester on Windows.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE). The repository does not include CloudflareSpeedTest code or binaries.

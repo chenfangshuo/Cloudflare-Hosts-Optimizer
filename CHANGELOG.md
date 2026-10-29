@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.5 - 2026-10-29
+
+### Added
+
+- `-Plan` / `-PlanPath`：不修改 hosts，输出机器可读的 JSON 计划（决策、写入计划、告警），
+  便于面板、脚本和定时任务消费。
+- 发布工具：`scripts/Package-Release.ps1` 生成只含 git 跟踪文件的 zip + SHA256；
+  发布流程见 `docs/releasing.md`。
+- 英文 README（`README.en.md`）、`SECURITY.md`、`CONTRIBUTING.md`、
+  issue/PR 模板、Dependabot。
+- 定时运行示例 `docs/scheduling.md`（非管理员 DryRun + 人工确认）。
+- 主流程纯函数 `Get-DomainAction`、`Resolve-ConfirmedDecision`、`New-PlanDocument`
+  及 10 项测试（共 96 项）。
+
+### Changed
+
+- CI 的 `actions/checkout` 固定到 v5.1.0 的 commit SHA，并启用 Dependabot 每周检查。
+- README 增加发布包下载、`-Plan` 和贡献/安全入口。
+
 ## 0.3.4 - 2026-10-29
 
 ### Changed
