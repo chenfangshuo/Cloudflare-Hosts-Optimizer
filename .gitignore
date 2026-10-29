@@ -4,8 +4,12 @@ domains.imported.txt
 *.imported.txt
 *.bak-*
 
-# 本地 Claude Code 指令（不公开）
+# 本地 Claude Code 指令与配置（不公开）
 CLAUDE.md
+.claude/
+
+# 本地 review 记录
+review-local.md
 
 # 运行产物
 backup/

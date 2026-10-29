@@ -61,9 +61,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 ```text
 ==== Cloudflare 优选 IP -> hosts ====
 hosts: C:\Windows\System32\drivers\etc\hosts
-域名数: 17
+域名数: 12
 
-代理：WinINET 系统代理已开启 -> 127.0.0.1:7897
+代理：WinINET 系统代理已开启 -> 127.0.0.1:7890
   注意：本工具的 curl 都带 --noproxy *，CFST 也会清空代理环境变量；探测和测速强制直连，不走这个代理。
 旁路：目标域名均在 ProxyOverride 中（仅代表 WinINET 层直连）。
 网卡：未发现已知 TUN 虚拟网卡（这不等于已证明直连）。
@@ -79,7 +79,7 @@ hosts: C:\Windows\System32\drivers\etc\hosts
   pt.example.com          切换 104.17.143.151 -> 162.159.160.5  [confirmed]
   forum.example.org       保留 104.17.131.149  [below-threshold]
 
-已写入 hosts（备份：C:\ProgramData\pt-cf-optimize\backup\hosts-20261029-141840-xxxxxxxx.bak）
+已写入 hosts（备份：C:\ProgramData\pt-cf-optimize\backup\hosts-20261029-120000-xxxxxxxx.bak）
 
 ==== 逐域名决策 ====
 Domain            BaselineIP      BaseState BaseTTFB ChosenIP        ChosenTTFB BestTTFB ImprovePct Reason           Action
@@ -134,7 +134,7 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 
 ## 大概要跑多久
 
-典型家用宽带（CFST + 17 个域名）约 **8–15 分钟**：
+典型家用宽带（CFST + 十几个域名）约 **8–15 分钟**：
 
 | 阶段 | 典型耗时 | 说明 |
 | --- | --- | --- |
