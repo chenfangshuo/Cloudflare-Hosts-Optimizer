@@ -155,7 +155,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.7'
+$ScriptVersion = '0.3.8'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
