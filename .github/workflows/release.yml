@@ -86,7 +86,6 @@ jobs:
           $pattern = "(?ms)^##\s+$([regex]::Escape($version))\b.*?(?=^##\s|\z)"
           $section = [regex]::Match($changelog, $pattern).Value.Trim()
           $packageNote = @"
-
           ### Package
 
           Download ``pt-cf-optimize-$version.zip``, verify it against the attached ``.sha256``,
@@ -94,7 +93,9 @@ jobs:
           ``pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -DryRun``.
           No installer; CFST is optional and not bundled.
           "@
-          $body = if ($section) { $section + $packageNote } else { "v$version" + $packageNote }
+          $packageNote = $packageNote.Trim()
+          $header = if ($section) { $section } else { "v$version" }
+          $body = $header + "`n`n" + $packageNote
           Set-Content -LiteralPath $notesFile -Value $body -Encoding utf8
 
           gh release create $tag $zip $sum --title $tag --verify-tag --notes-file $notesFile
