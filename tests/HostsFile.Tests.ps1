@@ -185,6 +185,11 @@ Describe 'Update-HostsDocument' {
             -ManagedDomains $script:AllDomains -DropPreviousDomains @('example.org')
         $second.Text | Should -Not -Match '10\.0\.0\.2'
         $second.Text | Should -Match '(?m)^203\.0\.113\.11 example\.org'
+        # 区块外的旧条目会被恢复，并作为告警返回（hosts 仍指向它）
+        $second.Warnings | Should -HaveCount 1
+        $second.Warnings[0].Domain | Should -Be 'example.org'
+        $second.Warnings[0].Ip | Should -Be '203.0.113.11'
+        $second.Warnings[0].Kind | Should -Be 'restored'
     }
 
     It '保留 CRLF' {

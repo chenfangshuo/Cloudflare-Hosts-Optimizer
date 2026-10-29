@@ -54,6 +54,17 @@ Describe 'Select-DomainIp' {
         $d.IP | Should -Be '1.1.1.1'
         $d.Changed | Should -BeFalse
         $d.Reason | Should -Be 'below-threshold'
+        $d.BestTtfb | Should -Be 0.9
+    }
+
+    It '快基线下绝对毫秒门槛拦住小改善' {
+        # 80ms -> 66ms：17.5% 达到百分比门槛，但只差 14ms，不应进入复核/切换
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 0.080 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.066 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15 -MinImprovementMs 30
+        $d.IP | Should -Be '1.1.1.1'
+        $d.Changed | Should -BeFalse
+        $d.Reason | Should -Be 'below-threshold'
     }
 
     It '候选类别更差时保留基线' {
@@ -102,6 +113,10 @@ Describe 'Get-PreviousAction' {
     It 'DropUnreachable 时 drop' {
         Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'bad' }) -Decision ([pscustomobject]@{ IP = $null }) -DropUnreachable |
             Should -Be 'drop'
+    }
+    It '基线可用时 DropUnreachable 不删除健康映射' {
+        Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'ok'; Ok = $true }) -Decision ([pscustomobject]@{ IP = $null }) -DropUnreachable |
+            Should -Be 'keep'
     }
 }
 
@@ -230,5 +245,47 @@ Describe 'Resolve-SwitchConfirmation' {
         # 基线 80ms、候选 66ms：17.5% 达到百分比门槛，但只差 14ms
         $r = Resolve-SwitchConfirmation -BaseTtfb 0.080 -BestTtfb 0.066 -Reason improved -MinImprovementPct 15 -MinImprovementMs 30
         $r.Switch | Should -BeFalse
+    }
+    It '接受 baseline-failed，不因参数校验中止' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.20 -Reason baseline-failed
+        $r.Switch | Should -BeTrue
+        $r.Reason | Should -Be 'confirmed-class'
+    }
+}
+
+Describe 'Find-Cfst' {
+    It '显式目录时找里面的 cfst.exe' {
+        $dir = Join-Path $TestDrive 'cfst-dir'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $exe = Join-Path $dir 'cfst.exe'
+        [IO.File]::WriteAllText($exe, '')
+        (Find-Cfst -Explicit $dir -Root $TestDrive) | Should -Be (Resolve-Path -LiteralPath $exe).Path
+    }
+    It '显式文件不存在时报错' {
+        { Find-Cfst -Explicit (Join-Path $TestDrive 'nope\cfst.exe') -Root $TestDrive } |
+            Should -Throw '*不存在*'
+    }
+    It '未指定时在 Root\cfst 下查找' {
+        $root = Join-Path $TestDrive 'root'
+        $dir = Join-Path $root 'cfst'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $exe = Join-Path $dir 'cfst.exe'
+        [IO.File]::WriteAllText($exe, '')
+        (Find-Cfst -Root $root) | Should -Be (Resolve-Path -LiteralPath $exe).Path
+    }
+}
+
+Describe 'Test-BypassStrict' {
+    It '精确匹配与通配符' {
+        Test-BypassStrict -Domain 'a.example.com' -Bypass 'a.example.com' | Should -BeTrue
+        Test-BypassStrict -Domain 'b.example.com' -Bypass '*.example.com' | Should -BeTrue
+        Test-BypassStrict -Domain 'example.net' -Bypass '*.example.com' | Should -BeFalse
+    }
+    It '支持以点开头的写法' {
+        Test-BypassStrict -Domain 'example.com' -Bypass '.example.com' | Should -BeTrue
+        Test-BypassStrict -Domain 'www.example.com' -Bypass '.example.com' | Should -BeTrue
+    }
+    It '忽略端口和 <local>' {
+        Test-BypassStrict -Domain 'a.example.com' -Bypass 'a.example.com:443;<local>' | Should -BeTrue
     }
 }

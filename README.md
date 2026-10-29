@@ -250,14 +250,16 @@ curl.exe -sI https://example.com | findstr /i "server:"
    只有候选比基线快 ≥15%（`-MinImprovementPct`）且绝对改善 ≥30ms（`-MinImprovementMs`），
    或基线失败/类别更差时才切换；否则保留基线，不写 hosts。
    旧映射只有在明确 1034 时才自动丢弃，连接失败默认保留。
-   如果胜出的是该域名自己的 DNS 记录（zone 只服务自己的 IP），动作是**交还 DNS**，不写 hosts。
+   如果胜出的是该域名自己的 DNS 记录（zone 只服务自己的 IP），动作是**删除托管条目、交还 DNS**；
+   区块外已有的旧条目/手工条目不会删除，仍会生效并告警。
 7. 读取 hosts、严格校验、增量合并、备份、原子替换、刷新 DNS。
 
 ## 安全边界
 
 - 只改 hosts 中列出的域名，其他内容保持不变（在支持的编码下）。
-- 只向测速地址做批量请求；对目标站只做少量 HEAD 探测（每域名典型 6–10 次，
-  含基线、候选、旧映射和切换前复核），不登录、不带 Cookie、不访问 announce URL、不读取 passkey。
+- 只向测速地址做批量请求；对目标站只做少量 HEAD 探测（每域名典型 6–10 次、最坏 11 次，
+  含基线、候选、旧映射和切换前复核；切换前复核使同一 IP 最多 2 次 HEAD），
+  不登录、不带 Cookie、不访问 announce URL、不读取 passkey。
 - 不改系统 DNS、网卡、防火墙、代理配置。
 - **不改变出口 IP**：前提是这些域名在代理旁路里。脚本会检查 WinINET 旁路并在缺失时报警，
   也会检测 TUN 网卡；但它**无法完整识别** PAC/WPAD、WinHTTP、应用级代理、WFP 透明转发。
@@ -305,7 +307,8 @@ A Windows PowerShell tool that picks the fastest Cloudflare edge IPs and writes 
 the hosts file, for Cloudflare-proxied sites (PT trackers, forums, etc.).
 
 It uses CloudflareSpeedTest for latency/loss screening only, measures throughput independently,
-samples candidates across edge colos, verifies every domain with a single HEAD request, and
+samples candidates across edge colos, verifies every domain with HEAD requests (one extra
+confirmation probe per IP when switching), and
 manages hosts entries in a tagged, idempotent, reversible block. Domain lists can be imported
 from a PT-Depiler backup, the Windows proxy bypass list, text, or the clipboard.
 

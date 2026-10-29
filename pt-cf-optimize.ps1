@@ -25,6 +25,9 @@
 .PARAMETER Version
     打印版本号并退出。
 
+.PARAMETER NoCfst
+    不使用 cfst.exe，改用内置扫描（从 Cloudflare 官方 IPv4 段随机抽样）。
+
 .PARAMETER Force
     与 -Rollback 同用时允许覆盖写入后被其他程序修改过的 hosts；
     与正常流程同用时允许在检测到 TUN 网卡后继续。
@@ -127,7 +130,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.2'
+$ScriptVersion = '0.3.3'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -174,23 +177,6 @@ function Assert-AdminForPath {
     }
 }
 
-function Find-Cfst {
-    param([string]$Explicit)
-    if ($Explicit) {
-        $candidate = $Explicit
-        # 传目录时自动找里面的 cfst.exe，避免"找到"目录后运行失败又静默回退
-        if (Test-Path -LiteralPath $candidate -PathType Container) {
-            $candidate = Join-Path $candidate 'cfst.exe'
-        }
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return (Resolve-Path -LiteralPath $candidate).Path }
-        throw "指定的 cfst.exe 不存在：$Explicit"
-    }
-    foreach ($c in @((Join-Path $Root 'cfst\cfst.exe'), (Join-Path $Root 'cfst.exe'))) {
-        if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
-    }
-    return $null
-}
-
 function Get-ProxyState {
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
     $v = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
@@ -200,20 +186,6 @@ function Get-ProxyState {
         Server  = [string]$v.ProxyServer
         Bypass  = [string]$v.ProxyOverride
     }
-}
-
-function Test-BypassStrict {
-    param([string]$Domain, [string]$Bypass)
-    foreach ($raw in ($Bypass -split ';')) {
-        $e = $raw.Trim()
-        if (-not $e -or $e -eq '<local>') { continue }
-        if ($e.Contains('*')) {
-            if ($Domain -like $e) { return $true }
-        } elseif ($Domain -ieq $e) {
-            return $true
-        }
-    }
-    return $false
 }
 
 function Show-ProxyCheck {
@@ -234,6 +206,10 @@ function Show-ProxyCheck {
 }
 
 function Test-TunAdapter {
+    if (-not (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue)) {
+        Say '网卡：当前环境缺少 NetAdapter 模块，跳过 TUN 检测。' 'Yellow'
+        return $false
+    }
     $tun = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
             $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'TAP|TUN|Wintun|WireGuard|Tailscale|Clash|Mihomo'
         })
@@ -282,6 +258,9 @@ function Invoke-Main {
         Fail "没有配置任何域名。请复制 domains.example.txt 为 domains.txt 并填入目标域名，或用 -Domains 指定。当前路径：$domainsFileResolved" 2
     }
 
+    # 测速地址是参数错误，尽早失败，不要扫完几分钟才发现。
+    try { $null = Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl } catch { Fail $_.Exception.Message 2 }
+
     if (-not $DryRun) { Assert-AdminForPath $hostsPathResolved }
     $curlExe = Get-CurlExe
 
@@ -325,7 +304,7 @@ function Invoke-Main {
     $latency = @()
     $cfst = $null
     if (-not $NoCfst) {
-        try { $cfst = Find-Cfst -Explicit $CfstPath }
+        try { $cfst = Find-Cfst -Explicit $CfstPath -Root $Root }
         catch { Fail $_.Exception.Message 2 }
     }
 
@@ -509,7 +488,8 @@ function Invoke-Main {
         }
 
         # 4) 选择：只有改善足够或基线失败才切换
-        $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
+        $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates `
+            -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
 
         # 4b) 准备切换且基线可用时，切换前复核：只比较基线与选中的候选。
         #     不在全部候选里重选（未复核的 IP 不该因复核噪声胜出）；
@@ -533,16 +513,22 @@ function Invoke-Main {
                     -Reason $decision.Reason `
                     -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
 
+                # 复核中位数回写到两边（成功和失败都写），报告里的
+                # BaseTTFB / ChosenTTFB / BestTTFB 才能和 ImprovePct 对得上。
+                if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
+                if ($null -ne $confirm.BestMs) { $best[0].Ttfb = [double]$confirm.BestMs / 1000.0 }
+
                 if ($confirm.Switch) {
                     $decision = [pscustomobject]@{
                         IP = $best[0].IP; Changed = $true
                         Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
+                        BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
                     }
-                    if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
                 } else {
                     $decision = [pscustomobject]@{
                         IP = $baseline.IP; Changed = $false
                         Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
+                        BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
                     }
                 }
             }
@@ -582,18 +568,25 @@ function Invoke-Main {
         }
 
         $chosenTtfb = $null
+        $displayIp = $decision.IP
         if ($decision.IP) {
             $chosen = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
-            if ($chosen.Count -gt 0) { $chosenTtfb = [math]::Round($chosen[0].Ttfb, 2) }
-            elseif ($decision.IP -eq $baseline.IP) { $chosenTtfb = [math]::Round($baseline.Ttfb, 2) }
+            if ($chosen.Count -gt 0) { $chosenTtfb = [math]::Round($chosen[0].Ttfb, 3) }
+            elseif ($decision.IP -eq $baseline.IP) { $chosenTtfb = [math]::Round($baseline.Ttfb, 3) }
+        } elseif ($action -in @('keep', 'keep-unreachable') -and $baseline.IP) {
+            # 基线可用、本次没有可用候选：报告显示实际保留的地址，而不是空。
+            $displayIp = $baseline.IP
+            if ($baseline.Ok) { $chosenTtfb = [math]::Round($baseline.Ttfb, 3) }
         }
+        $bestTtfb = if ($null -ne $decision.BestTtfb) { [math]::Round([double]$decision.BestTtfb, 3) } else { $null }
         $decisions += [pscustomobject]@{
             Domain     = $d
             BaselineIP = $baseline.IP
             BaseState  = $baseline.Class
-            BaseTTFB   = if ($baseline.Ok) { [math]::Round($baseline.Ttfb, 2) } else { $null }
-            ChosenIP   = $decision.IP
+            BaseTTFB   = if ($baseline.Ok) { [math]::Round($baseline.Ttfb, 3) } else { $null }
+            ChosenIP   = $displayIp
             ChosenTTFB = $chosenTtfb
+            BestTTFB   = $bestTtfb
             ImprovePct = $decision.ImprovementPct
             Reason     = $decision.Reason
             Action     = $action
@@ -602,9 +595,9 @@ function Invoke-Main {
         if ($action -eq 'update') {
             Say ("  {0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $decision.Reason) 'Green'
         } elseif ($action -in @('keep', 'dns')) {
-            Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $decision.IP, $decision.Reason) 'DarkGray'
+            Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $displayIp, $decision.Reason) 'DarkGray'
         } elseif ($action -eq 'release') {
-            Say ("  {0,-24} 该 zone 只服务自己的 IP，交还 DNS（不写 hosts）  [{1}]" -f $d, $decision.Reason) 'DarkGray'
+            Say ("  {0,-24} 该 zone 只服务自己的 IP，删除托管条目并交还 DNS  [{1}]" -f $d, $decision.Reason) 'DarkGray'
         } elseif ($action -eq 'keep-unreachable') {
             Say ("  {0,-24} 未验证通过，保留旧映射（-DropUnreachable 可删除）" -f $d) 'Yellow'
         } elseif ($action -eq 'drop') {
@@ -620,6 +613,17 @@ function Invoke-Main {
         $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -DropPreviousDomains $dropPrevious
     } catch {
         Fail $_.Exception.Message 4
+    }
+
+    # 删除托管条目后，如果区块外还有该域名的旧条目，hosts 仍会生效。
+    if ($update.Warnings -and $update.Warnings.Count -gt 0) {
+        Say ''
+        Say '警告：以下域名的托管条目已移除（DryRun 下为“将移除”），但 hosts 区块外仍有条目，仍会生效：' 'Yellow'
+        foreach ($w in $update.Warnings) {
+            $kind = if ($w.Kind -eq 'restored') { '已恢复的旧条目' } else { '手工条目' }
+            Say ("  - {0} 第 {1} 行：{2}（{3}）" -f $w.Domain, $w.Line, $w.Ip, $kind) 'Yellow'
+        }
+        Say '  如需真正交还 DNS，请手动删除或注释这些行。' 'DarkGray'
     }
 
     if ($DryRun) {
@@ -667,7 +671,7 @@ function Invoke-Main {
     if ($decisions.Count -gt 0) {
         Say ''
         Say '==== 逐域名决策 ====' 'Cyan'
-        $decisions | Select-Object Domain, BaselineIP, BaseState, BaseTTFB, ChosenIP, ChosenTTFB, ImprovePct, Reason, Action |
+        $decisions | Select-Object Domain, BaselineIP, BaseState, BaseTTFB, ChosenIP, ChosenTTFB, BestTTFB, ImprovePct, Reason, Action |
             Format-Table -AutoSize | Out-String -Width 260 | ForEach-Object { Say $_.TrimEnd() }
     }
 

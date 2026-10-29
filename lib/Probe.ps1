@@ -17,6 +17,13 @@ $script:CfOfficialRanges = @(
 # 非官方列表、但实测有 CF 响应的网段；仅在 -ExperimentalRanges 时启用
 $script:CfExperimentalRanges = @('104.28.0.0/14')
 
+# curl -w 字段的唯一定义：格式串由它生成，解析器按名字取索引，
+# 增删字段时两边不会再各改一处、静默错位。
+$script:CurlWriteFields = @(
+    'http_code', 'size_download', 'time_total', 'time_namelookup',
+    'time_connect', 'time_appconnect', 'time_starttransfer', 'remote_ip'
+)
+
 function Get-CurlExe {
     [CmdletBinding()]
     param()
@@ -88,32 +95,37 @@ function ConvertFrom-CurlWriteOut {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Raw = '')
 
-    # 字段顺序必须与 Invoke-CurlProbe 里的 -w 一致
     $p = (($Raw -split '\|@@\|')[-1]) -split '\|'
+    $idx = @{}
+    for ($i = 0; $i -lt $script:CurlWriteFields.Count; $i++) { $idx[$script:CurlWriteFields[$i]] = $i }
+
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $read = {
-        param([int]$Index)
-        if ($p.Count -le $Index) { return 0.0 }
+        param([string]$Name)
+        $i = $idx[$Name]
+        if ($null -eq $i -or $p.Count -le $i) { return 0.0 }
         $v = 0.0
-        if ([double]::TryParse([string]$p[$Index], [System.Globalization.NumberStyles]::Float, $inv, [ref]$v)) { return $v }
+        if ([double]::TryParse([string]$p[$i], [System.Globalization.NumberStyles]::Float, $inv, [ref]$v)) { return $v }
         return 0.0
     }
-    $dns = & $read 3
+    $dns = & $read 'time_namelookup'
     $relative = {
         param([double]$Value)
         $x = $Value - $dns
         if ($x -lt 0) { 0.0 } else { $x }
     }
 
+    $httpIdx = $idx['http_code']
+    $remoteIdx = $idx['remote_ip']
     return [pscustomobject]@{
-        Http     = if ($p.Count -ge 1 -and $p[0]) { [string]$p[0] } else { '000' }
-        Bytes    = & $read 1
-        Total    = & $read 2
+        Http     = if ($p.Count -gt $httpIdx -and $p[$httpIdx]) { [string]$p[$httpIdx] } else { '000' }
+        Bytes    = & $read 'size_download'
+        Total    = & $read 'time_total'
         Dns      = $dns
-        Connect  = & $relative (& $read 4)
-        Tls      = & $relative (& $read 5)
-        Ttfb     = & $relative (& $read 6)
-        RemoteIp = if ($p.Count -ge 8) { [string]$p[7] } else { '' }
+        Connect  = & $relative (& $read 'time_connect')
+        Tls      = & $relative (& $read 'time_appconnect')
+        Ttfb     = & $relative (& $read 'time_starttransfer')
+        RemoteIp = if ($p.Count -gt $remoteIdx) { [string]$p[$remoteIdx] } else { '' }
     }
 }
 
@@ -137,7 +149,7 @@ function Invoke-CurlProbe {
     if ($Range) { $curlArgs += @('--range', $Range) }
     if ($MaxFileSize -gt 0) { $curlArgs += @('--max-filesize', [string]$MaxFileSize) }
     if ($Output) { $curlArgs += @('-o', $Output) }
-    $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
+    $fmt = '|@@|' + (($script:CurlWriteFields | ForEach-Object { "%{$_}" }) -join '|')
     $curlArgs += @('-w', $fmt)
     $curlArgs += $Url
 
@@ -487,7 +499,8 @@ function Select-DomainIp {
     param(
         [Parameter(Mandatory)]$Baseline,
         [Parameter(Mandatory)][AllowEmptyCollection()]$Candidates,
-        [ValidateRange(0, 100)][int]$MinImprovementPct = 15
+        [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
+        [ValidateRange(0, 5000)][int]$MinImprovementMs = 0
     )
 
     $ranked = @($Candidates | Where-Object { $_ -and $_.Ok -and $_.IP } |
@@ -496,32 +509,58 @@ function Select-DomainIp {
     $best = $ranked | Select-Object -First 1
 
     if (-not $best) {
-        return [pscustomobject]@{ IP = $null; Changed = $false; Reason = 'no-working-candidate'; ImprovementPct = $null }
+        return [pscustomobject]@{
+            IP = $null; Changed = $false; Reason = 'no-working-candidate'
+            ImprovementPct = $null; BestIP = $null; BestTtfb = $null
+        }
     }
     if (-not $Baseline -or -not $Baseline.Ok -or -not $Baseline.IP) {
-        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'baseline-failed'; ImprovementPct = $null }
+        return [pscustomobject]@{
+            IP = $best.IP; Changed = $true; Reason = 'baseline-failed'
+            ImprovementPct = $null; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
     if ($best.IP -eq $Baseline.IP) {
-        return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'baseline-is-best'; ImprovementPct = 0 }
+        return [pscustomobject]@{
+            IP = $Baseline.IP; Changed = $false; Reason = 'baseline-is-best'
+            ImprovementPct = 0; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
 
     $basePriority = if ($Baseline.Class -eq 'ok') { 0 } else { 1 }
     $bestPriority = if ($best.Class -eq 'ok') { 0 } else { 1 }
     if ($bestPriority -gt $basePriority) {
-        return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'baseline-class-better'; ImprovementPct = 0 }
+        return [pscustomobject]@{
+            IP = $Baseline.IP; Changed = $false; Reason = 'baseline-class-better'
+            ImprovementPct = 0; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
     if ($bestPriority -lt $basePriority) {
-        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'better-class'; ImprovementPct = $null }
+        return [pscustomobject]@{
+            IP = $best.IP; Changed = $true; Reason = 'better-class'
+            ImprovementPct = $null; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
     if ($Baseline.Ttfb -le 0) {
-        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'baseline-no-ttfb'; ImprovementPct = $null }
+        return [pscustomobject]@{
+            IP = $best.IP; Changed = $true; Reason = 'baseline-no-ttfb'
+            ImprovementPct = $null; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
 
     $improvement = [math]::Round((($Baseline.Ttfb - $best.Ttfb) / $Baseline.Ttfb) * 100, 1)
-    if ($improvement -ge $MinImprovementPct) {
-        return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'improved'; ImprovementPct = $improvement }
+    # 百分比和绝对毫秒门槛都在这里先判一次：不满足的组合不再进入复核，省 2 次 HEAD。
+    $deltaMs = ($Baseline.Ttfb - $best.Ttfb) * 1000
+    if (($improvement -ge $MinImprovementPct) -and ($deltaMs -ge $MinImprovementMs)) {
+        return [pscustomobject]@{
+            IP = $best.IP; Changed = $true; Reason = 'improved'
+            ImprovementPct = $improvement; BestIP = $best.IP; BestTtfb = $best.Ttfb
+        }
     }
-    return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'below-threshold'; ImprovementPct = $improvement }
+    return [pscustomobject]@{
+        IP = $Baseline.IP; Changed = $false; Reason = 'below-threshold'
+        ImprovementPct = $improvement; BestIP = $best.IP; BestTtfb = $best.Ttfb
+    }
 }
 
 # 本次没有可用决策时，如何处理旧映射。
@@ -537,6 +576,9 @@ function Get-PreviousAction {
     if (-not $HasPrevious) { return 'none' }
     if ($Decision -and $Decision.IP) { return 'keep' }
     if ($Baseline -and $Baseline.Class -eq 'restricted') { return 'drop' }
+    # 基线本身可用（只是本次没有可用候选）时，旧映射是健康的，不能因
+    # -DropUnreachable 被误删。
+    if ($Baseline -and $Baseline.Ok) { return 'keep' }
     if ($DropUnreachable) { return 'drop' }
     return 'keep-unreachable'
 }
@@ -552,7 +594,7 @@ function Resolve-SwitchConfirmation {
         [AllowEmptyCollection()][double[]]$CandidateSamples = @(),
         [switch]$CandidateFlaky,
         [switch]$BaselineRetestFailed,
-        [ValidateSet('improved', 'better-class', 'baseline-no-ttfb')][string]$Reason = 'improved',
+        [ValidateSet('improved', 'better-class', 'baseline-no-ttfb', 'baseline-failed')][string]$Reason = 'improved',
         [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
         [ValidateRange(0, 5000)][int]$MinImprovementMs = 30
     )
@@ -583,4 +625,50 @@ function Resolve-SwitchConfirmation {
         BaseMs = [math]::Round($baseMedian * 1000)
         BestMs = [math]::Round($bestMedian * 1000)
     }
+}
+
+# ProxyOverride 匹配。除了标准语法（精确域名或 *.example.com），也接受
+# 用户常见的非标准写法：带端口、以点开头（.example.com）。
+function Test-BypassStrict {
+    [CmdletBinding()]
+    param([string]$Domain, [string]$Bypass)
+    foreach ($raw in ($Bypass -split ';')) {
+        $e = $raw.Trim()
+        if (-not $e -or $e -eq '<local>') { continue }
+        if ($e -match '^(?<host>.+):\d+$') { $e = $matches['host'] }
+        if ($e.StartsWith('.')) {
+            if ($Domain -ieq $e.TrimStart('.')) { return $true }
+            $e = "*$e"
+        }
+        if ($e.Contains('*')) {
+            if ($Domain -like $e) { return $true }
+        } elseif ($Domain -ieq $e) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# 定位 cfst.exe。显式路径可以是文件或目录；传目录时找里面的 cfst.exe，
+# 避免"找到"目录后运行失败又静默回退。单独放在 lib 里以便离线测试。
+function Find-Cfst {
+    [CmdletBinding()]
+    param(
+        [string]$Explicit,
+        [string]$Root
+    )
+    if ($Explicit) {
+        $candidate = $Explicit
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            $candidate = Join-Path $candidate 'cfst.exe'
+        }
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return (Resolve-Path -LiteralPath $candidate).Path }
+        throw "指定的 cfst.exe 不存在：$Explicit"
+    }
+    if ($Root) {
+        foreach ($c in @((Join-Path $Root 'cfst\cfst.exe'), (Join-Path $Root 'cfst.exe'))) {
+            if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
+        }
+    }
+    return $null
 }

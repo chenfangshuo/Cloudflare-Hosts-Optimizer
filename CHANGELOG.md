@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.3 - 2026-10-29
+
+按本地 review 修复边界问题，并让报告与文档和实际行为一致。
+
+### Fixed
+
+- `release` / 删除托管条目时，若 hosts 区块外仍有该域名的旧条目（被注释的原条目会恢复，
+  用户手工行会保留），运行结束会告警；文档不再承诺一定“交还 DNS”。
+- `Resolve-SwitchConfirmation` 接受 `baseline-failed`，避免边界情况下参数校验中止整次运行。
+- `-DropUnreachable` 不再删除基线验证可用的映射；报告与日志显示实际保留的 IP。
+- 报告新增 `BestTTFB`；复核中位数同时回写基线和候选，修复
+  `BaseTTFB` / `ChosenTTFB` / `ImprovePct` 对不上的问题。
+- 绝对毫秒门槛并入 `Select-DomainIp`，必然被 30ms 门槛拒绝的组合不再多花 2 次复核 HEAD。
+- `-SpeedTestUrl` 在扫描前校验，参数写错不用等几分钟才失败。
+- 缺少 `NetAdapter` 模块时跳过 TUN 检测，而不是抛 `CommandNotFoundException` 中止。
+- ProxyOverride 匹配支持 `.example.com` 和 `example.com:443` 这类非标准写法。
+- 决策表 TTFB 保留 3 位小数，避免 184ms 显示成 180ms（仅显示，判定仍用原始值）。
+
+### Changed
+
+- 切换前复核明确为每域名每 IP 最多 2 次 HEAD，规则与文档同步；请求预算最坏值修正为 11。
+- `curl -w` 字段清单与解析器共用一份定义，避免两边索引漂移。
+- 补上 `-NoCfst` 的帮助文本。
+
+### Added
+
+- `Find-Cfst`、`Test-BypassStrict` 迁入 `lib/Probe.ps1`，补目录解析、复核
+  `baseline-failed`、健康基线保留、毫秒门槛和 release 告警的测试（共 86 项）。
+
 ## 0.3.2 - 2026-10-29
 
 修复测量口径与切换前复核（外部 review 的 P1）；DNS 回退不再写死 IP。

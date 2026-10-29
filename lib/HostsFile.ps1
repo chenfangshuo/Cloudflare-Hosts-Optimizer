@@ -255,11 +255,28 @@ function Update-HostsDocument {
         if ($ips.Count -gt 0) { $final[$pair.Key] = $ips }
     }
 
+    # 被移除的托管域名如果还在区块外有条目（工具注释过的旧条目或用户手工行），
+    # 删除区块行后它们仍会生效。这里只生成告警，不删除用户数据。
+    $warnings = [System.Collections.Generic.List[object]]::new()
+    foreach ($d in $dropSet) {
+        if ($final.Contains($d)) { continue }
+        foreach ($e in $outside.Tagged.GetEnumerator()) {
+            if ($e.Value.Host -ieq $d) {
+                $warnings.Add([pscustomobject]@{ Domain = $d; Line = $e.Key + 1; Ip = $e.Value.Ip; Kind = 'restored' })
+            }
+        }
+        foreach ($e in $outside.Original.GetEnumerator()) {
+            if ($e.Value.Host -ieq $d) {
+                $warnings.Add([pscustomobject]@{ Domain = $d; Line = $e.Key + 1; Ip = $e.Value.Ip; Kind = 'manual' })
+            }
+        }
+    }
+
     # 没有任何新结果、也没有历史映射：保持文件原样（不因空白/换行规范化而写入）
     if ($final.Count -eq 0 -and -not $Prune -and $VerifiedMap.Count -eq 0 -and $previous.Count -eq 0) {
         return [pscustomobject]@{
             Text = $Document.Text; Changed = $false
-            FinalMap = [ordered]@{}; Conflicts = @()
+            FinalMap = [ordered]@{}; Conflicts = @(); Warnings = @($warnings)
         }
     }
 
@@ -329,6 +346,7 @@ function Update-HostsDocument {
         Changed   = ($newText -cne $Document.Text)
         FinalMap  = $resultMap
         Conflicts = @()
+        Warnings  = @($warnings)
     }
 }
 
