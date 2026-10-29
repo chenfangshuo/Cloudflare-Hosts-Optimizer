@@ -62,6 +62,10 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 A full run takes about **8–15 minutes**. The `probing candidate colos (256)` phase takes
 several minutes by itself; it prints progress every 32 candidates, so it is not stuck.
 
+For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts; see
+[docs/scheduling.md](docs/scheduling.md) for three scheduling options, including auto-apply
+with its risks.
+
 ## What a run looks like
 
 Domains and some numbers are placeholders; the real output also includes scan/throughput
@@ -143,9 +147,6 @@ To shorten a run:
 .\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
 .\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
 ```
-
-For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts; see
-[docs/scheduling.md](docs/scheduling.md) for a safe scheduled DryRun pattern.
 
 ## Safety
 

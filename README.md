@@ -56,6 +56,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 第一次运行约 **8–15 分钟**。`探测候选落地区域（256 个）` 本身就要几分钟，现在每 32 个
 会打印一次 `已探测 x/256`，不会看起来像卡死。各阶段耗时见[运行时间](#大概要跑多久)。
 
+需要给面板/脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）；
+定时运行的三种方案（含自动写入的风险）见 [docs/scheduling.md](docs/scheduling.md)。
+
 ## 准备域名
 
 `domains.txt` 每行一个域名，`#` 开头为注释；已加入 `.gitignore`，站点清单不会进入版本库。
@@ -150,9 +153,6 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 .\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
 .\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
 ```
-
-需要给面板或脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）；
-定时运行的推荐方式见 [docs/scheduling.md](docs/scheduling.md)。
 
 ## 安全边界（PT 站必看）
 
