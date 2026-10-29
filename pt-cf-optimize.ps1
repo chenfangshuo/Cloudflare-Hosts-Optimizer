@@ -130,7 +130,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.3'
+$ScriptVersion = '0.3.4'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -196,6 +196,7 @@ function Show-ProxyCheck {
         return
     }
     Say "代理：WinINET 系统代理已开启 -> $($p.Server)" 'Yellow'
+    Say '  注意：本工具的 curl 都带 --noproxy *，CFST 也会清空代理环境变量；探测和测速强制直连，不走这个代理。' 'DarkGray'
     $missing = @($TargetDomains | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $p.Bypass) })
     if ($missing.Count -eq 0) {
         Say '旁路：目标域名均在 ProxyOverride 中（仅代表 WinINET 层直连）。' 'Green'
@@ -309,7 +310,7 @@ function Invoke-Main {
     }
 
     if ($cfst) {
-        Say "使用 CFST 做全量延迟扫描：$cfst" 'Cyan'
+        Say "使用 CFST 做全量延迟扫描（可能需要 1–3 分钟）：$cfst" 'Cyan'
         try { $latency = @(Invoke-CfstLatencyScan -Exe $cfst -Ranges $ranges) }
         catch { Say "CFST 运行失败：$($_.Exception.Message)" 'Yellow'; $latency = @() }
         if ($latency.Count -eq 0) { Say 'CFST 没有产出结果，改用内置扫描。' 'Yellow' }
@@ -331,8 +332,17 @@ function Invoke-Main {
 
     # ---- 机房分层 ----
     $pool = @($latency | Select-Object -First ([int][math]::Min(256, $latency.Count)))
-    Say "探测候选落地区域（$($pool.Count) 个）..." 'Cyan'
-    $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool)
+    Say "探测候选落地区域（$($pool.Count) 个，可能需要几分钟，每 32 个打印一次进度）..." 'Cyan'
+    try {
+        $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool -OnProgress {
+                param($Done, $Total, $ElapsedSec)
+                $pct = if ($Total -gt 0) { [int](100 * $Done / $Total) } else { 100 }
+                Write-Progress -Activity '探测候选落地区域' -Status "$Done/$Total" -PercentComplete $pct
+                Say ("  已探测 {0}/{1}（{2:N0}s）" -f $Done, $Total, $ElapsedSec) 'DarkGray'
+            })
+    } finally {
+        Write-Progress -Activity '探测候选落地区域' -Completed
+    }
     $candidates = @(Select-Stratified -Candidates $pool -Count $ThroughputCandidates)
     $coloSummary = (@($candidates | Group-Object Colo | ForEach-Object {
                 $name = if ($_.Name) { $_.Name } else { '??' }

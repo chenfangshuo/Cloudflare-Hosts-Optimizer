@@ -15,10 +15,17 @@
 ## 需要关掉 Clash / 代理吗？
 
 不需要。脚本里所有 curl 都带 `--noproxy '*'`，CFST 启动前也会清空
-`HTTP_PROXY/HTTPS_PROXY` 环境变量。
+`HTTP_PROXY/HTTPS_PROXY` 环境变量。控制台仍会显示“系统代理已开启”，那只是信息提示，
+不代表探测或测速走了代理。
 
 唯一要避免的是 **TUN / 虚拟网卡模式**。检测到 TUN 时，非 DryRun 会中止；
 确认风险后可以加 `-Force`。
+
+## 为什么“探测候选落地区域”要等几分钟？
+
+这一步最多探测 256 个候选，每个请求超时 6 秒、16 并发，典型 2–6 分钟；慢线路会更久。
+现在每 32 个会打印一次“已探测 x/256”，不是卡死。完整运行的耗时见 README 的
+“大概要跑多久”。
 
 ## 怎么导入域名？
 
@@ -37,7 +44,8 @@
 ```
 
 默认输出 `domains.imported.txt`，不会覆盖 `domains.txt`。检查后用
-`-Merge` 合并，或手工复制。
+`-Merge` 合并，或手工复制。完整说明（PTD 选项、隐私边界、合并流程）见
+[importing.md](importing.md)。
 
 导入器只读取 PT-Depiler 备份里的 `metadata.json`，**绝不读取 `cookies.json` /
 `userInfo.json`**；控制台只打印数量，不打印域名、passkey 或完整 URL。

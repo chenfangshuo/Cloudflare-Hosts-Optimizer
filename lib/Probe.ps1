@@ -384,19 +384,37 @@ function Resolve-Colo {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$CurlExe,
-        [Parameter(Mandatory)]$Candidates
+        [Parameter(Mandatory)]$Candidates,
+        # 分批探测并在每批结束后回调，避免 256 个候选跑几分钟却没有任何输出
+        [scriptblock]$OnProgress
     )
-    $rows = $Candidates | ForEach-Object -Parallel {
-        $ip = $_.IP
-        $curlPath = $using:CurlExe
-        $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
-            --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
-            'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
-        $s = ($raw -join "`n")
-        $colo = ''
-        if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
-        [pscustomobject]@{ IP = $ip; Colo = $colo; Loss = $_.Loss; Ttfb = $_.Ttfb }
-    } -ThrottleLimit 16
+    $list = @($Candidates)
+    $total = $list.Count
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $start = Get-Date
+    $chunkSize = 32
+
+    for ($i = 0; $i -lt $total; $i += $chunkSize) {
+        $last = [math]::Min($i + $chunkSize - 1, $total - 1)
+        $chunk = @($list[$i..$last])
+        $part = $chunk | ForEach-Object -Parallel {
+            $ip = $_.IP
+            $curlPath = $using:CurlExe
+            $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
+                --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
+                'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
+            $s = ($raw -join "`n")
+            $colo = ''
+            if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
+            [pscustomobject]@{ IP = $ip; Colo = $colo; Loss = $_.Loss; Ttfb = $_.Ttfb }
+        } -ThrottleLimit 16
+        foreach ($r in $part) { $rows.Add($r) }
+
+        if ($OnProgress) {
+            $done = [math]::Min($i + $chunkSize, $total)
+            & $OnProgress $done $total ((Get-Date) - $start).TotalSeconds
+        }
+    }
     return @($rows)
 }
 
