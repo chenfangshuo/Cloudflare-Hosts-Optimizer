@@ -25,6 +25,14 @@ pwsh -NoProfile -File .\Register-DryRunTask.ps1
 
 `domains.txt` 必须已经在 `$root` 下；计划任务不会帮你创建它。
 
+如果任务启动失败，先检查 `pwsh.exe` 路径：
+
+```powershell
+(Get-Command pwsh).Source
+```
+
+把 `-Execute 'pwsh.exe'` 换成上面的完整路径即可（计划任务的 PATH 可能和你的终端不同）。
+
 ## 方案 A：定时 DryRun（保守，推荐）
 
 保存为 `Register-DryRunTask.ps1`，用**普通 PowerShell**运行一次，不需要管理员：
@@ -66,6 +74,9 @@ Get-Content .\last-report.txt
 ## 方案 C：定时自动写入 hosts（有风险）
 
 适合已经手动跑过 2–3 次、域名列表不常变、能接受“出问题时自己回滚”的人。
+它仍然逐站验证、拒绝 1034、未达改善门槛就保留旧映射，不是盲目写入；但计划任务运行时
+你不在场，所以风险要自己承担。
+
 保存为 `Register-AutoApplyTask.ps1`，用**管理员 PowerShell**运行一次：
 
 ```powershell
