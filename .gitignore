@@ -4,6 +4,9 @@ domains.imported.txt
 *.imported.txt
 *.bak-*
 
+# 本地 Claude Code 指令（不公开）
+CLAUDE.md
+
 # 运行产物
 backup/
 last-report.txt
