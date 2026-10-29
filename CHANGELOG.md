@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 - 2026-10-29
+
+修复 Cloudflare Error 1034（Edge IP Restricted）导致的整站不可用。
+
+### Fixed
+
+- 403/503 不再一律当作 WAF：会取一小段响应体，识别 `error code: 1034` / `1003`
+  （Edge IP Restricted / Direct IP access not allowed），判定为 `restricted` 并拒绝写入。
+- 受限时回退到该域名自己的 DNS A 记录（最多 2 条，6 秒超时）；仍不可用才跳过。
+- 旧映射校验：上一次写坏的 IP（1034 或连接失败）会被丢弃，不会因为"验证失败保留旧映射"
+  而继续保留。可用的旧映射优先于 DNS 回退。
+- 收紧超时：吞吐初测 20 秒、决赛 15 秒、域名验证 8 秒、DNS 回退 6 秒；
+  避免慢速/无响应 IP 把一次运行拖到十几分钟。
+- 新增 `Get-CfErrorClass` 测试与 `InvalidPreviousDomains` 测试；共 53 项。
+
 ## 0.2.0 - 2026-10-29
 
 安全修复（P0）与域名导入。

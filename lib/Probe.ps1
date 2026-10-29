@@ -90,12 +90,14 @@ function Invoke-CurlProbe {
         [switch]$Head,
         [int]$MaxTime = 10,
         [string]$Output = 'NUL',
-        [string]$Proto = '=https'
+        [string]$Proto = '=https',
+        [string]$Range
     )
 
     $curlArgs = @('-q', '-sS', '--noproxy', '*', '--max-redirs', '0', '--proto', $Proto, '--max-time', [string]$MaxTime)
     if ($Head) { $curlArgs += '-I' }
     if ($Resolve) { $curlArgs += @('--resolve', $Resolve) }
+    if ($Range) { $curlArgs += @('--range', $Range) }
     if ($Output) { $curlArgs += @('-o', $Output) }
     $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
     $curlArgs += @('-w', $fmt)
@@ -141,7 +143,8 @@ function Invoke-ThroughputTest {
         [Parameter(Mandatory)][int]$Samples,
         [Parameter(Mandatory)][int]$Bytes,
         [Parameter(Mandatory)][string]$UrlTemplate,
-        [int]$ThrottleLimit = 6
+        [int]$ThrottleLimit = 6,
+        [int]$MaxTime = 20
     )
 
     $target = Split-SpeedTestUrl -UrlTemplate $UrlTemplate
@@ -157,6 +160,7 @@ function Invoke-ThroughputTest {
         $urlTemplate = $using:UrlTemplate
         $resolveHost = $using:targetHost
         $resolvePort = $using:targetPort
+        $timeoutSec = $using:MaxTime
 
         $valid = @()
         $failed = 0
@@ -165,7 +169,7 @@ function Invoke-ThroughputTest {
             $url = $urlTemplate -replace '\{bytes\}', [string]$byteCount
             $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{remote_ip}'
             $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
-                --max-time 40 --resolve "${resolveHost}:${resolvePort}:$ip" -o NUL -w $fmt $url 2>$null
+                --max-time $timeoutSec --resolve "${resolveHost}:${resolvePort}:$ip" -o NUL -w $fmt $url 2>$null
             $exit = $LASTEXITCODE
             $p = (($raw -join '') -split '\|@@\|')[-1] -split '\|'
             $http = if ($p.Count -ge 1) { [string]$p[0] } else { '000' }
@@ -372,19 +376,54 @@ function Select-Stratified {
     return @($picked)
 }
 
+# 识别 Cloudflare 错误页。1034/1003 表示这个边缘 IP 不被该 zone 允许，
+# 这种 IP 写进 hosts 会让站点完全打不开，必须当作失败。
+function Get-CfErrorClass {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Body)
+    if ([string]::IsNullOrEmpty($Body)) { return '' }
+    if ($Body -match '(?i)error\s*code:\s*1034' -or $Body -match '(?i)Edge IP Restricted') { return 'restricted' }
+    if ($Body -match '(?i)error\s*code:\s*1003' -or $Body -match '(?i)Direct IP access not allowed') { return 'restricted' }
+    return ''
+}
+
 # 可接受的 HTTP 状态：2xx/3xx + 401/403（登录墙/WAF）
+# 但 403/503 会进一步取响应体，排除 CF 的 Edge IP Restricted。
 function Test-DomainIp {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Domain,
         [Parameter(Mandatory)][string]$Ip,
-        [Parameter(Mandatory)][string]$CurlExe
+        [Parameter(Mandatory)][string]$CurlExe,
+        [int]$MaxTime = 8
     )
-    $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve "${Domain}:443:$Ip" -Head -MaxTime 10
-    $accepted = @('200', '204', '301', '302', '303', '307', '308', '401', '403')
-    $remoteOk = ($r.RemoteIp -eq $Ip)
-    $ok = ($r.ExitCode -eq 0 -and $r.Http -in $accepted -and $remoteOk)
-    $class = if (-not $ok) { 'bad' } elseif ($r.Http -eq '403') { 'waf' } else { 'ok' }
+    $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve "${Domain}:443:$Ip" -Head -MaxTime $MaxTime
+
+    $class = 'bad'
+    if ($r.ExitCode -eq 0 -and $r.RemoteIp -eq $Ip) {
+        switch -Regex ($r.Http) {
+            '^(200|204|301|302|303|307|308|401)$' { $class = 'ok' }
+            '^(403|503)$' {
+                $tmp = Join-Path ([IO.Path]::GetTempPath()) ('cf-body-' + [guid]::NewGuid().ToString('N') + '.txt')
+                try {
+                    $null = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" `
+                        -Resolve "${Domain}:443:$Ip" -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191'
+                    $body = if (Test-Path -LiteralPath $tmp) { Get-Content -LiteralPath $tmp -Raw -ErrorAction SilentlyContinue } else { '' }
+                    $cf = Get-CfErrorClass -Body $body
+                    if ($cf -eq 'restricted') { $class = 'restricted' }
+                    elseif ($r.Http -eq '403') { $class = 'waf' }
+                    else { $class = 'bad' }
+                } catch {
+                    if ($r.Http -eq '403') { $class = 'waf' } else { $class = 'bad' }
+                } finally {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                }
+            }
+            default { $class = 'bad' }
+        }
+    }
+
+    $ok = ($class -in @('ok', 'waf'))
     return [pscustomobject]@{
         Ok = $ok; Http = $r.Http; Class = $class; Ttfb = $r.Ttfb
         Connect = $r.Connect; Tls = $r.Tls; RemoteIp = $r.RemoteIp; Exit = $r.ExitCode

@@ -4,6 +4,19 @@ BeforeAll {
     . (Join-Path $repoRoot 'lib\Probe.ps1')
 }
 
+Describe 'Get-CfErrorClass' {
+    It '识别 1034 边缘限制' {
+        Get-CfErrorClass -Body 'error code: 1034' | Should -Be 'restricted'
+        Get-CfErrorClass -Body '<title>Error 1034: Edge IP Restricted</title>' | Should -Be 'restricted'
+    }
+    It '识别 1003' {
+        Get-CfErrorClass -Body 'error code: 1003' | Should -Be 'restricted'
+    }
+    It '普通 403 HTML 不算限制' {
+        Get-CfErrorClass -Body '<html><body>403 Forbidden</body></html>' | Should -Be ''
+    }
+}
+
 Describe 'Test-IpInCidr' {
     It '匹配网段内地址' {
         Test-IpInCidr -Ip '104.16.0.5' -Cidr '104.16.0.0/13' | Should -BeTrue

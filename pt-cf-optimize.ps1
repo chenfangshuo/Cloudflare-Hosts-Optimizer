@@ -96,7 +96,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.2.0'
+$ScriptVersion = '0.2.1'
 
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:RepoRoot = $Root
@@ -209,7 +209,7 @@ function Invoke-Main {
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
     if ($Version) {
-        Write-Output "pt-cf-optimize $ScriptVersion"
+        [Console]::Out.WriteLine("pt-cf-optimize $ScriptVersion")
         return 0
     }
     if ($Rollback -and $DryRun) { Fail '-Rollback 不能与 -DryRun 同时使用。' 2 }
@@ -259,6 +259,16 @@ function Invoke-Main {
         Fail '检测到 TUN 网卡。为避免测速和访问走代理，已中止；确认风险后加 -Force 继续。' 3
     }
     Say ''
+
+    # ---- 读取 hosts（尽早校验结构，避免白扫几分钟才报错） ----
+    try {
+        $doc = Read-HostsDocument -Path $hostsPathResolved
+        $hostsLines = @($doc.Text -split "`r?`n")
+        $blockInfo = Get-HostsBlockInfo -Lines $hostsLines
+        $previousMap = Get-HostsBlockMap -Lines $hostsLines -BlockInfo $blockInfo
+    } catch {
+        Fail $_.Exception.Message 4
+    }
 
     # ---- 延迟筛选 ----
     $ranges = Get-CfRanges -Experimental:$ExperimentalRanges
@@ -318,7 +328,7 @@ function Invoke-Main {
     $picks = @()
     if ($promoted.Count -gt 0) {
         # 决赛：3 x 2MB，串行，避免互相抢带宽
-        $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1)
+        $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1 -MaxTime 15)
         $finalMap = @{}
         foreach ($f in $final) { if ($f) { $finalMap[$f.IP] = $f } }
 
@@ -357,16 +367,20 @@ function Invoke-Main {
     # ---- 逐域名验证 ----
     $map = @{}
     $verifyRows = @()
+    $restrictedDomains = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
     if ($picks.Count -gt 0) {
         Say '逐域名验证（每域名每 IP 1 次 HEAD）...' 'Cyan'
         foreach ($d in $domainList) {
             $passed = @()
+            $restrictedSeen = $false
             foreach ($p in $picks) {
                 $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe
                 $verifyRows += [pscustomobject]@{
                     Domain = $d; IP = $p.IP; Colo = $p.Colo; Http = $r.Http; Class = $r.Class
                     Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
                 }
+                if ($r.Class -eq 'restricted') { $restrictedSeen = $true }
                 if ($r.Ok) {
                     $priority = if ($r.Class -eq 'ok') { 0 } else { 1 }
                     $passed += [pscustomobject]@{ IP = $p.IP; Ttfb = $r.Ttfb; Priority = $priority; Class = $r.Class }
@@ -379,16 +393,73 @@ function Invoke-Main {
                 $classes = (@($passed | ForEach-Object { $_.Class } | Select-Object -Unique) -join ',')
                 Say ("  {0,-24} OK  {1}  [{2}]" -f $d, ($ordered -join ', '), $classes) 'Green'
             } else {
-                Say ("  {0,-24} 失败，保留旧映射（非 CF 或不可用）" -f $d) 'Yellow'
+                if ($restrictedSeen) { [void]$restrictedDomains.Add($d) }
+                Say ("  {0,-24} 未通过候选验证" -f $d) 'Yellow'
             }
         }
         Say ''
     }
 
-    # ---- 读取并更新 hosts ----
-    $doc = Read-HostsDocument -Path $hostsPathResolved
+    # ---- 兜底顺序：可用的旧映射 > 该域名自己的 DNS A 记录 ----
+    $invalidPrevious = @()
+    foreach ($d in $domainList) {
+        if ($map.ContainsKey($d)) { continue }
+
+        $prevIps = if ($previousMap.Contains($d)) { @($previousMap[$d] | Select-Object -Unique) } else { @() }
+        $working = @()
+        $prevRestricted = $false
+        foreach ($ip in $prevIps) {
+            $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
+            $verifyRows += [pscustomobject]@{
+                Domain = $d; IP = $ip; Colo = ''; Http = $r.Http; Class = $r.Class
+                Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
+            }
+            if ($r.Class -eq 'restricted') { $prevRestricted = $true }
+            if ($r.Ok) { $working += $ip }
+            Start-Sleep -Milliseconds $VerifyDelayMs
+        }
+        if ($working.Count -gt 0) {
+            $map[$d] = $working
+            Say ("  {0,-24} 旧映射可用，保留 {1}" -f $d, ($working -join ', ')) 'DarkGray'
+            continue
+        }
+
+        # 该 zone 限制了边缘 IP（Error 1034）：回退到它自己的 DNS A 记录
+        if ($restrictedDomains.Contains($d) -or $prevRestricted) {
+            $dnsIps = @(Resolve-DnsName -Name $d -Type A -DnsOnly -ErrorAction SilentlyContinue |
+                    Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress } |
+                    Select-Object -Unique | Select-Object -First 2)
+            $dnsWorking = @()
+            foreach ($ip in $dnsIps) {
+                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
+                $verifyRows += [pscustomobject]@{
+                    Domain = $d; IP = $ip; Colo = ''; Http = $r.Http; Class = $r.Class
+                    Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
+                }
+                if ($r.Ok) {
+                    $priority = if ($r.Class -eq 'ok') { 0 } else { 1 }
+                    $dnsWorking += [pscustomobject]@{ IP = $ip; Ttfb = $r.Ttfb; Priority = $priority }
+                }
+                Start-Sleep -Milliseconds $VerifyDelayMs
+            }
+            if ($dnsWorking.Count -gt 0) {
+                $ordered = @($dnsWorking | Sort-Object Priority, Ttfb | Select-Object -First $TopN | ForEach-Object { $_.IP })
+                $map[$d] = $ordered
+                Say ("  {0,-24} 边缘受限，已回退到 DNS 记录 {1}" -f $d, ($ordered -join ', ')) 'Yellow'
+                continue
+            }
+        }
+
+        if ($prevIps.Count -gt 0) {
+            $invalidPrevious += $d
+            Say ("  {0,-24} 旧映射已失效，将丢弃" -f $d) 'Yellow'
+        }
+    }
+    Say ''
+
+    # ---- 更新 hosts ----
     try {
-        $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune
+        $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -InvalidPreviousDomains $invalidPrevious
     } catch {
         Fail $_.Exception.Message 4
     }

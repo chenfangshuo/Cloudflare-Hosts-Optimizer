@@ -220,6 +220,7 @@ function Update-HostsDocument {
         [Parameter(Mandatory)]$Document,
         [Parameter(Mandatory)][hashtable]$VerifiedMap,
         [Parameter(Mandatory)][string[]]$ManagedDomains,
+        [AllowEmptyCollection()][string[]]$InvalidPreviousDomains = @(),
         [switch]$Prune
     )
 
@@ -239,8 +240,12 @@ function Update-HostsDocument {
     }
 
     # 增量合并：成功 -> 更新；失败 -> 保留 previous；不在输入中 -> 默认保留
+    $invalidSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($x in $InvalidPreviousDomains) { [void]$invalidSet.Add($x) }
+
     $final = [ordered]@{}
     foreach ($pair in $previous.GetEnumerator()) {
+        if ($invalidSet.Contains($pair.Key)) { continue }
         if (-not $Prune -or $managedSet.Contains($pair.Key)) {
             $final[$pair.Key] = @($pair.Value)
         }

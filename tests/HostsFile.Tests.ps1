@@ -172,6 +172,21 @@ Describe 'Update-HostsDocument' {
             Should -Throw '*foreign-block:S302*'
     }
 
+    It 'InvalidPreviousDomains 丢弃指定旧映射并还原旧条目' {
+        $tmp = Join-Path $TestDrive 'u10.txt'
+        $doc = New-Doc $tmp
+        $first = Update-HostsDocument -Document $doc -VerifiedMap @{
+            'cf.example.net' = @('10.0.0.1')
+            'example.org'    = @('10.0.0.2')
+        } -ManagedDomains $script:AllDomains
+        [IO.File]::WriteAllText($tmp, $first.Text, [Text.ASCIIEncoding]::new())
+        $doc2 = Read-HostsDocument -Path $tmp
+        $second = Update-HostsDocument -Document $doc2 -VerifiedMap @{ 'cf.example.net' = @('10.0.0.9') } `
+            -ManagedDomains $script:AllDomains -InvalidPreviousDomains @('example.org')
+        $second.Text | Should -Not -Match '10\.0\.0\.2'
+        $second.Text | Should -Match '(?m)^203\.0\.113\.11 example\.org'
+    }
+
     It '保留 CRLF' {
         $doc = New-Doc (Join-Path $TestDrive 'u9.txt')
         $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
