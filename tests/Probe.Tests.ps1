@@ -166,3 +166,69 @@ Describe 'Select-Stratified' {
         @($p | ForEach-Object { $_.Colo } | Select-Object -Unique).Count | Should -Be 3
     }
 }
+
+Describe 'ConvertFrom-CurlWriteOut' {
+    It '时间字段统一扣掉 DNS 解析时间' {
+        $raw = '|@@|200|0|0.40|0.12|0.14|0.30|0.38|104.17.1.1'
+        $m = ConvertFrom-CurlWriteOut -Raw $raw
+        $m.Http | Should -Be '200'
+        [math]::Round($m.Dns, 2) | Should -Be 0.12
+        [math]::Round($m.Connect, 2) | Should -Be 0.02
+        [math]::Round($m.Tls, 2) | Should -Be 0.18
+        [math]::Round($m.Ttfb, 2) | Should -Be 0.26
+        $m.RemoteIp | Should -Be '104.17.1.1'
+    }
+    It '解析时间为 0 时保持原值' {
+        $raw = '|@@|200|0|0.30|0|0.05|0.20|0.28|104.17.1.2'
+        $m = ConvertFrom-CurlWriteOut -Raw $raw
+        [math]::Round($m.Ttfb, 2) | Should -Be 0.28
+    }
+    It '负值钳到 0，空输出返回 000' {
+        $raw = '|@@|200|0|0.10|0.20|0.08|0.15|0.19|1.2.3.4'
+        $m = ConvertFrom-CurlWriteOut -Raw $raw
+        $m.Connect | Should -Be 0
+        $m.Tls | Should -Be 0
+        (ConvertFrom-CurlWriteOut -Raw '').Http | Should -Be '000'
+    }
+    It '忽略响应体，只取最后一个分隔段' {
+        $raw = '<html>body|@@|200|1|0.5|0.1|0.2|0.3|0.4|8.8.8.8'
+        $m = ConvertFrom-CurlWriteOut -Raw $raw
+        $m.Http | Should -Be '200'
+        $m.RemoteIp | Should -Be '8.8.8.8'
+    }
+}
+
+Describe 'Resolve-SwitchConfirmation' {
+    It '复核后改善不足则不切换' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.40 -BestTtfb 0.34 `
+            -BaseSamples @(0.40) -CandidateSamples @(0.39) -Reason improved
+        $r.Switch | Should -BeFalse
+        $r.Reason | Should -Be 'not-confirmed'
+    }
+    It '复核确认改善则切换' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.30 `
+            -BaseSamples @(0.52) -CandidateSamples @(0.31) -Reason improved
+        $r.Switch | Should -BeTrue
+        $r.Reason | Should -Be 'confirmed'
+    }
+    It '候选复测失败不切换' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.20 -CandidateFlaky -Reason improved
+        $r.Switch | Should -BeFalse
+        $r.Reason | Should -Be 'candidate-flaky'
+    }
+    It '基线复测失败则切换' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.45 -BaselineRetestFailed -Reason improved
+        $r.Switch | Should -BeTrue
+        $r.Reason | Should -Be 'baseline-failed-on-retest'
+    }
+    It '类别更好时只要求候选不失败' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.60 -Reason better-class
+        $r.Switch | Should -BeTrue
+        $r.Reason | Should -Be 'confirmed-class'
+    }
+    It '绝对毫秒门槛拦下快基线的小改善' {
+        # 基线 80ms、候选 66ms：17.5% 达到百分比门槛，但只差 14ms
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.080 -BestTtfb 0.066 -Reason improved -MinImprovementPct 15 -MinImprovementMs 30
+        $r.Switch | Should -BeFalse
+    }
+}

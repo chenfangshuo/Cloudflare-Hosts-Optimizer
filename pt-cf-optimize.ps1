@@ -10,8 +10,10 @@
 
     安全约束：
       * 标记结构异常、编码无法识别、存在多别名/IPv6 冲突时，直接拒绝改写。
-      * 验证失败的域名保留上一次的映射；只有 -Prune 才删除。
-      * 只向测速地址做批量请求；对目标站仅每域名每 IP 1 次 HEAD。
+      * 验证失败的域名默认保留上一次的映射；明确 1034/1003 才删除；
+        只有 -Prune 才删除不在域名列表里的历史映射。
+      * 只向测速地址做批量请求；对目标站只做少量 HEAD 探测
+        （每域名典型 6-10 次，含基线、候选、旧映射和切换前复核）。
       * 不登录、不带 Cookie、不访问 announce URL。
 
 .PARAMETER DryRun
@@ -38,6 +40,28 @@
 
 .PARAMETER TopN
     每个域名写入的 IP 数（1-3，默认 1）。hosts 不保证多行之间的故障转移。
+
+.PARAMETER CandidatesPerDomain
+    每个域名参与对比的全局候选数（1-5，默认 3）。
+
+.PARAMETER BackfillCandidates
+    前几个全局候选都不可用时，补测的候选数（0-5，默认 1）。
+
+.PARAMETER MaxDomainProbes
+    每个域名的候选探测硬上限（1-16，默认 6）；不含基线和 DNS 回退。
+
+.PARAMETER VerifyTimeoutSec
+    单次域名验证超时（秒，2-15，默认 5）。
+
+.PARAMETER MinImprovementPct
+    候选相对基线至少快多少百分比才切换（0-100，默认 15）。
+
+.PARAMETER MinImprovementMs
+    切换所需的绝对改善下限（毫秒，默认 30）。基线很快时，15% 可能只有十几毫秒，
+    落在测量噪声里；两个门槛都满足才切换。
+
+.PARAMETER DropUnreachable
+    旧映射连接失败时也删除。默认保留并告警；明确 1034/1003 始终自动删除。
 
 .PARAMETER Domains
     域名列表，优先于 -DomainsFile。
@@ -86,7 +110,7 @@ param(
     [ValidateRange(1, 16)][int]$MaxDomainProbes = 6,
     [ValidateRange(2, 15)][int]$VerifyTimeoutSec = 5,
     [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
-    [ValidateRange(0, 20)][int]$ConfirmThresholdPct = 5,
+    [ValidateRange(0, 5000)][int]$MinImprovementMs = 30,
     [string[]]$Domains,
     [string]$DomainsFile,
     [string]$CfstPath,
@@ -98,11 +122,12 @@ param(
     [ValidateRange(4, 64)][int]$ThroughputCandidates = 32,
     [ValidateRange(1, 3)][int]$ThroughputSamples = 1,
     [ValidateRange(500000, 20000000)][int]$ThroughputBytes = 1000000,
-    [ValidateRange(1, 16)][int]$RefineTop = 6,    [ValidateRange(0, 5000)][int]$VerifyDelayMs = 400
+    [ValidateRange(1, 16)][int]$RefineTop = 6,
+    [ValidateRange(0, 5000)][int]$VerifyDelayMs = 400
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.1'
+$ScriptVersion = '0.3.2'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -152,7 +177,12 @@ function Assert-AdminForPath {
 function Find-Cfst {
     param([string]$Explicit)
     if ($Explicit) {
-        if (Test-Path -LiteralPath $Explicit) { return (Resolve-Path -LiteralPath $Explicit).Path }
+        $candidate = $Explicit
+        # 传目录时自动找里面的 cfst.exe，避免"找到"目录后运行失败又静默回退
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            $candidate = Join-Path $candidate 'cfst.exe'
+        }
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return (Resolve-Path -LiteralPath $candidate).Path }
         throw "指定的 cfst.exe 不存在：$Explicit"
     }
     foreach ($c in @((Join-Path $Root 'cfst\cfst.exe'), (Join-Path $Root 'cfst.exe'))) {
@@ -481,34 +511,55 @@ function Invoke-Main {
         # 4) 选择：只有改善足够或基线失败才切换
         $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
 
-        # 4b) 改善接近阈值时，基线和最佳候选各复核一次
-        if ($ConfirmThresholdPct -gt 0 -and $baseline.Ok -and $null -ne $decision.ImprovementPct -and
-            [math]::Abs([double]$decision.ImprovementPct - $MinImprovementPct) -le $ConfirmThresholdPct) {
-            $best = @($candidates | Where-Object { $_.Ok -and $_.IP } |
-                Sort-Object @{ Expression = { if ($_.Class -eq 'ok') { 0 } else { 1 } } },
-                            @{ Expression = 'Ttfb'; Descending = $false } |
-                Select-Object -First 1)
+        # 4b) 准备切换且基线可用时，切换前复核：只比较基线与选中的候选。
+        #     不在全部候选里重选（未复核的 IP 不该因复核噪声胜出）；
+        #     候选复测失败/受限则不切换；百分比和绝对毫秒门槛都要满足。
+        if ($decision.Changed -and $decision.IP -and $baseline.Ok) {
+            $best = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
             if ($best.Count -gt 0) {
                 $b2 = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
                 Start-Sleep -Milliseconds $VerifyDelayMs
                 $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
-                if ($b2.Ok -and $c2.Ok) {
-                    $avgBase = ($baseline.Ttfb + $b2.Ttfb) / 2.0
-                    $avgBest = ($best[0].Ttfb + $c2.Ttfb) / 2.0
-                    $baseline = [pscustomobject]@{ IP = $baseline.IP; Ok = $true; Class = $baseline.Class; Ttfb = $avgBase }
-                    $candidates = @($candidates | ForEach-Object {
-                            if ($_.IP -eq $best[0].IP) {
-                                [pscustomobject]@{ IP = $_.IP; Colo = $_.Colo; Ok = $_.Ok; Class = $_.Class; Ttfb = $avgBest; Source = $_.Source }
-                            } else { $_ }
-                        })
-                    $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
-                }
                 Start-Sleep -Milliseconds $VerifyDelayMs
+
+                $baseSamples = @()
+                if ($b2.Ok) { $baseSamples += $b2.Ttfb }
+                $candSamples = @()
+                if ($c2.Ok) { $candSamples += $c2.Ttfb }
+
+                $confirm = Resolve-SwitchConfirmation -BaseTtfb $baseline.Ttfb -BestTtfb $best[0].Ttfb `
+                    -BaseSamples $baseSamples -CandidateSamples $candSamples `
+                    -CandidateFlaky:(-not $c2.Ok) -BaselineRetestFailed:(-not $b2.Ok) `
+                    -Reason $decision.Reason `
+                    -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
+
+                if ($confirm.Switch) {
+                    $decision = [pscustomobject]@{
+                        IP = $best[0].IP; Changed = $true
+                        Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
+                    }
+                    if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
+                } else {
+                    $decision = [pscustomobject]@{
+                        IP = $baseline.IP; Changed = $false
+                        Reason = $confirm.Reason; ImprovementPct = $confirm.Pct
+                    }
+                }
             }
         }
 
         # 5) 行动
-        if ($decision.Changed -and $decision.IP) {
+        $chosenSource = $null
+        if ($decision.IP) {
+            $chosen0 = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
+            if ($chosen0.Count -gt 0) { $chosenSource = $chosen0[0].Source }
+        }
+
+        if ($decision.Changed -and $decision.IP -and $chosenSource -eq 'dns') {
+            # zone 只服务它自己的 IP（1034 类），写死反而会在换 IP 后失效：交还 DNS。
+            $action = 'release'
+            if ($baselineFromBlock) { $dropPrevious += $d }
+        } elseif ($decision.Changed -and $decision.IP) {
             $ordered = @($decision.IP)
             if ($TopN -gt 1) {
                 $chosenObj = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
@@ -552,6 +603,8 @@ function Invoke-Main {
             Say ("  {0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $decision.Reason) 'Green'
         } elseif ($action -in @('keep', 'dns')) {
             Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $decision.IP, $decision.Reason) 'DarkGray'
+        } elseif ($action -eq 'release') {
+            Say ("  {0,-24} 该 zone 只服务自己的 IP，交还 DNS（不写 hosts）  [{1}]" -f $d, $decision.Reason) 'DarkGray'
         } elseif ($action -eq 'keep-unreachable') {
             Say ("  {0,-24} 未验证通过，保留旧映射（-DropUnreachable 可删除）" -f $d) 'Yellow'
         } elseif ($action -eq 'drop') {

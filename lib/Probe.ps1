@@ -81,6 +81,42 @@ function Get-CfRanges {
     return $r
 }
 
+# 解析 curl -w 输出。所有时间字段统一扣掉 time_namelookup：
+# 候选走 --resolve（解析≈0），基线走系统解析；不扣掉的话基线会白背一次 DNS 时间，
+# 15% 的门槛会被解析时间吃掉一部分。
+function ConvertFrom-CurlWriteOut {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Raw = '')
+
+    # 字段顺序必须与 Invoke-CurlProbe 里的 -w 一致
+    $p = (($Raw -split '\|@@\|')[-1]) -split '\|'
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $read = {
+        param([int]$Index)
+        if ($p.Count -le $Index) { return 0.0 }
+        $v = 0.0
+        if ([double]::TryParse([string]$p[$Index], [System.Globalization.NumberStyles]::Float, $inv, [ref]$v)) { return $v }
+        return 0.0
+    }
+    $dns = & $read 3
+    $relative = {
+        param([double]$Value)
+        $x = $Value - $dns
+        if ($x -lt 0) { 0.0 } else { $x }
+    }
+
+    return [pscustomobject]@{
+        Http     = if ($p.Count -ge 1 -and $p[0]) { [string]$p[0] } else { '000' }
+        Bytes    = & $read 1
+        Total    = & $read 2
+        Dns      = $dns
+        Connect  = & $relative (& $read 4)
+        Tls      = & $relative (& $read 5)
+        Ttfb     = & $relative (& $read 6)
+        RemoteIp = if ($p.Count -ge 8) { [string]$p[7] } else { '' }
+    }
+}
+
 function Invoke-CurlProbe {
     [CmdletBinding()]
     param(
@@ -101,24 +137,25 @@ function Invoke-CurlProbe {
     if ($Range) { $curlArgs += @('--range', $Range) }
     if ($MaxFileSize -gt 0) { $curlArgs += @('--max-filesize', [string]$MaxFileSize) }
     if ($Output) { $curlArgs += @('-o', $Output) }
-    $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
+    $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
     $curlArgs += @('-w', $fmt)
     $curlArgs += $Url
 
     $raw = & $CurlExe @curlArgs 2>$null
     $exit = $LASTEXITCODE
     $s = ($raw -join "`n")
-    $p = (($s -split '\|@@\|')[-1]) -split '\|'
+    $m = ConvertFrom-CurlWriteOut -Raw $s
 
     return [pscustomobject]@{
         ExitCode = $exit
-        Http     = if ($p.Count -ge 1) { [string]$p[0] } else { '000' }
-        Bytes    = if ($p.Count -ge 2) { [double]$p[1] } else { 0.0 }
-        Total    = if ($p.Count -ge 3) { [double]$p[2] } else { 0.0 }
-        Connect  = if ($p.Count -ge 4) { [double]$p[3] } else { 0.0 }
-        Tls      = if ($p.Count -ge 5) { [double]$p[4] } else { 0.0 }
-        Ttfb     = if ($p.Count -ge 6) { [double]$p[5] } else { 0.0 }
-        RemoteIp = if ($p.Count -ge 7) { [string]$p[6] } else { '' }
+        Http     = $m.Http
+        Bytes    = $m.Bytes
+        Total    = $m.Total
+        Dns      = $m.Dns
+        Connect  = $m.Connect
+        Tls      = $m.Tls
+        Ttfb     = $m.Ttfb
+        RemoteIp = $m.RemoteIp
         Raw      = $s
     }
 }
@@ -438,7 +475,8 @@ function Test-DomainIp {
     $ok = ($class -in @('ok', 'waf'))
     return [pscustomobject]@{
         Ok = $ok; Http = $r.Http; Class = $class; Ttfb = $r.Ttfb
-        Connect = $r.Connect; Tls = $r.Tls; RemoteIp = $r.RemoteIp; Exit = $r.ExitCode
+        Connect = $r.Connect; Tls = $r.Tls; Dns = $r.Dns
+        RemoteIp = $r.RemoteIp; Exit = $r.ExitCode
     }
 }
 
@@ -501,4 +539,48 @@ function Get-PreviousAction {
     if ($Baseline -and $Baseline.Class -eq 'restricted') { return 'drop' }
     if ($DropUnreachable) { return 'drop' }
     return 'keep-unreachable'
+}
+
+# 切换前复核：只比较"基线"和"准备切换到的那个候选"，不再在全部候选里重选；
+# 候选任意一次复测失败都不切换。
+function Resolve-SwitchConfirmation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][double]$BaseTtfb,
+        [Parameter(Mandatory)][double]$BestTtfb,
+        [AllowEmptyCollection()][double[]]$BaseSamples = @(),
+        [AllowEmptyCollection()][double[]]$CandidateSamples = @(),
+        [switch]$CandidateFlaky,
+        [switch]$BaselineRetestFailed,
+        [ValidateSet('improved', 'better-class', 'baseline-no-ttfb')][string]$Reason = 'improved',
+        [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
+        [ValidateRange(0, 5000)][int]$MinImprovementMs = 30
+    )
+
+    if ($CandidateFlaky) {
+        return [pscustomobject]@{ Switch = $false; Reason = 'candidate-flaky'; Pct = $null; BaseMs = $null; BestMs = $null }
+    }
+    if ($BaselineRetestFailed) {
+        return [pscustomobject]@{ Switch = $true; Reason = 'baseline-failed-on-retest'; Pct = $null; BaseMs = $null; BestMs = $null }
+    }
+    if ($Reason -ne 'improved') {
+        return [pscustomobject]@{ Switch = $true; Reason = 'confirmed-class'; Pct = $null; BaseMs = $null; BestMs = $null }
+    }
+
+    $baseMedian = Get-Median -Values (@($BaseTtfb) + @($BaseSamples))
+    $bestMedian = Get-Median -Values (@($BestTtfb) + @($CandidateSamples))
+    if ($null -eq $baseMedian -or $null -eq $bestMedian -or $baseMedian -le 0) {
+        return [pscustomobject]@{ Switch = $false; Reason = 'not-confirmed'; Pct = $null; BaseMs = $null; BestMs = $null }
+    }
+
+    $pct = [math]::Round((($baseMedian - $bestMedian) / $baseMedian) * 100, 1)
+    $deltaMs = ($baseMedian - $bestMedian) * 1000
+    $ok = ($pct -ge $MinImprovementPct) -and ($deltaMs -ge $MinImprovementMs)
+    return [pscustomobject]@{
+        Switch = $ok
+        Reason = if ($ok) { 'confirmed' } else { 'not-confirmed' }
+        Pct    = $pct
+        BaseMs = [math]::Round($baseMedian * 1000)
+        BestMs = [math]::Round($bestMedian * 1000)
+    }
 }
