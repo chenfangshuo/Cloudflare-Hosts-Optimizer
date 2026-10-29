@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.1 - 2026-10-29
+
+按外部 review 收敛可靠性：不再因一次失败删除旧映射，备份按目标隔离，
+请求预算与文档一致。
+
+### Fixed
+
+- 旧映射只在明确 `1034/1003` 时自动丢弃；连接失败默认保留并告警；
+  新增 `-DropUnreachable` 显式删除。
+- 备份按 hosts 目标隔离（非系统 hosts 使用 `targets\<hash>` 子目录），
+  回滚校验 manifest 的 `hostsPath`，避免沙箱备份恢复到系统 hosts。
+- 403/503 诊断 GET 加 `--max-filesize 65536`，只读前 16KB；文档同步请求预算。
+- DNS 回退显式 `-NoHostsFile`；只接受 IPv4 且在允许的 CF 网段内。
+- `-RefineTop` 范围改为 1–16（0 不再静默禁用新候选）。
+- `-Version` 提前到加载 lib 之前；显式 `-CfstPath` 不存在直接报错。
+- 冲突 preflight 提前到扫描前；`Invoke-Main` 不再用返回值当退出码。
+- 基线失败时不再跳过同 IP 候选；`-TopN` 额外 IP 需同类且 TTFB ≤ 主 IP 的 1.5 倍。
+- 报告增加 `BaseState`；基线不可用时 `BaseTTFB` 留空，避免“变慢”误读。
+
+### Added
+
+- `-BackfillCandidates`（默认 1）、`-MaxDomainProbes`（默认 6）、
+  `-VerifyTimeoutSec`（默认 5）、`-ConfirmThresholdPct`（默认 5）。
+- 逐域名有限补位：前 K 个都不可用时补测。
+- 改善接近 15% 阈值时，基线与最佳候选各复核一次。
+- 导入器拒绝重复 `metadata.json` 和 >8MB 的解压内容。
+- 测试扩展到 67 项。
+
 ## 0.3.0 - 2026-10-29
 
 逐域名选择 + 基线对比。

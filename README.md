@@ -190,7 +190,12 @@ curl.exe -sI https://example.com | findstr /i "server:"
 | `-ExperimentalRanges` | | 允许扫描 CF 官方列表之外的 104.28.0.0/14 |
 | `-TopN` | 1 | 切换后每个域名最多写入的 IP 数（未切换时保留基线） |
 | `-CandidatesPerDomain` | 3 | 每个域名参与对比的全局候选数（1–5） |
+| `-BackfillCandidates` | 1 | 前 K 个都不可用时补测的候选数（0–5） |
+| `-MaxDomainProbes` | 6 | 每域名候选探测硬上限（不含基线/DNS） |
+| `-VerifyTimeoutSec` | 5 | 单次域名验证超时（秒） |
 | `-MinImprovementPct` | 15 | 相对基线至少改善多少百分比才切换 |
+| `-ConfirmThresholdPct` | 5 | 改善接近阈值时的复核带宽（百分点） |
+| `-DropUnreachable` | | 旧映射连接失败时也删除（默认保留并告警） |
 | `-Domains` | | 直接指定域名（严格模式：拒绝 URL/端口/路径） |
 | `-DomainsFile` | `.\domains.txt` | 域名文件路径 |
 | `-CfstPath` | 自动查找 | cfst.exe 路径 |
@@ -218,9 +223,13 @@ curl.exe -sI https://example.com | findstr /i "server:"
   不会冒险改写。
 - **增量**：验证成功 → 更新；验证失败 → 保留上一次映射；不在本次列表 → 默认保留，
   `-Prune` 才删除。
-- **备份**：`%ProgramData%\pt-cf-optimize\backup`（不可写时回退项目目录），
-  文件名含时间戳和 GUID，附带 JSON 清单（pre/post 哈希）；按文件名选最近，
-  不依赖 LastWriteTime；保留最近 10 份 + 一份首次接管快照。
+- **旧映射丢弃**：只有明确 `1034/1003`（边缘 IP 受限）才自动丢弃；
+  连接失败/TLS/超时默认**保留并告警**，只有 `-DropUnreachable` 才删除。
+- **备份**：`%ProgramData%\pt-cf-optimize\backup`（不可写时回退项目目录）；
+  非系统 hosts 使用 `targets\<路径哈希>` 子目录，回滚时校验 manifest 的 `hostsPath`，
+  避免沙箱备份被系统 hosts 的回滚选中。文件名含时间戳和 GUID，附带 JSON 清单
+  （pre/post 哈希）；按文件名选最近，不依赖 LastWriteTime；保留最近 10 份 +
+  一份首次接管快照。
 - **写入**：全局互斥锁 → 提交前哈希检查 → 临时文件 → 原子替换 → 读回校验。
 - **回滚**：如果 hosts 在最后一次写入后被其他程序改过，默认拒绝覆盖，`-Force` 才允许。
 
@@ -233,11 +242,11 @@ curl.exe -sI https://example.com | findstr /i "server:"
 3. 按机房分层抽样 32 个，用 `-SpeedTestUrl` 做 1MB 吞吐初测。
 4. 前 6 名进入决赛：3 × 2MB、串行，只保留有效样本 ≥2 的 IP。
 5. 每个域名：先测当前 hosts/DNS 路径作为基线；再测全局前 K（默认 3）个候选和旧映射；
-   如果全部受限（1034），再测该域名自己的 DNS A 记录（最多 2 条）。
+   前 K 个都不可用时补测 `-BackfillCandidates` 个；改善接近阈值时基线与最佳候选各复核一次；
+   如果全部受限（1034），再测该域名自己的 DNS A 记录（最多 2 条，仅限 CF 网段）。
 6. 只有候选比基线快 ≥15%（`-MinImprovementPct`），或基线失败/类别更差时才切换；
-   否则保留基线，不写 hosts。
+   否则保留基线，不写 hosts。旧映射只有在明确 1034 时才自动丢弃，连接失败默认保留。
 7. 读取 hosts、严格校验、增量合并、备份、原子替换、刷新 DNS。
-   上一次写坏的旧映射（1034/连接失败）会被丢弃。
 
 ## 安全边界
 

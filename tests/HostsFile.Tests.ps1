@@ -172,7 +172,7 @@ Describe 'Update-HostsDocument' {
             Should -Throw '*foreign-block:S302*'
     }
 
-    It 'InvalidPreviousDomains 丢弃指定旧映射并还原旧条目' {
+    It 'DropPreviousDomains 丢弃指定旧映射并还原旧条目' {
         $tmp = Join-Path $TestDrive 'u10.txt'
         $doc = New-Doc $tmp
         $first = Update-HostsDocument -Document $doc -VerifiedMap @{
@@ -182,7 +182,7 @@ Describe 'Update-HostsDocument' {
         [IO.File]::WriteAllText($tmp, $first.Text, [Text.ASCIIEncoding]::new())
         $doc2 = Read-HostsDocument -Path $tmp
         $second = Update-HostsDocument -Document $doc2 -VerifiedMap @{ 'cf.example.net' = @('10.0.0.9') } `
-            -ManagedDomains $script:AllDomains -InvalidPreviousDomains @('example.org')
+            -ManagedDomains $script:AllDomains -DropPreviousDomains @('example.org')
         $second.Text | Should -Not -Match '10\.0\.0\.2'
         $second.Text | Should -Match '(?m)^203\.0\.113\.11 example\.org'
     }
@@ -227,6 +227,25 @@ Describe '写入与回滚' {
 
         Invoke-HostsRollback -HostsPath $tmp -BackupDir $backupDir | Out-Null
         (Get-Content $tmp -Raw).Trim() | Should -Be 'new'
+    }
+
+    It '回滚只使用匹配 hostsPath 的备份' {
+        $hostsA = Join-Path $TestDrive 'hosts-iso-a.txt'
+        $hostsB = Join-Path $TestDrive 'hosts-iso-b.txt'
+        [IO.File]::WriteAllText($hostsA, "current-a`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($hostsB, "current-b`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-iso'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bakA = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        $bakB = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($bakA, "backup-a`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($bakB, "backup-b`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bakA.json", (@{ hostsPath = $hostsA } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$bakB.json", (@{ hostsPath = $hostsB } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        Invoke-HostsRollback -HostsPath $hostsB -BackupDir $dir | Out-Null
+        (Get-Content $hostsB -Raw).Trim() | Should -Be 'backup-b'
+        (Get-Content $hostsA -Raw).Trim() | Should -Be 'current-a'
     }
 
     It '内容无变化时不写、不产生备份' {

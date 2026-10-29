@@ -82,6 +82,29 @@ Describe 'Select-DomainIp' {
     }
 }
 
+Describe 'Get-PreviousAction' {
+    It '无旧映射时 none' {
+        Get-PreviousAction -HasPrevious $false -Baseline ([pscustomobject]@{ Class = 'bad' }) -Decision ([pscustomobject]@{ IP = $null }) |
+            Should -Be 'none'
+    }
+    It '有可用决策时 keep' {
+        Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'ok' }) -Decision ([pscustomobject]@{ IP = '1.1.1.1' }) |
+            Should -Be 'keep'
+    }
+    It '明确 1034 时 drop' {
+        Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'restricted' }) -Decision ([pscustomobject]@{ IP = $null }) |
+            Should -Be 'drop'
+    }
+    It '连接失败默认保留' {
+        Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'bad' }) -Decision ([pscustomobject]@{ IP = $null }) |
+            Should -Be 'keep-unreachable'
+    }
+    It 'DropUnreachable 时 drop' {
+        Get-PreviousAction -HasPrevious $true -Baseline ([pscustomobject]@{ Class = 'bad' }) -Decision ([pscustomobject]@{ IP = $null }) -DropUnreachable |
+            Should -Be 'drop'
+    }
+}
+
 Describe 'Test-IpInCidr' {
     It '匹配网段内地址' {
         Test-IpInCidr -Ip '104.16.0.5' -Cidr '104.16.0.0/13' | Should -BeTrue

@@ -79,9 +79,14 @@ param(
     [switch]$Prune,
     [switch]$CheckResolved,
     [switch]$ExperimentalRanges,
+    [switch]$DropUnreachable,
     [ValidateRange(1, 3)][int]$TopN = 1,
     [ValidateRange(1, 5)][int]$CandidatesPerDomain = 3,
+    [ValidateRange(0, 5)][int]$BackfillCandidates = 1,
+    [ValidateRange(1, 16)][int]$MaxDomainProbes = 6,
+    [ValidateRange(2, 15)][int]$VerifyTimeoutSec = 5,
     [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
+    [ValidateRange(0, 20)][int]$ConfirmThresholdPct = 5,
     [string[]]$Domains,
     [string]$DomainsFile,
     [string]$CfstPath,
@@ -93,12 +98,17 @@ param(
     [ValidateRange(4, 64)][int]$ThroughputCandidates = 32,
     [ValidateRange(1, 3)][int]$ThroughputSamples = 1,
     [ValidateRange(500000, 20000000)][int]$ThroughputBytes = 1000000,
-    [ValidateRange(0, 16)][int]$RefineTop = 6,
-    [ValidateRange(0, 5000)][int]$VerifyDelayMs = 400
+    [ValidateRange(1, 16)][int]$RefineTop = 6,    [ValidateRange(0, 5000)][int]$VerifyDelayMs = 400
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.0'
+$ScriptVersion = '0.3.1'
+
+# -Version 放在加载 lib 之前，库缺失/损坏时也能用
+if ($Version) {
+    [Console]::Out.WriteLine("pt-cf-optimize $ScriptVersion")
+    exit 0
+}
 
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:RepoRoot = $Root
@@ -141,12 +151,12 @@ function Assert-AdminForPath {
 
 function Find-Cfst {
     param([string]$Explicit)
-    $cands = @()
-    if ($Explicit) { $cands += $Explicit }
-    $cands += (Join-Path $Root 'cfst\cfst.exe')
-    $cands += (Join-Path $Root 'cfst.exe')
-    foreach ($c in $cands) {
-        if ($c -and (Test-Path -LiteralPath $c)) { return (Resolve-Path -LiteralPath $c).Path }
+    if ($Explicit) {
+        if (Test-Path -LiteralPath $Explicit) { return (Resolve-Path -LiteralPath $Explicit).Path }
+        throw "指定的 cfst.exe 不存在：$Explicit"
+    }
+    foreach ($c in @((Join-Path $Root 'cfst\cfst.exe'), (Join-Path $Root 'cfst.exe'))) {
+        if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
     }
     return $null
 }
@@ -210,15 +220,11 @@ function Invoke-Main {
     $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
-    if ($Version) {
-        [Console]::Out.WriteLine("pt-cf-optimize $ScriptVersion")
-        return 0
-    }
     if ($Rollback -and $DryRun) { Fail '-Rollback 不能与 -DryRun 同时使用。' 2 }
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
-        $backupDir = Get-HostsBackupDir -FallbackRoot $Root
+        $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
         $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -Force:$Force
         $flush = Clear-DnsCache
         Say "已恢复 hosts：$($r.Restored)" 'Green'
@@ -268,7 +274,19 @@ function Invoke-Main {
         $hostsLines = @($doc.Text -split "`r?`n")
         $blockInfo = Get-HostsBlockInfo -Lines $hostsLines
         $previousMap = Get-HostsBlockMap -Lines $hostsLines -BlockInfo $blockInfo
+
+        # 提前检查多别名/IPv6/其他工具区块冲突，避免扫描几分钟后才失败
+        $preflightSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $domainList) { [void]$preflightSet.Add($d) }
+        $preflight = Get-HostsOutsideInfo -Lines $hostsLines -BlockInfo $blockInfo -ManagedSet $preflightSet
+        if ($preflight.Conflicts.Count -gt 0) {
+            $details = ($preflight.Conflicts | ForEach-Object {
+                    "第 $($_.Line) 行 [$($_.Reason)]：$($_.Hosts)"
+                }) -join '; '
+            Fail "hosts 中存在需要人工处理的映射，已中止且未修改：$details" 4
+        }
     } catch {
+        if ($script:FailCode) { throw }
         Fail $_.Exception.Message 4
     }
 
@@ -276,7 +294,10 @@ function Invoke-Main {
     $ranges = Get-CfRanges -Experimental:$ExperimentalRanges
     $latency = @()
     $cfst = $null
-    if (-not $NoCfst) { $cfst = Find-Cfst -Explicit $CfstPath }
+    if (-not $NoCfst) {
+        try { $cfst = Find-Cfst -Explicit $CfstPath }
+        catch { Fail $_.Exception.Message 2 }
+    }
 
     if ($cfst) {
         Say "使用 CFST 做全量延迟扫描：$cfst" 'Cyan'
@@ -328,6 +349,7 @@ function Invoke-Main {
         Select-Object -First $RefineTop)
 
     $globalCandidates = @()
+    $reserveCandidates = @()
     if ($promoted.Count -gt 0) {
         # 决赛：3 x 2MB，串行，避免互相抢带宽
         $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1 -MaxTime 15)
@@ -349,9 +371,10 @@ function Invoke-Main {
         $finalRows | Select-Object IP, Colo, Loss, Ttfb, SpeedMBps, Valid |
             Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
 
-        $globalCandidates = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
-            Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false } |
-            Select-Object -First $CandidatesPerDomain)
+        $rankedFinal = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
+            Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false })
+        $globalCandidates = @($rankedFinal | Select-Object -First $CandidatesPerDomain)
+        $reserveCandidates = @($rankedFinal | Select-Object -Skip $CandidatesPerDomain -First $BackfillCandidates)
     } else {
         Say '警告：没有候选通过吞吐初测，本次只做基线与兜底检查。' 'Yellow'
     }
@@ -364,46 +387,72 @@ function Invoke-Main {
     } else {
         Say '  （无）' 'Yellow'
     }
+    if ($reserveCandidates.Count -gt 0) {
+        Say '补位候选（前几个都不可用时才测）：' 'Cyan'
+        $reserveCandidates | Select-Object IP, Colo, Ttfb, SpeedMBps |
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+    }
     Say ''
 
     # ---- 逐域名选择：基线 = 当前 hosts/DNS 路径 ----
     $map = @{}
     $decisions = @()
-    $invalidPrevious = @()
+    $dropPrevious = @()
 
     Say '逐域名验证与选择（基线 = 当前 hosts/DNS 路径）...' 'Cyan'
     foreach ($d in $domainList) {
         # 1) 基线：不指定 IP，走系统当前路径
-        $baseResult = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime 8
+        $baseResult = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
         $baseline = [pscustomobject]@{
             IP = $baseResult.RemoteIp; Ok = $baseResult.Ok
             Class = $baseResult.Class; Ttfb = $baseResult.Ttfb
         }
         $baselineFromBlock = $previousMap.Contains($d)
 
-        # 2) 候选：全局前 K + 旧映射（去重）
+        # 2) 候选：全局前 K + 补位 + 旧映射（去重，受 MaxDomainProbes 约束）
         $candidates = @()
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        if ($baseline.IP) { [void]$seen.Add($baseline.IP) }
+        if ($baseline.IP -and $baseline.Ok) { [void]$seen.Add($baseline.IP) }
+        $probes = 0
 
         foreach ($p in $globalCandidates) {
+            if ($probes -ge $MaxDomainProbes) { break }
             if ($seen.Contains($p.IP)) { continue }
-            $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime 8
+            $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
             $candidates += [pscustomobject]@{
                 IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'global'
             }
             [void]$seen.Add($p.IP)
+            $probes++
             Start-Sleep -Milliseconds $VerifyDelayMs
+        }
+
+        # 前 K 个都没有可用结果时，才测补位候选
+        $anyWorking = @($candidates | Where-Object { $_.Ok }).Count -gt 0
+        if (-not $anyWorking) {
+            foreach ($p in $reserveCandidates) {
+                if ($probes -ge $MaxDomainProbes) { break }
+                if ($seen.Contains($p.IP)) { continue }
+                $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                $candidates += [pscustomobject]@{
+                    IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'reserve'
+                }
+                [void]$seen.Add($p.IP)
+                $probes++
+                Start-Sleep -Milliseconds $VerifyDelayMs
+            }
         }
 
         if ($baselineFromBlock) {
             foreach ($ip in @($previousMap[$d] | Select-Object -Unique)) {
+                if ($probes -ge $MaxDomainProbes) { break }
                 if ($seen.Contains($ip)) { continue }
-                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
+                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
                 $candidates += [pscustomobject]@{
                     IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'previous'
                 }
                 [void]$seen.Add($ip)
+                $probes++
                 Start-Sleep -Milliseconds $VerifyDelayMs
             }
         }
@@ -413,12 +462,14 @@ function Invoke-Main {
         $anyRestricted = ($baseline.Class -eq 'restricted') -or
             (@($candidates | Where-Object { $_.Class -eq 'restricted' }).Count -gt 0)
         if (-not $anyWorking -and $anyRestricted) {
-            $dnsIps = @(Resolve-DnsName -Name $d -Type A -DnsOnly -ErrorAction SilentlyContinue |
-                    Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress } |
+            $dnsIps = @(Resolve-DnsName -Name $d -Type A -DnsOnly -NoHostsFile -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Type -eq 'A' -and $_.IPAddress } |
+                    ForEach-Object { $_.IPAddress } |
+                    Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and (Test-IpAllowed -Ip $_ -Ranges $ranges) } |
                     Select-Object -Unique | Select-Object -First 2)
             foreach ($ip in $dnsIps) {
                 if ($seen.Contains($ip)) { continue }
-                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime 6
+                $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
                 $candidates += [pscustomobject]@{
                     IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'dns'
                 }
@@ -430,24 +481,54 @@ function Invoke-Main {
         # 4) 选择：只有改善足够或基线失败才切换
         $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
 
+        # 4b) 改善接近阈值时，基线和最佳候选各复核一次
+        if ($ConfirmThresholdPct -gt 0 -and $baseline.Ok -and $null -ne $decision.ImprovementPct -and
+            [math]::Abs([double]$decision.ImprovementPct - $MinImprovementPct) -le $ConfirmThresholdPct) {
+            $best = @($candidates | Where-Object { $_.Ok -and $_.IP } |
+                Sort-Object @{ Expression = { if ($_.Class -eq 'ok') { 0 } else { 1 } } },
+                            @{ Expression = 'Ttfb'; Descending = $false } |
+                Select-Object -First 1)
+            if ($best.Count -gt 0) {
+                $b2 = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
+                Start-Sleep -Milliseconds $VerifyDelayMs
+                $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                if ($b2.Ok -and $c2.Ok) {
+                    $avgBase = ($baseline.Ttfb + $b2.Ttfb) / 2.0
+                    $avgBest = ($best[0].Ttfb + $c2.Ttfb) / 2.0
+                    $baseline = [pscustomobject]@{ IP = $baseline.IP; Ok = $true; Class = $baseline.Class; Ttfb = $avgBase }
+                    $candidates = @($candidates | ForEach-Object {
+                            if ($_.IP -eq $best[0].IP) {
+                                [pscustomobject]@{ IP = $_.IP; Colo = $_.Colo; Ok = $_.Ok; Class = $_.Class; Ttfb = $avgBest; Source = $_.Source }
+                            } else { $_ }
+                        })
+                    $decision = Select-DomainIp -Baseline $baseline -Candidates $candidates -MinImprovementPct $MinImprovementPct
+                }
+                Start-Sleep -Milliseconds $VerifyDelayMs
+            }
+        }
+
+        # 5) 行动
         if ($decision.Changed -and $decision.IP) {
             $ordered = @($decision.IP)
             if ($TopN -gt 1) {
-                $extra = @($candidates | Where-Object { $_.Ok -and $_.IP -ne $decision.IP } |
-                    Sort-Object @{ Expression = { if ($_.Class -eq 'ok') { 0 } else { 1 } } },
-                                @{ Expression = 'Ttfb'; Descending = $false } |
+                $chosenObj = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
+                $chosenClass = if ($chosenObj.Count -gt 0) { $chosenObj[0].Class } else { $baseline.Class }
+                $chosenT = if ($chosenObj.Count -gt 0) { $chosenObj[0].Ttfb } else { $baseline.Ttfb }
+                $extra = @($candidates | Where-Object {
+                        $_.Ok -and $_.IP -ne $decision.IP -and $_.Class -eq $chosenClass -and
+                        $_.Ttfb -le ($chosenT * 1.5)
+                    } | Sort-Object @{ Expression = 'Ttfb'; Descending = $false } |
                     Select-Object -First ($TopN - 1) | ForEach-Object { $_.IP })
                 $ordered += $extra
             }
             $map[$d] = $ordered
-        } elseif (-not $decision.IP -and $baselineFromBlock) {
-            $invalidPrevious += $d
+            $action = 'update'
+        } elseif ($decision.IP) {
+            $action = if ($baselineFromBlock) { 'keep' } else { 'dns' }
+        } else {
+            $action = Get-PreviousAction -HasPrevious:$baselineFromBlock -Baseline $baseline -Decision $decision -DropUnreachable:$DropUnreachable
+            if ($action -eq 'drop') { $dropPrevious += $d }
         }
-
-        $action = if ($decision.Changed) { 'update' }
-                  elseif ($decision.IP) { if ($baselineFromBlock) { 'keep' } else { 'dns' } }
-                  elseif ($baselineFromBlock) { 'drop' }
-                  else { 'none' }
 
         $chosenTtfb = $null
         if ($decision.IP) {
@@ -458,7 +539,8 @@ function Invoke-Main {
         $decisions += [pscustomobject]@{
             Domain     = $d
             BaselineIP = $baseline.IP
-            BaseTTFB   = [math]::Round($baseline.Ttfb, 2)
+            BaseState  = $baseline.Class
+            BaseTTFB   = if ($baseline.Ok) { [math]::Round($baseline.Ttfb, 2) } else { $null }
             ChosenIP   = $decision.IP
             ChosenTTFB = $chosenTtfb
             ImprovePct = $decision.ImprovementPct
@@ -466,10 +548,14 @@ function Invoke-Main {
             Action     = $action
         }
 
-        if ($decision.Changed) {
+        if ($action -eq 'update') {
             Say ("  {0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $decision.Reason) 'Green'
-        } elseif ($decision.IP) {
+        } elseif ($action -in @('keep', 'dns')) {
             Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $decision.IP, $decision.Reason) 'DarkGray'
+        } elseif ($action -eq 'keep-unreachable') {
+            Say ("  {0,-24} 未验证通过，保留旧映射（-DropUnreachable 可删除）" -f $d) 'Yellow'
+        } elseif ($action -eq 'drop') {
+            Say ("  {0,-24} 旧映射为 1034 受限，已丢弃" -f $d) 'Yellow'
         } else {
             Say ("  {0,-24} 无可用候选" -f $d) 'Yellow'
         }
@@ -478,7 +564,7 @@ function Invoke-Main {
 
     # ---- 更新 hosts ----
     try {
-        $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -InvalidPreviousDomains $invalidPrevious
+        $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -DropPreviousDomains $dropPrevious
     } catch {
         Fail $_.Exception.Message 4
     }
@@ -495,7 +581,7 @@ function Invoke-Main {
         Say ''
         Say "变更检测：$(if ($update.Changed) { '会修改 hosts' } else { '内容无变化，不会写入' })" 'DarkGray'
     } else {
-        $backupDir = Get-HostsBackupDir -FallbackRoot $Root
+        $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
         try {
             $write = Write-HostsDocument -Document $doc -Update $update -BackupDir $backupDir -Version $ScriptVersion
         } catch {
@@ -528,15 +614,20 @@ function Invoke-Main {
     if ($decisions.Count -gt 0) {
         Say ''
         Say '==== 逐域名决策 ====' 'Cyan'
-        $decisions | Select-Object Domain, BaselineIP, BaseTTFB, ChosenIP, ChosenTTFB, ImprovePct, Reason, Action |
-            Format-Table -AutoSize | Out-String -Width 240 | ForEach-Object { Say $_.TrimEnd() }
+        $decisions | Select-Object Domain, BaselineIP, BaseState, BaseTTFB, ChosenIP, ChosenTTFB, ImprovePct, Reason, Action |
+            Format-Table -AutoSize | Out-String -Width 260 | ForEach-Object { Say $_.TrimEnd() }
     }
 
     Say ''
     Say '说明：' 'Cyan'
+    $unreachable = @($decisions | Where-Object { $_.Action -eq 'keep-unreachable' } | ForEach-Object { $_.Domain })
+    if ($unreachable.Count -gt 0) {
+        Say '以下域名本次未验证通过，已保留旧映射（-DropUnreachable 可删除）：' 'Yellow'
+        foreach ($f in $unreachable) { Say "  - $f" 'DarkGray' }
+    }
     $failed = @($decisions | Where-Object { $_.Action -in @('drop', 'none') } | ForEach-Object { $_.Domain })
     if ($failed.Count -gt 0) {
-        Say '以下域名没有可用候选（可能非 CF、不可用或边缘受限），未更新：' 'Yellow'
+        Say '以下域名没有可用候选（可能非 CF、不可用或边缘受限），未写入：' 'Yellow'
         foreach ($f in $failed) { Say "  - $f" 'DarkGray' }
     }
     Say 'hosts 只影响这些域名的网页/tracker；P2P 和 IPv6 对等连接不受影响。' 'DarkGray'
@@ -555,14 +646,14 @@ if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Version -and -n
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
 
-$exitCode = 0
+$script:ExitCode = 0
 try {
-    $exitCode = Invoke-Main
+    Invoke-Main | Out-Null
 } catch {
     $msg = $_.Exception.Message
     Write-Host "错误：$msg" -ForegroundColor Red
     $script:Log.Add("ERROR: $msg")
-    $exitCode = if ($script:FailCode) { $script:FailCode } else { 1 }
+    $script:ExitCode = if ($script:FailCode) { $script:FailCode } else { 1 }
 }
 
 if ($script:ReportPathResolved) {
@@ -573,4 +664,4 @@ if ($script:ReportPathResolved) {
     }
 }
 
-exit $exitCode
+exit $script:ExitCode

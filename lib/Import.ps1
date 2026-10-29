@@ -26,6 +26,17 @@ function Get-DepilerDomains {
     $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $ZipPath).Path)
     try {
         # 只读取 metadata.json；cookies.json / userInfo.json 等一律不打开
+        $metaEntries = @($zip.Entries | Where-Object { $_.FullName -ceq 'metadata.json' })
+        if ($metaEntries.Count -eq 0) {
+            throw '备份里没有 metadata.json。请确认这是 PT-Depiler 的完整备份。'
+        }
+        if ($metaEntries.Count -gt 1) {
+            throw '备份中存在多个同名 metadata.json，拒绝处理。'
+        }
+        if ($metaEntries[0].Length -gt 8MB) {
+            throw 'metadata.json 解压后超过 8MB，拒绝处理。'
+        }
+
         $json = Read-ZipTextEntry -Zip $zip -Name 'metadata.json'
         if (-not $json) {
             throw '备份里没有 metadata.json。请确认这是 PT-Depiler 的完整备份。'

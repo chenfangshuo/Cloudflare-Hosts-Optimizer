@@ -6,7 +6,7 @@ BeforeAll {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     function New-TestZip {
-        param([string]$Path, [switch]$NoMetadata, [switch]$BadMetadata)
+        param([string]$Path, [switch]$NoMetadata, [switch]$BadMetadata, [switch]$DuplicateMetadata)
 
         $zip = [IO.Compression.ZipFile]::Open($Path, 'Create')
         try {
@@ -28,6 +28,12 @@ BeforeAll {
                 $e = $zip.CreateEntry('metadata.json')
                 $w = [IO.StreamWriter]::new($e.Open())
                 try { $w.Write($meta) } finally { $w.Dispose() }
+
+                if ($DuplicateMetadata) {
+                    $e2 = $zip.CreateEntry('metadata.json')
+                    $w2 = [IO.StreamWriter]::new($e2.Open())
+                    try { $w2.Write('{}') } finally { $w2.Dispose() }
+                }
             }
             # 故意放入非法 JSON 和 canary：导入器不应读取它们
             foreach ($pair in @(@('cookies.json', '%%%not json%%%'), @('userInfo.json', 'SECRET_CANARY'))) {
@@ -71,6 +77,12 @@ Describe 'Get-DepilerDomains' {
         New-TestZip -Path $zip
         $r = Get-DepilerDomains -ZipPath $zip -WithAlternates -WithOffline
         $r.Domains | Should -HaveCount 4
+    }
+
+    It '重复 metadata.json 时报错' {
+        $zip = Join-Path $TestDrive 'ptd-dup.zip'
+        New-TestZip -Path $zip -DuplicateMetadata
+        { Get-DepilerDomains -ZipPath $zip } | Should -Throw '*多个同名*'
     }
 
     It '缺少 metadata.json 时报错' {

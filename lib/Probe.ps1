@@ -91,13 +91,15 @@ function Invoke-CurlProbe {
         [int]$MaxTime = 10,
         [string]$Output = 'NUL',
         [string]$Proto = '=https',
-        [string]$Range
+        [string]$Range,
+        [int]$MaxFileSize = 0
     )
 
     $curlArgs = @('-q', '-sS', '--noproxy', '*', '--max-redirs', '0', '--proto', $Proto, '--max-time', [string]$MaxTime)
     if ($Head) { $curlArgs += '-I' }
     if ($Resolve) { $curlArgs += @('--resolve', $Resolve) }
     if ($Range) { $curlArgs += @('--range', $Range) }
+    if ($MaxFileSize -gt 0) { $curlArgs += @('--max-filesize', [string]$MaxFileSize) }
     if ($Output) { $curlArgs += @('-o', $Output) }
     $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
     $curlArgs += @('-w', $fmt)
@@ -411,8 +413,14 @@ function Test-DomainIp {
                 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('cf-body-' + [guid]::NewGuid().ToString('N') + '.txt')
                 try {
                     $null = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" `
-                        -Resolve $resolveArg -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191'
-                    $body = if (Test-Path -LiteralPath $tmp) { Get-Content -LiteralPath $tmp -Raw -ErrorAction SilentlyContinue } else { '' }
+                        -Resolve $resolveArg -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191' -MaxFileSize 65536
+                    $body = ''
+                    if (Test-Path -LiteralPath $tmp) {
+                        # 只读前 16KB，避免错误页异常大时占用内存
+                        $bytes = [IO.File]::ReadAllBytes($tmp)
+                        $take = [math]::Min($bytes.Length, 16384)
+                        if ($take -gt 0) { $body = [Text.Encoding]::UTF8.GetString($bytes, 0, $take) }
+                    }
                     $cf = Get-CfErrorClass -Body $body
                     if ($cf -eq 'restricted') { $class = 'restricted' }
                     elseif ($r.Http -eq '403') { $class = 'waf' }
@@ -476,4 +484,21 @@ function Select-DomainIp {
         return [pscustomobject]@{ IP = $best.IP; Changed = $true; Reason = 'improved'; ImprovementPct = $improvement }
     }
     return [pscustomobject]@{ IP = $Baseline.IP; Changed = $false; Reason = 'below-threshold'; ImprovementPct = $improvement }
+}
+
+# 本次没有可用决策时，如何处理旧映射。
+# 只有明确的 1034/1003 才自动丢弃；连接失败默认保留，除非显式 -DropUnreachable。
+function Get-PreviousAction {
+    [CmdletBinding()]
+    param(
+        [bool]$HasPrevious,
+        $Baseline,
+        $Decision,
+        [switch]$DropUnreachable
+    )
+    if (-not $HasPrevious) { return 'none' }
+    if ($Decision -and $Decision.IP) { return 'keep' }
+    if ($Baseline -and $Baseline.Class -eq 'restricted') { return 'drop' }
+    if ($DropUnreachable) { return 'drop' }
+    return 'keep-unreachable'
 }

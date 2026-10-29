@@ -220,7 +220,7 @@ function Update-HostsDocument {
         [Parameter(Mandatory)]$Document,
         [Parameter(Mandatory)][hashtable]$VerifiedMap,
         [Parameter(Mandatory)][string[]]$ManagedDomains,
-        [AllowEmptyCollection()][string[]]$InvalidPreviousDomains = @(),
+        [AllowEmptyCollection()][string[]]$DropPreviousDomains = @(),
         [switch]$Prune
     )
 
@@ -240,12 +240,12 @@ function Update-HostsDocument {
     }
 
     # 增量合并：成功 -> 更新；失败 -> 保留 previous；不在输入中 -> 默认保留
-    $invalidSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($x in $InvalidPreviousDomains) { [void]$invalidSet.Add($x) }
+    $dropSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($x in $DropPreviousDomains) { [void]$dropSet.Add($x) }
 
     $final = [ordered]@{}
     foreach ($pair in $previous.GetEnumerator()) {
-        if ($invalidSet.Contains($pair.Key)) { continue }
+        if ($dropSet.Contains($pair.Key)) { continue }
         if (-not $Prune -or $managedSet.Contains($pair.Key)) {
             $final[$pair.Key] = @($pair.Value)
         }
@@ -334,27 +334,54 @@ function Update-HostsDocument {
 
 function Get-HostsBackupDir {
     [CmdletBinding()]
-    param([string]$FallbackRoot)
+    param(
+        [string]$HostsPath,
+        [string]$FallbackRoot
+    )
 
+    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $isSystem = $true
+    if ($HostsPath) {
+        try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
+    }
+
+    # 非系统 hosts 使用按目标路径哈希隔离的子目录，避免沙箱备份被系统 hosts 回滚选中
+    $targetId = $null
+    if ($HostsPath -and -not $isSystem) {
+        $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
+        $targetId = $hash.Substring(0, 16)
+    }
+
+    $base = $null
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     if ($programData) {
         $candidate = Join-Path $programData 'pt-cf-optimize\backup'
         try {
             if (-not (Test-Path -LiteralPath $candidate)) {
                 New-Item -ItemType Directory -Force -Path $candidate | Out-Null
-                # 尽力收紧 ACL；失败不阻塞
                 try {
                     & icacls $candidate /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
                 } catch { }
             }
-            return $candidate
+            $base = $candidate
         } catch { }
     }
+    if (-not $base) {
+        $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
+        $base = Join-Path $root 'backup'
+    }
 
-    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
-    $fallback = Join-Path $root 'backup'
-    New-Item -ItemType Directory -Force -Path $fallback | Out-Null
-    return $fallback
+    $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        if ($targetId) {
+            try {
+                & icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
+            } catch { }
+        }
+    }
+    return $dir
 }
 
 function Backup-HostsDocument {
@@ -476,16 +503,44 @@ function Invoke-HostsRollback {
         [switch]$Force
     )
 
+    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $isSystem = $true
+    try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
+
     $dirs = @($BackupDir)
-    if ($LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $dirs += $LegacyBackupDir }
+    if ($isSystem -and $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $dirs += $LegacyBackupDir }
 
     $all = @(foreach ($d in $dirs) {
             if (-not (Test-Path -LiteralPath $d)) { continue }
             Get-ChildItem -LiteralPath $d -Filter 'hosts-*.bak' -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -notlike 'hosts-initial-*' }
         })
-    $baks = @($all | Sort-Object Name -Descending)
-    if ($baks.Count -eq 0) { throw "没有找到备份文件：$($dirs -join ', ')" }
+
+    # 按 manifest 的 hostsPath 过滤，确保沙箱备份不会被恢复到另一个目标
+    $valid = @()
+    foreach ($bak in $all) {
+        $manifestPath = "$($bak.FullName).json"
+        if (Test-Path -LiteralPath $manifestPath) {
+            try {
+                $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                if ($m.hostsPath) {
+                    $same = $false
+                    try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
+                    if (-not $same) { continue }
+                }
+                $valid += $bak
+            } catch { continue }
+        } else {
+            # 旧版无 manifest 的备份：只允许系统 hosts 从 legacy 目录使用
+            $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
+                ([IO.Path]::GetFullPath($bak.DirectoryName) -ieq [IO.Path]::GetFullPath($LegacyBackupDir))
+            if ($isLegacy -and -not $isSystem) { continue }
+            $valid += $bak
+        }
+    }
+
+    $baks = @($valid | Sort-Object Name -Descending)
+    if ($baks.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
 
     $latest = $baks[0]
     $manifestPath = "$($latest.FullName).json"
