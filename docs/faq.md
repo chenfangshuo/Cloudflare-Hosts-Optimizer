@@ -5,32 +5,57 @@
 本工具不改变你的出口 IP：它只改"连到哪个 CF 边缘节点"，流量仍然从你的家宽直接出去，
 登录 IP、tracker 上报 IP 都不变。
 
-前提是这些域名在代理旁路里。脚本会检查 Windows 系统代理的 `ProxyOverride`，
-缺失时会报红；也会检测 TUN 网卡。请不要用 VPN、机场、在线优选网站或公共反向代理
-访问 PT——那些才会让出口 IP 变化。
+前提是这些域名在代理旁路里。脚本会检查 WinINET 的 `ProxyOverride`，缺失时报警；
+也会检测 TUN 网卡。但它无法完整识别 PAC/WPAD、WinHTTP、应用级代理和 WFP 透明转发。
+请不要用 VPN、机场、在线优选网站或公共反向代理访问 PT。
 
-验证阶段每域名每 IP 只发 1 次 HEAD，不登录、不带 Cookie、不爬页面。
+验证阶段每域名每 IP 只发 1 次 HEAD，不登录、不带 Cookie、不访问 announce URL。
 具体规则以各站为准。
 
 ## 需要关掉 Clash / 代理吗？
 
 不需要。脚本里所有 curl 都带 `--noproxy '*'`，CFST 启动前也会清空
-`HTTP_PROXY/HTTPS_PROXY` 环境变量，所以测速走的是直连。
+`HTTP_PROXY/HTTPS_PROXY` 环境变量。
 
-唯一要避免的是 **TUN / 虚拟网卡模式**，它会接管全部流量，导致测速结果和出口 IP 都失真。
-脚本会检测并警告。
+唯一要避免的是 **TUN / 虚拟网卡模式**。检测到 TUN 时，非 DryRun 会中止；
+确认风险后可以加 `-Force`。
 
-## 为什么不用 DNS 替代 hosts？
+## 怎么导入域名？
 
-有些 PT 站点的公共 DNS 被污染（返回 Facebook/Twitter 的 IP），改 DNS 记录没有意义；
-hosts 是唯一可靠的方式。另外本工具不想改你的 DNS 服务器或路由器配置。
+四种来源：
 
-## 为什么只做 IPv4？我的 IPv6 呢？
+```powershell
+# PT-Depiler 备份（推荐；建议关闭备份加密后导出）
+.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip'
 
-在测试线路上，CF 的 IPv6 全部落到远端 LAX，3MB 下载只有约 83KB/s，明显不如 IPv4 候选。
+# Windows 系统代理旁路列表（零文件、零网络）
+.\Import-Domains.ps1 -Source ProxyBypass
 
-hosts 写入 A 记录后，Windows 对这些域名不再使用 DNS 的 AAAA，浏览器会走 IPv4 优选。
-**BitTorrent 的 IPv6 对等连接不受影响**，因为 hosts 只影响这几个域名的网页/tracker。
+# 文本 / 剪贴板
+.\Import-Domains.ps1 -Source Text -Path .\sites.txt
+.\Import-Domains.ps1 -Source Clipboard
+```
+
+默认输出 `domains.imported.txt`，不会覆盖 `domains.txt`。检查后用
+`-Merge` 合并，或手工复制。
+
+导入器只读取 PT-Depiler 备份里的 `metadata.json`，**绝不读取 `cookies.json` /
+`userInfo.json`**；控制台只打印数量，不打印域名、passkey 或完整 URL。
+
+## 我用的是 PTPP，不是 PT-Depiler，可以吗？
+
+PT-Depiler（PTD）是 PTPP 的 Manifest V3 继任者。本导入器针对 PT-Depiler 的备份结构
+（`metadata.json` 的 `sites` / `siteHostMap`）。
+
+如果你还在用 PTPP，最方便的方式是用 `-Source ProxyBypass` 或文本导入；
+PTPP 备份的 `userdatas.json` 结构不同，当前不保证支持。
+
+## 为什么默认只写 1 个 IP？
+
+hosts 不是带优先级的故障转移配置。即使按 TTFB 顺序写多行，系统和应用也不保证
+按文件顺序使用，更不保证首个失败就自动切换。多行反而可能让某些客户端先尝试一个不可用地址。
+
+所以默认 `-TopN 1`。确实想写多个可以 `-TopN 2`，但请理解这不等于冗余。
 
 ## 为什么下载速度没有变快？
 
@@ -38,51 +63,60 @@ hosts 只影响这些域名的网页和 tracker 通告。PT 的 P2P 传输是 Bi
 与 hosts 无关，取决于做种人数、你的 IPv6 连通性和运营商互联质量。
 网页变快 ≠ 下载变快。
 
-## 支持哪些站点？
+## 为什么只做 IPv4？我的 IPv6 呢？
 
-任何**由 Cloudflare 代理**的域名都支持。检测方法：
+在测试线路上，CF 的 IPv6 全部落到 LAX，3MB 下载只有约 83KB/s，明显不如 IPv4 候选。
 
-```powershell
-curl.exe -sI https://example.com | findstr /i "server:"
-```
-
-返回 `server: cloudflare` 即可。不是 CF 的站点会被逐站验证自动跳过。
-
-## 多久重跑一次？
-
-CF 的路由和运营商互联会变。建议每 1–2 周，或感觉变慢、出现大面积红种时重跑。
-不需要手工改 hosts。
+hosts 写入 A 记录后，Windows 通常不再使用 DNS 的 AAAA，浏览器会走 IPv4。
+**BitTorrent 的 IPv6 对等连接不受影响**。可以用 `-CheckResolved` 核对系统实际返回的地址。
 
 ## 某个站验证失败怎么办？
 
-脚本会保持该站原样（不写入 hosts），并在报告里列出。
+脚本会保留该站上一次的映射（如果之前写过），并在报告里列出。
 常见原因：
 
 - 站点不是 Cloudflare 托管；
 - 站点当前维护或源站故障（TCP/TLS 能连上但 HTTP 无响应）；
-- 站点对 HEAD 请求直接断开（少数 WAF）。
+- 站点对 HEAD 请求直接断开。
 
 等站点恢复后重跑即可。不要手工把 CF IP 写进去。
+
+## 报错"多别名行" / "foreign-block" / "ipv6-mapping" 是什么？
+
+这是安全中止，不是 bug：
+
+- **多别名行**：hosts 里有一行同时映射了多个主机名，其中包含你的目标域名。
+  自动注释整行会误伤其他主机名，所以脚本拒绝处理，让你手工拆分。
+- **foreign-block**：hosts 里有其他工具的托管区块（例如 `# S302 BEGIN/END`），
+  其中包含你的目标域名。脚本不会接管别的工具的条目。
+- **ipv6-mapping**：目标域名在 hosts 里已有 IPv6 条目，写 IPv4 可能仍然无效。
+
+按报错里的行号处理后重跑。
+
+## 报错"编码不支持"怎么办？
+
+hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16，
+脚本会拒绝改写，以免损坏原文件。用记事本/VS Code 另存为 UTF-8 后重试。
 
 ## 测速地址 403 怎么办？
 
 默认测速地址是 `https://speed.cloudflare.com/__down?bytes={bytes}`。
-如果你所在网络访问不了，可以用 `-SpeedTestUrl` 换成自建地址，例如参考
-[cmliu/CF-Workers-SpeedTestURL](https://github.com/cmliu/CF-Workers-SpeedTestURL)
-搭一个 Cloudflare Workers 测速地址。
+如果访问不了，可以用 `-SpeedTestUrl` 换成自建地址，例如参考
+[cmliu/CF-Workers-SpeedTestURL](https://github.com/cmliu/CF-Workers-SpeedTestURL)。
 
-注意：自建地址也应当由 Cloudflare 托管，否则 `--resolve` 固定 IP 的语义不成立。
+自定义地址必须：https、由 Cloudflare 托管、返回 HTTP 200、至少返回 `{bytes}` 字节、
+不重定向、不带凭据。否则样本会被判定为无效。
 
 ## 会消耗多少流量？
 
-一次完整运行大致是：
+一次完整运行大致：
 
-- 延迟扫描：每个候选几十字节的 trace 请求（CFST 扫描数千个 IP 也很轻）。
-- 吞吐初测：32 个 IP × 1MB ≈ 32MB（`-ThroughputCandidates` / `-ThroughputBytes` 可调）。
-- 复核：前 6 名 × 3MB × 2 ≈ 36MB。
+- 延迟扫描：每个候选几十字节的 trace 请求。
+- 吞吐初测：32 × 1MB ≈ 32MB。
+- 决赛：6 × 3 × 2MB ≈ 36MB。
 - 站点验证：每域名每 IP 1 次 HEAD，可忽略。
 
-合计约 70MB 量级，可通过参数调小。
+合计约 70MB，可通过 `-ThroughputCandidates`、`-ThroughputBytes`、`-RefineTop` 调整。
 
 ## 为什么需要管理员权限？
 
@@ -91,16 +125,16 @@ CF 的路由和运营商互联会变。建议每 1–2 周，或感觉变慢、�
 ## 怎么完全卸载？
 
 ```powershell
-# 先回滚
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 ```
 
-然后删除整个目录即可。脚本不会安装服务、驱动或计划任务。
+然后删除整个目录。脚本不会安装服务、驱动或计划任务。
+备份在 `%ProgramData%\pt-cf-optimize\backup`，可一并删除。
 
 ## 会覆盖 hosts 里的其他内容吗？
 
-不会。只处理 `domains.txt` 里列出的域名和一对标记区块；其他行逐字节保留。
-写入前自动备份，失败自动还原，也可以随时 `-Rollback`。
+不会。只处理域名列表里的域名和一对标记区块；其他行保持不变（在支持的编码下）。
+写入前自动备份，失败自动还原，可以随时 `-Rollback`。
 
 ## 能在 Linux / 路由器 / macOS 上用吗？
 

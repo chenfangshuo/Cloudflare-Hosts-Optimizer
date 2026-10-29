@@ -4,49 +4,58 @@
     优选 Cloudflare 边缘 IP 并写入 Windows hosts（适用于 PT 站等 CF 托管站点）。
 
 .DESCRIPTION
-    流程：CFST 全量测延迟/丢包 -> 取延迟最低的一批 -> 本脚本独立测吞吐
-          -> 按落地机房分层抽样 -> 按实测吞吐排序
-          -> 对每个域名做连通性验证 -> 备份 hosts -> 只替换标记区块 -> 刷新 DNS。
+    流程：CFST 全量测延迟/丢包 -> 延迟预筛 -> 探测机房并分层抽样
+          -> 独立吞吐初测 -> 决赛（3x2MB，串行）-> 逐域名 HEAD 验证
+          -> 严格解析 hosts -> 增量合并 -> 备份 -> 原子替换 -> 刷新 DNS。
 
-    为什么不用 CFST 的下载测速：
-      CFST 的默认测速地址可能失效（例如 cf.xiu2.xyz/url 返回 403），
-      会把错误页算出虚高速度。所以 CFST 只用 -dd（纯延迟/丢包），
-      吞吐量由本脚本直接请求 -SpeedTestUrl 实测，不依赖第三方测速地址。
-
-    安全边界：
-      * 只改 hosts 中本脚本管理的域名，其余内容逐字节保留。
-      * 只向测速地址做批量扫描；对目标站仅每域名每 IP 发 1 次 HEAD。
-      * 不登录、不带 Cookie、不爬页面、不改系统 DNS/网卡/防火墙/代理配置。
-      * 不改变出口 IP（前提：目标域名在代理旁路里）。
+    安全约束：
+      * 标记结构异常、编码无法识别、存在多别名/IPv6 冲突时，直接拒绝改写。
+      * 验证失败的域名保留上一次的映射；只有 -Prune 才删除。
+      * 只向测速地址做批量请求；对目标站仅每域名每 IP 1 次 HEAD。
+      * 不登录、不带 Cookie、不访问 announce URL。
 
 .PARAMETER DryRun
-    只扫描和验证，不写 hosts。
+    只扫描和验证，不修改 hosts。
 
 .PARAMETER Rollback
-    用最近一次备份恢复 hosts。
+    用最近一次备份恢复 hosts。可在 domains.txt 缺失时使用。
+
+.PARAMETER Version
+    打印版本号并退出。
+
+.PARAMETER Force
+    与 -Rollback 同用时允许覆盖写入后被其他程序修改过的 hosts；
+    与正常流程同用时允许在检测到 TUN 网卡后继续。
+
+.PARAMETER Prune
+    删除不再出现在 domains.txt 中的历史托管映射（默认保留）。
+
+.PARAMETER CheckResolved
+    写入后解析每个域名，报告系统实际返回的地址（用于核对是否走 IPv4）。
+
+.PARAMETER ExperimentalRanges
+    允许扫描 CF 官方列表之外的实验网段（104.28.0.0/14）。
 
 .PARAMETER TopN
-    最终写入的 IP 数量（1-3，默认 2）。每个域名逐个验证，只写验证通过的 IP。
+    每个域名写入的 IP 数（1-3，默认 1）。hosts 不保证多行之间的故障转移。
 
 .PARAMETER Domains
     域名列表，优先于 -DomainsFile。
 
 .PARAMETER DomainsFile
-    域名文件，默认 .\domains.txt。每行一个域名，# 开头为注释。
+    域名文件，默认 .\domains.txt。
 
 .PARAMETER CfstPath
-    CloudflareSpeedTest 的 cfst.exe 路径。不提供则自动查找 .\cfst\cfst.exe；
-    找不到就用内置 PowerShell 扫描。
+    cfst.exe 路径；不提供则自动查找 .\cfst\cfst.exe。
 
 .PARAMETER SpeedTestUrl
-    吞吐测速地址，支持 {bytes} 占位符。
-    默认 https://speed.cloudflare.com/__down?bytes={bytes}。
+    吞吐测速地址，支持 {bytes} 占位符。必须是 https，且由 Cloudflare 托管。
 
-.PARAMETER NoCfst
-    不查找 cfst.exe，强制使用内置扫描。
+.PARAMETER HostsPath
+    高级选项：hosts 文件路径，默认系统 hosts。用于测试/沙箱。
 
-.PARAMETER Version
-    打印版本号并退出。
+.PARAMETER ReportPath
+    报告文件路径。默认正常运行时写 .\last-report.txt；-DryRun 默认不写。
 
 .EXAMPLE
     .\pt-cf-optimize.ps1 -DryRun
@@ -56,6 +65,9 @@
 
 .EXAMPLE
     .\pt-cf-optimize.ps1 -Rollback
+
+.EXAMPLE
+    .\pt-cf-optimize.ps1 -Prune -TopN 1
 #>
 [CmdletBinding()]
 param(
@@ -63,11 +75,17 @@ param(
     [switch]$Rollback,
     [switch]$Version,
     [switch]$NoCfst,
-    [ValidateRange(1, 3)][int]$TopN = 2,
+    [switch]$Force,
+    [switch]$Prune,
+    [switch]$CheckResolved,
+    [switch]$ExperimentalRanges,
+    [ValidateRange(1, 3)][int]$TopN = 1,
     [string[]]$Domains,
     [string]$DomainsFile,
     [string]$CfstPath,
     [string]$SpeedTestUrl = 'https://speed.cloudflare.com/__down?bytes={bytes}',
+    [string]$HostsPath,
+    [string]$ReportPath,
     [ValidateRange(1, 5)][int]$ScanSamples = 2,
     [ValidateRange(16, 512)][int]$MaxCandidates = 192,
     [ValidateRange(4, 64)][int]$ThroughputCandidates = 32,
@@ -78,56 +96,28 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-$ScriptVersion = '0.1.0'
-
-$BeginMarker = '# >>> pt-cf-optimize BEGIN (auto-generated; -Rollback to undo) >>>'
-$EndMarker = '# <<< pt-cf-optimize END <<<'
-$LegacyTag = '# [pt-cf-optimize] '
+$ScriptVersion = '0.2.0'
 
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$BackupDir = Join-Path $Root 'backup'
-$ReportPath = Join-Path $Root 'last-report.txt'
-$HostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$script:RepoRoot = $Root
+
+. (Join-Path $Root 'lib\Domains.ps1')
+. (Join-Path $Root 'lib\HostsFile.ps1')
+. (Join-Path $Root 'lib\Probe.ps1')
 
 $script:Log = [System.Collections.Generic.List[string]]::new()
-
-if ($Version) {
-    Write-Output "pt-cf-optimize $ScriptVersion"
-    return
-}
-
-if (-not $DomainsFile) { $DomainsFile = Join-Path $Root 'domains.txt' }
-
-function Read-DomainsFile {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    $result = @()
-    foreach ($raw in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
-        $line = $raw.Trim()
-        if (-not $line -or $line.StartsWith('#')) { continue }
-        $hostName = ($line -split '\s+')[0].TrimEnd('.').ToLowerInvariant()
-        if ($hostName) { $result += $hostName }
-    }
-    return $result
-}
-
-if (-not $Domains -or $Domains.Count -eq 0) {
-    $Domains = @(Read-DomainsFile -Path $DomainsFile)
-}
-if (-not $Domains -or $Domains.Count -eq 0) {
-    throw "没有配置任何域名。请复制 domains.example.txt 为 domains.txt 并填入目标域名，或用 -Domains 指定。当前路径：$DomainsFile"
-}
-$Domains = @($Domains | ForEach-Object { $_.Trim().TrimEnd('.').ToLowerInvariant() } |
-    Where-Object { $_ } | Select-Object -Unique)
+$script:FailCode = 0
 
 function Say {
     param([string]$Text = '', [string]$Color = 'Gray')
     Write-Host $Text -ForegroundColor $Color
     $script:Log.Add($Text)
+}
+
+function Fail {
+    param([string]$Message, [int]$Code = 1)
+    $script:FailCode = $Code
+    throw $Message
 }
 
 function Assert-Admin {
@@ -138,44 +128,27 @@ function Assert-Admin {
     }
 }
 
-function Get-CurlExe {
-    $c = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if (-not $c) { throw '找不到 curl.exe（Windows 10/11 自带）。' }
-    return $c.Source
-}
-
-# ---------------------------------------------------------------------------
-# 备份 / 回滚
-# ---------------------------------------------------------------------------
-function Backup-Hosts {
-    if (-not (Test-Path -LiteralPath $BackupDir)) {
-        New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+# 只有目标是系统 hosts 时才需要管理员；-HostsPath 指向临时文件时不需要
+function Assert-AdminForPath {
+    param([string]$Path)
+    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    if ([IO.Path]::GetFullPath($Path) -ieq [IO.Path]::GetFullPath($systemHosts)) {
+        Assert-Admin
     }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dest = Join-Path $BackupDir "hosts-$stamp.bak"
-    Copy-Item -LiteralPath $HostsPath -Destination $dest -Force
-    Get-ChildItem -LiteralPath $BackupDir -Filter 'hosts-*.bak' |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 5 |
-        Remove-Item -Force
-    return $dest
 }
 
-function Invoke-Rollback {
-    Assert-Admin
-    $baks = @(Get-ChildItem -LiteralPath $BackupDir -Filter 'hosts-*.bak' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending)
-    if ($baks.Count -eq 0) { throw "没有找到备份文件：$BackupDir" }
-    $latest = $baks[0]
-    Copy-Item -LiteralPath $latest.FullName -Destination $HostsPath -Force
-    ipconfig /flushdns | Out-Null
-    Say "已用备份恢复 hosts：$($latest.Name)" 'Green'
-    Say "备份时间：$($latest.LastWriteTime)" 'DarkGray'
+function Find-Cfst {
+    param([string]$Explicit)
+    $cands = @()
+    if ($Explicit) { $cands += $Explicit }
+    $cands += (Join-Path $Root 'cfst\cfst.exe')
+    $cands += (Join-Path $Root 'cfst.exe')
+    foreach ($c in $cands) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    return $null
 }
 
-# ---------------------------------------------------------------------------
-# 代理旁路检查（只读，不修改 Clash 配置）
-# ---------------------------------------------------------------------------
 function Get-ProxyState {
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
     $v = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
@@ -202,19 +175,19 @@ function Test-BypassStrict {
 }
 
 function Show-ProxyCheck {
+    param([string[]]$TargetDomains)
     $p = Get-ProxyState
     if (-not $p.Enabled) {
-        Say '代理：未启用系统代理，所有流量直连。' 'Green'
+        Say '代理：未启用 WinINET 系统代理（这不排除 PAC/TUN/应用级代理）。' 'Yellow'
         return
     }
-    Say "代理：系统代理已开启 -> $($p.Server)" 'Yellow'
-    $missing = @($Domains | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $p.Bypass) })
+    Say "代理：WinINET 系统代理已开启 -> $($p.Server)" 'Yellow'
+    $missing = @($TargetDomains | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $p.Bypass) })
     if ($missing.Count -eq 0) {
-        Say '旁路：所有目标域名都在 ProxyOverride 中，PT 流量直连。' 'Green'
+        Say '旁路：目标域名均在 ProxyOverride 中（仅代表 WinINET 层直连）。' 'Green'
     } else {
-        Say '旁路：以下域名未在 ProxyOverride 中（会走代理，出口 IP 会变，有封号风险）：' 'Red'
+        Say '旁路：以下域名不在 ProxyOverride 中，可能走代理、导致出口 IP 变化：' 'Red'
         foreach ($m in $missing) { Say "  - $m" 'Red' }
-        Say '  请先在 Clash 旁路里补上这些域名，再重新运行。' 'Red'
     }
 }
 
@@ -223,537 +196,291 @@ function Test-TunAdapter {
             $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'TAP|TUN|Wintun|WireGuard|Tailscale|Clash|Mihomo'
         })
     if ($tun.Count -gt 0) {
-        Say '警告：检测到可能处于 TUN 模式的虚拟网卡（所有流量会被代理接管）：' 'Red'
+        Say '警告：检测到可能处于 TUN 模式的网卡（可能接管流量）：' 'Red'
         foreach ($t in $tun) { Say "  - $($t.Name) / $($t.InterfaceDescription)" 'Red' }
-        Say '  请关闭 TUN 模式后再扫描，否则测速结果和出口 IP 都不可信。' 'Red'
-        return $false
+        return $true
     }
-    Say '网卡：未检测到 TUN 模式虚拟网卡。' 'Green'
-    return $true
+    Say '网卡：未发现已知 TUN 虚拟网卡（这不等于已证明直连）。' 'Green'
+    return $false
 }
 
-# ---------------------------------------------------------------------------
-# 候选 IP
-# ---------------------------------------------------------------------------
-function New-CandidateIps {
-    param([int]$Count)
-    # 官方 Cloudflare IPv4 段（含 CFST 里能命中的 104.28.0.0/14）
-    $ranges = @(
-        @('173.245.48.0', 20), @('103.21.244.0', 22), @('103.22.200.0', 22), @('103.31.4.0', 22),
-        @('141.101.64.0', 18), @('108.162.192.0', 18), @('190.93.240.0', 20), @('188.114.96.0', 20),
-        @('197.234.240.0', 22), @('198.41.128.0', 17), @('162.158.0.0', 15), @('104.16.0.0', 13),
-        @('104.24.0.0', 14), @('104.28.0.0', 14), @('172.64.0.0', 13), @('131.0.72.0', 22)
-    )
-    # 本机实测有响应的种子，提高命中率
-    $seeds = @(
-        '104.16.0.1', '104.17.0.1', '104.18.0.1', '104.19.0.1', '104.20.0.1', '104.21.0.1',
-        '104.24.0.1', '104.25.0.1', '104.26.0.1', '104.26.4.1', '104.26.10.251', '104.27.0.1',
-        '104.28.0.1', '104.29.111.59', '104.16.192.1', '104.17.128.1', '104.17.141.134',
-        '104.17.240.1', '104.18.64.1', '104.18.128.1', '104.18.240.1', '104.19.64.1',
-        '104.20.64.1', '104.21.64.1', '162.158.0.1', '162.159.0.1', '188.114.96.1', '188.114.97.1'
-    )
-    $list = [System.Collections.Generic.List[string]]::new()
-    foreach ($s in $seeds) { if ($list.Count -lt $Count -and -not $list.Contains($s)) { $list.Add($s) } }
+function Invoke-Main {
+    $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
+    $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
-    $rnd = [System.Random]::new()
-    $guard = 0
-    while ($list.Count -lt $Count -and $guard -lt ($Count * 30)) {
-        $guard++
-        $r = $ranges[$rnd.Next($ranges.Count)]
-        $hostBits = 32 - [int]$r[1]
-        $base = [long]0
-        foreach ($o in ($r[0] -split '\.')) { $base = ($base -shl 8) -bor [long]$o }
-        $val = $base + [long]($rnd.NextDouble() * [math]::Pow(2, $hostBits))
-        $o1 = [int](($val -shr 24) -band 255)
-        $o2 = [int](($val -shr 16) -band 255)
-        $o3 = [int](($val -shr 8) -band 255)
-        $o4 = [int]($val -band 255)
-        if ($o4 -eq 0 -or $o4 -eq 255) { continue }
-        $ip = "$o1.$o2.$o3.$o4"
-        if (-not $list.Contains($ip)) { $list.Add($ip) }
+    if ($Version) {
+        Write-Output "pt-cf-optimize $ScriptVersion"
+        return 0
     }
-    return @($list)
-}
+    if ($Rollback -and $DryRun) { Fail '-Rollback 不能与 -DryRun 同时使用。' 2 }
 
-# ---------------------------------------------------------------------------
-# 延迟扫描
-# ---------------------------------------------------------------------------
-function Find-Cfst {
-    param([string]$Explicit)
-    $cands = @()
-    if ($Explicit) { $cands += $Explicit }
-    $cands += (Join-Path $Root 'cfst\cfst.exe')
-    $cands += (Join-Path $Root 'cfst.exe')
-    foreach ($c in $cands) {
-        if ($c -and (Test-Path -LiteralPath $c)) { return (Resolve-Path -LiteralPath $c).Path }
-    }
-    return $null
-}
-
-function Invoke-CfstLatencyScan {
-    param([string]$Exe)
-    $dir = Split-Path -Parent $Exe
-    $csv = Join-Path $dir 'result.csv'
-    if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv -Force }
-    if (-not (Test-Path -LiteralPath (Join-Path $dir 'ip.txt'))) {
-        Say "CFST 目录下缺少 ip.txt：$dir" 'Yellow'
-        return @()
+    if ($Rollback) {
+        Assert-AdminForPath $hostsPathResolved
+        $backupDir = Get-HostsBackupDir -FallbackRoot $Root
+        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -Force:$Force
+        $flush = Clear-DnsCache
+        Say "已恢复 hosts：$($r.Restored)" 'Green'
+        if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        return 0
     }
 
-    $proxyVars = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
-    $saved = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-    foreach ($k in $proxyVars) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
-
-    Push-Location $dir
-    try {
-        foreach ($k in $proxyVars) { [Environment]::SetEnvironmentVariable($k, $null) }
-        # -dd 只测延迟/丢包，不做下载测速（默认测速地址已失效，会给出假速度）
-        $cfstArgs = @('-dd', '-tlr', '0.05', '-p', '0', '-o', 'result.csv', '-f', 'ip.txt')
-        & $Exe @cfstArgs *> $null
-        $code = $LASTEXITCODE
-        Say "CFST 延迟扫描退出码：$code" 'DarkGray'
-        if (-not (Test-Path -LiteralPath $csv)) { return @() }
-
-        $rows = @()
-        foreach ($l in @(Get-Content -LiteralPath $csv -Encoding UTF8 | Select-Object -Skip 1)) {
-            if ([string]::IsNullOrWhiteSpace($l)) { continue }
-            $p = $l.Split(',')
-            if ($p.Count -lt 5) { continue }
-            $ip = $p[0].Trim()
-            if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { continue }
-            $loss = 1.0;  [void][double]::TryParse($p[3].Trim(), [ref]$loss)
-            $delay = 0.0; [void][double]::TryParse($p[4].Trim(), [ref]$delay)
-            if ($delay -le 0) { continue }
-            $rows += [pscustomobject]@{
-                IP = $ip; Loss = $loss; Ttfb = ($delay / 1000.0)
-                Colo = ''; Source = 'cfst'
-            }
+    # ---- 域名 ----
+    $domainList = @()
+    if ($Domains) {
+        foreach ($d in $Domains) {
+            $n = ConvertTo-NormalizedDomain -Value $d -Strict
+            if (-not $n) { Fail "非法域名：$d" 2 }
+            $domainList += $n
         }
-        return $rows
-    } finally {
-        Pop-Location
-        foreach ($k in $proxyVars) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
-    }
-}
-
-function Invoke-BuiltinLatencyScan {
-    param([string]$CurlExe, [int]$Candidates, [int]$Samples)
-
-    $ips = New-CandidateIps -Count $Candidates
-    Say "内置延迟扫描：$($ips.Count) 个候选 IP，每个 $Samples 次探测 ..." 'Cyan'
-
-    $probe = $ips | ForEach-Object -Parallel {
-        $ip = $_
-        $curlPath = $using:CurlExe
-        $sampleCount = $using:Samples
-
-        function Get-Median([double[]]$arr) {
-            if (-not $arr -or $arr.Count -eq 0) { return 0.0 }
-            $s = @($arr | Sort-Object)
-            $n = $s.Count
-            if ($n % 2 -eq 1) { return [double]$s[[int][math]::Floor($n / 2)] }
-            return ([double]$s[$n / 2 - 1] + [double]$s[$n / 2]) / 2.0
-        }
-
-        $ok = 0; $con = @(); $tls = @(); $ttf = @(); $colo = ''
-        for ($i = 0; $i -lt $sampleCount; $i++) {
-            $raw = & $curlPath -sS --noproxy '*' --max-time 6 `
-                --resolve "speed.cloudflare.com:443:$ip" `
-                -w '|@@|%{time_connect}|%{time_appconnect}|%{time_starttransfer}' `
-                'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
-            $exit = $LASTEXITCODE
-            $s = ($raw -join "`n")
-            if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
-            if ($exit -ne 0) { continue }
-            $p = (($s -split '\|@@\|')[-1]) -split '\|'
-            if ($p.Count -lt 3) { continue }
-            $ok++
-            $con += [double]$p[0]; $tls += [double]$p[1]; $ttf += [double]$p[2]
-        }
-        if ($ok -eq 0) { return }
-        [pscustomobject]@{
-            IP      = $ip
-            Colo    = $colo
-            Loss    = 1.0 - ($ok / [double]$sampleCount)
-            Connect = Get-Median $con
-            Tls     = Get-Median $tls
-            Ttfb    = Get-Median $ttf
-            Source  = 'builtin'
-        }
-    } -ThrottleLimit 24
-
-    return @($probe | Where-Object { $_ -and $_.Ttfb -gt 0 -and $_.Loss -le 0.05 } | Sort-Object Ttfb)
-}
-
-# ---------------------------------------------------------------------------
-# 独立吞吐测速（不依赖第三方测速地址）
-# ---------------------------------------------------------------------------
-function Invoke-ThroughputTest {
-    param([string]$CurlExe, $Candidates, [int]$Samples, [int]$Bytes, [string]$UrlTemplate)
-
-    $testUri = [uri]($UrlTemplate -replace '\{bytes\}', '1')
-    $testHost = $testUri.Host
-    $testPort = if ($testUri.Port -gt 0) { $testUri.Port } else { 443 }
-
-    Say "吞吐测速：$($Candidates.Count) 个 IP x $Samples 次 x $([math]::Round($Bytes / 1MB, 1))MB（$testHost）..." 'Cyan'
-    $rows = $Candidates | ForEach-Object -Parallel {
-        $ip = $_.IP
-        $curlPath = $using:CurlExe
-        $sampleCount = $using:Samples
-        $byteCount = $using:Bytes
-        $urlTemplate = $using:UrlTemplate
-        $resolveHost = $using:testHost
-        $resolvePort = $using:testPort
-        $speeds = @()
-        for ($i = 0; $i -lt $sampleCount; $i++) {
-            $url = $urlTemplate -replace '\{bytes\}', [string]$byteCount
-            $raw = & $curlPath -sS --noproxy '*' --max-time 30 `
-                --resolve "${resolveHost}:${resolvePort}:$ip" `
-                -o NUL -w '%{speed_download}|%{size_download}|%{time_total}' `
-                $url 2>$null
-            $p = (($raw -join '') -split '\|')
-            if ($p.Count -lt 3) { continue }
-            $bytesGot = 0.0; [void][double]::TryParse($p[1], [ref]$bytesGot)
-            $time = 0.0;     [void][double]::TryParse($p[2], [ref]$time)
-            if ($bytesGot -lt 500000 -or $time -le 0) { continue }
-            $speeds += ($bytesGot / $time)
-        }
-        if ($speeds.Count -eq 0) {
-            return [pscustomobject]@{ IP = $ip; SpeedMBps = 0.0; Samples = 0 }
-        }
-        $sorted = @($speeds | Sort-Object)
-        $median = $sorted[[int][math]::Floor($sorted.Count / 2)]
-        [pscustomobject]@{ IP = $ip; SpeedMBps = ($median / 1MB); Samples = $speeds.Count }
-    } -ThrottleLimit 6
-    return @($rows)
-}
-
-function Get-ColoForIp {
-    param([string]$CurlExe, [string]$Ip)
-    $raw = & $CurlExe -sS --noproxy '*' --max-time 6 `
-        --resolve "speed.cloudflare.com:443:$Ip" `
-        'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
-    $s = ($raw -join "`n")
-    if ($s -match 'colo=([A-Za-z]{3})') { return $matches[1].ToUpperInvariant() }
-    return ''
-}
-
-function Resolve-Colo {
-    param([string]$CurlExe, $Candidates)
-    $rows = $Candidates | ForEach-Object -Parallel {
-        $ip = $_.IP
-        $curlPath = $using:CurlExe
-        $raw = & $curlPath -sS --noproxy '*' --max-time 6 `
-            --resolve "speed.cloudflare.com:443:$ip" `
-            'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
-        $s = ($raw -join "`n")
-        $colo = ''
-        if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
-        [pscustomobject]@{ IP = $ip; Colo = $colo; Loss = $_.Loss; Ttfb = $_.Ttfb }
-    } -ThrottleLimit 16
-    return @($rows)
-}
-
-# 按落地机房轮流取样，避免延迟排序把候选全选成 HKG（HKG 延迟低但大流量极易卡死）
-function Select-Stratified {
-    param($Candidates, [int]$Count)
-    $groups = @($Candidates | Group-Object Colo |
-        Sort-Object { ($_.Group | Measure-Object -Property Ttfb -Minimum).Minimum })
-    $picked = @()
-    $idx = 0
-    while ($picked.Count -lt $Count) {
-        $added = $false
-        foreach ($g in $groups) {
-            if ($idx -lt $g.Group.Count) {
-                $picked += $g.Group[$idx]
-                $added = $true
-                if ($picked.Count -ge $Count) { break }
-            }
-        }
-        if (-not $added) { break }
-        $idx++
-    }
-    return @($picked)
-}
-
-# ---------------------------------------------------------------------------
-# 域名验证
-# ---------------------------------------------------------------------------
-function Test-DomainIp {
-    param([string]$Domain, [string]$Ip, [string]$CurlExe)
-    $raw = & $CurlExe -sS -I --noproxy '*' --max-time 10 `
-        --resolve "${Domain}:443:$Ip" `
-        -w '|@@|%{http_code}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}' `
-        "https://$Domain/" 2>$null
-    $exit = $LASTEXITCODE
-    $s = ($raw -join "`n")
-    $p = (($s -split '\|@@\|')[-1]) -split '\|'
-    $http = if ($p.Count -ge 1) { [string]$p[0] } else { '000' }
-    $con = if ($p.Count -ge 2) { [double]$p[1] } else { 0.0 }
-    $tls = if ($p.Count -ge 3) { [double]$p[2] } else { 0.0 }
-    $ttf = if ($p.Count -ge 4) { [double]$p[3] } else { 0.0 }
-    $ok = ($exit -eq 0 -and $http -match '^\d{3}$' -and $http -ne '000')
-    return [pscustomobject]@{ Ok = $ok; Http = $http; Connect = $con; Tls = $tls; Ttfb = $ttf; Exit = $exit }
-}
-
-# ---------------------------------------------------------------------------
-# 写 hosts（只动标记区块和本脚本管理的域名）
-# ---------------------------------------------------------------------------
-function Update-HostsFile {
-    param([string]$Path, [hashtable]$Map, [string[]]$AllDomains)
-
-    $bytes = [IO.File]::ReadAllBytes($Path)
-    $nonAscii = $false
-    foreach ($b in $bytes) { if ($b -gt 127) { $nonAscii = $true; break } }
-    $text = if ($nonAscii) { [Text.Encoding]::UTF8.GetString($bytes) } else { [Text.Encoding]::ASCII.GetString($bytes) }
-    $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $lines = $text -split "`r?`n"
-
-    $active = @($Map.Keys)
-    $out = [System.Collections.Generic.List[string]]::new()
-    $inBlock = $false
-
-    foreach ($line in $lines) {
-        $t = $line.Trim()
-        if ($t -eq $BeginMarker) { $inBlock = $true; continue }
-        if ($t -eq $EndMarker) { $inBlock = $false; continue }
-        if ($inBlock) { continue }
-
-        $isTagged = $t.StartsWith($LegacyTag)
-        $work = if ($isTagged) { $t.Substring($LegacyTag.Length).Trim() } else { $t }
-
-        if ($work -and -not $work.StartsWith('#')) {
-            $parts = $work -split '\s+'
-            if ($parts.Count -ge 2) {
-                $hostName = $parts[1].TrimEnd('.').ToLowerInvariant()
-                if ($active -contains $hostName) {
-                    # 仍在管理：保留为注释，实际地址由下面的区块提供
-                    $out.Add($LegacyTag + $work)
-                    continue
-                }
-                if ($isTagged) {
-                    # 本次未通过验证：还原用户原来的条目，避免把站弄挂
-                    $out.Add($work)
-                    continue
-                }
-            }
-        }
-        if ($isTagged) { $out.Add($work); continue }
-        $out.Add($line)
-    }
-
-    while ($out.Count -gt 0 -and $out[$out.Count - 1].Trim() -eq '') { $out.RemoveAt($out.Count - 1) }
-
-    $out.Add('')
-    $out.Add($BeginMarker)
-    foreach ($d in $AllDomains) {
-        if (-not $Map.ContainsKey($d)) { continue }
-        foreach ($ip in $Map[$d]) { $out.Add("$ip`t$d") }
-    }
-    $out.Add($EndMarker)
-    $out.Add('')
-
-    $newText = ($out -join $nl)
-    if (-not $newText.EndsWith($nl)) { $newText += $nl }
-    $enc = if ($nonAscii) { [Text.UTF8Encoding]::new($false) } else { [Text.ASCIIEncoding]::new() }
-    [IO.File]::WriteAllText($Path, $newText, $enc)
-}
-
-# ===========================================================================
-# 主流程
-# ===========================================================================
-Say ''
-Say '==== Cloudflare 优选 IP -> hosts ====' 'Cyan'
-Say "hosts: $HostsPath" 'DarkGray'
-Say "域名数: $($Domains.Count)" 'DarkGray'
-Say ''
-
-if ($Rollback) {
-    Invoke-Rollback
-    Say ''
-    Say '完成。' 'Green'
-    return
-}
-
-# 正式写入需要管理员；提前检查，避免扫描几分钟后才报错
-if (-not $DryRun) { Assert-Admin }
-
-$curlExe = Get-CurlExe
-
-Show-ProxyCheck
-[void](Test-TunAdapter)
-Say ''
-
-# --- 阶段 1：延迟/丢包筛选 ---
-$latency = @()
-$cfst = $null
-if (-not $NoCfst) { $cfst = Find-Cfst -Explicit $CfstPath }
-if ($cfst) {
-    Say "使用 CFST 做全量延迟扫描：$cfst" 'Cyan'
-    try {
-        $latency = @(Invoke-CfstLatencyScan -Exe $cfst)
-    } catch {
-        Say "CFST 运行失败：$($_.Exception.Message)" 'Yellow'
-        $latency = @()
-    }
-    if ($latency.Count -eq 0) { Say 'CFST 没有产出结果，改用内置扫描。' 'Yellow' }
-}
-if ($latency.Count -eq 0) {
-    if ($NoCfst) {
-        Say '已指定 -NoCfst，使用内置扫描。' 'Yellow'
-    } elseif (-not $cfst) {
-        Say '未找到 cfst.exe，使用内置扫描。' 'Yellow'
-        Say '（想更快更全：从官方 Releases 下载 cfst_windows_amd64.zip，解压到 .\cfst\ 后重跑）' 'DarkGray'
-    }
-    $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples)
-}
-if ($latency.Count -eq 0) {
-    throw '没有扫到任何可用 IP。请检查网络，或关闭代理/TUN 后重试。'
-}
-$latency = @($latency | Sort-Object Ttfb)
-Say "延迟/丢包筛选后可用 IP：$($latency.Count)，最佳 $($latency[0].IP)（$([math]::Round($latency[0].Ttfb * 1000))ms）" 'Gray'
-
-# 合理性检查：延迟 <5ms 基本只可能是走了代理
-$speedProxy = ($latency | Select-Object -First 10 | Measure-Object -Property Ttfb -Average).Average
-if ($speedProxy -lt 0.005) {
-    throw '平均延迟异常低（<5ms），疑似测速流量走了代理。请关闭系统代理/TUN 后重试。'
-}
-
-# --- 阶段 2：独立吞吐测速 ---
-# 先探明前 64 个候选的落地机房，再按机房分层抽样（避免候选被 HKG 全部占据）
-$pool = @($latency | Select-Object -First ([int][math]::Min(64, $latency.Count)))
-Say "探测候选落地区域（$($pool.Count) 个）..." 'Cyan'
-$pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool)
-$candidates = @(Select-Stratified -Candidates $pool -Count $ThroughputCandidates)
-$coloSummary = (@($candidates | Group-Object Colo | ForEach-Object {
-    $name = if ($_.Name) { $_.Name } else { '??' }
-    "$name x$($_.Count)"
-})) -join ', '
-Say "分层抽样 $($candidates.Count) 个（$coloSummary）" 'Gray'
-
-$tp = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $candidates -Samples $ThroughputSamples -Bytes $ThroughputBytes -UrlTemplate $SpeedTestUrl)
-$tpMap = @{}
-foreach ($t in $tp) { if ($t) { $tpMap[$t.IP] = [double]$t.SpeedMBps } }
-
-$ranked = foreach ($c in $candidates) {
-    $sp = if ($tpMap.ContainsKey($c.IP)) { $tpMap[$c.IP] } else { 0.0 }
-    [pscustomobject]@{
-        IP = $c.IP; Colo = $c.Colo; Loss = $c.Loss; Ttfb = $c.Ttfb; SpeedMBps = $sp
-    }
-}
-$ranked = @($ranked | Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true },
-                                   @{ Expression = 'Ttfb'; Descending = $false })
-
-# 对吞吐靠前的 IP 再做一次更长的复核（3MB x 2 次），减少抖动误判
-if ($RefineTop -gt 0) {
-    $refineList = @($ranked | Where-Object { $_.SpeedMBps -gt 0 } | Select-Object -First $RefineTop)
-    if ($refineList.Count -gt 0) {
-        $refine = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $refineList -Samples 2 -Bytes 3000000 -UrlTemplate $SpeedTestUrl)
-        $refMap = @{}
-        foreach ($r in $refine) { if ($r) { $refMap[$r.IP] = [double]$r.SpeedMBps } }
-        foreach ($r in $ranked) {
-            if ($refMap.ContainsKey($r.IP) -and $refMap[$r.IP] -gt 0) { $r.SpeedMBps = $refMap[$r.IP] }
-        }
-    }
-}
-
-$withSpeed = @($ranked | Where-Object { $_.SpeedMBps -gt 0 })
-if ($withSpeed.Count -gt 0) {
-    $ranked = @($withSpeed | Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true },
-                                     @{ Expression = 'Ttfb'; Descending = $false })
-} else {
-    Say '警告：所有候选都没完成吞吐测速，改为按延迟排序（可能只适合网页）。' 'Yellow'
-    $ranked = @($ranked | Sort-Object Ttfb)
-}
-
-Say ''
-Say '吞吐排名（前 8）：' 'Cyan'
-$ranked | Select-Object -First 8 IP, Colo, Loss, Ttfb, SpeedMBps |
-    Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
-
-$picks = @($ranked | Select-Object -First $TopN)
-# 补齐落地区域码（CFST 纯延迟模式没有这一列）
-foreach ($pk in $picks) {
-    if (-not $pk.Colo) { $pk.Colo = Get-ColoForIp -CurlExe $curlExe -Ip $pk.IP }
-}
-Say ''
-Say '选定 IP：' 'Cyan'
-$picks | Select-Object IP, Colo, Loss, Ttfb, SpeedMBps |
-    Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
-Say ''
-
-# --- 阶段 3：逐域名验证 ---
-Say '逐域名验证（每域名每 IP 1 次 HEAD）...' 'Cyan'
-$map = @{}
-$verifyRows = @()
-foreach ($d in $Domains) {
-    $passed = @()
-    foreach ($p in $picks) {
-        $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe
-        $verifyRows += [pscustomobject]@{
-            Domain = $d; IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok
-            Http = $r.Http; Connect = $r.Connect; Tls = $r.Tls; Ttfb = $r.Ttfb
-        }
-        if ($r.Ok) { $passed += [pscustomobject]@{ IP = $p.IP; Ttfb = $r.Ttfb } }
-        Start-Sleep -Milliseconds $VerifyDelayMs
-    }
-    if ($passed.Count -gt 0) {
-        # 按实际 TTFB 排序，最快的排前面
-        $ordered = @($passed | Sort-Object Ttfb | ForEach-Object { $_.IP })
-        $map[$d] = $ordered
-        Say ("  {0,-22} OK  {1}" -f $d, ($ordered -join ', ')) 'Green'
     } else {
-        Say ("  {0,-22} 失败，保持原样（非 CF 或不可用）" -f $d) 'Yellow'
+        $res = Read-DomainsFile -Path $domainsFileResolved
+        if ($res.Invalid.Count -gt 0) {
+            Fail ("域名文件含非法项：{0}" -f ($res.Invalid -join ', ')) 2
+        }
+        $domainList = @($res.Domains)
     }
-}
-Say ''
+    $domainList = @($domainList | Select-Object -Unique)
+    if ($domainList.Count -eq 0) {
+        Fail "没有配置任何域名。请复制 domains.example.txt 为 domains.txt 并填入目标域名，或用 -Domains 指定。当前路径：$domainsFileResolved" 2
+    }
 
-if ($map.Count -eq 0) {
-    throw '所有域名验证都失败，未修改 hosts。'
-}
+    if (-not $DryRun) { Assert-AdminForPath $hostsPathResolved }
+    $curlExe = Get-CurlExe
 
-# --- 阶段 4：写入 ---
-if ($DryRun) {
-    Say 'DryRun：不写 hosts。将写入以下内容：' 'Cyan'
-    foreach ($d in $Domains) {
-        if ($map.ContainsKey($d)) {
-            foreach ($ip in $map[$d]) { Say ("  {0,-16} {1}" -f $ip, $d) 'White' }
+    Say ''
+    Say '==== Cloudflare 优选 IP -> hosts ====' 'Cyan'
+    Say "hosts: $hostsPathResolved" 'DarkGray'
+    Say "域名数: $($domainList.Count)" 'DarkGray'
+    Say ''
+
+    Show-ProxyCheck -TargetDomains $domainList
+    $tun = Test-TunAdapter
+    if ($tun -and -not $DryRun -and -not $Force) {
+        Fail '检测到 TUN 网卡。为避免测速和访问走代理，已中止；确认风险后加 -Force 继续。' 3
+    }
+    Say ''
+
+    # ---- 延迟筛选 ----
+    $ranges = Get-CfRanges -Experimental:$ExperimentalRanges
+    $latency = @()
+    $cfst = $null
+    if (-not $NoCfst) { $cfst = Find-Cfst -Explicit $CfstPath }
+
+    if ($cfst) {
+        Say "使用 CFST 做全量延迟扫描：$cfst" 'Cyan'
+        try { $latency = @(Invoke-CfstLatencyScan -Exe $cfst -Ranges $ranges) }
+        catch { Say "CFST 运行失败：$($_.Exception.Message)" 'Yellow'; $latency = @() }
+        if ($latency.Count -eq 0) { Say 'CFST 没有产出结果，改用内置扫描。' 'Yellow' }
+    }
+    if ($latency.Count -eq 0) {
+        if ($NoCfst) { Say '已指定 -NoCfst，使用内置扫描。' 'Yellow' }
+        elseif (-not $cfst) { Say '未找到 cfst.exe，使用内置扫描。' 'Yellow' }
+        $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples -Ranges $ranges)
+    }
+    if ($latency.Count -eq 0) { Fail '没有扫到任何可用 IP。请检查网络后重试。' 3 }
+
+    $latency = @($latency | Sort-Object Ttfb)
+    Say "延迟/丢包筛选后可用 IP：$($latency.Count)，最佳 $($latency[0].IP)（$([math]::Round($latency[0].Ttfb * 1000))ms）" 'Gray'
+
+    $avgTtfb = ($latency | Select-Object -First 10 | Measure-Object -Property Ttfb -Average).Average
+    if ($avgTtfb -lt 0.005) {
+        Say '警告：平均延迟异常低（<5ms），测速可能经过了代理。结果仅供参考。' 'Yellow'
+    }
+
+    # ---- 机房分层 ----
+    $pool = @($latency | Select-Object -First ([int][math]::Min(256, $latency.Count)))
+    Say "探测候选落地区域（$($pool.Count) 个）..." 'Cyan'
+    $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool)
+    $candidates = @(Select-Stratified -Candidates $pool -Count $ThroughputCandidates)
+    $coloSummary = (@($candidates | Group-Object Colo | ForEach-Object {
+                $name = if ($_.Name) { $_.Name } else { '??' }
+                "$name x$($_.Count)"
+            })) -join ', '
+    Say "分层抽样 $($candidates.Count) 个（$coloSummary）" 'Gray'
+
+    # ---- 吞吐初测 ----
+    $quick = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $candidates -Samples $ThroughputSamples -Bytes $ThroughputBytes -UrlTemplate $SpeedTestUrl -ThrottleLimit 6)
+    $quickMap = @{}
+    foreach ($q in $quick) { if ($q) { $quickMap[$q.IP] = $q } }
+
+    $ranked = foreach ($c in $candidates) {
+        $q = $quickMap[$c.IP]
+        [pscustomobject]@{
+            IP = $c.IP; Colo = $c.Colo; Loss = $c.Loss; Ttfb = $c.Ttfb
+            QuickSpeed = if ($q) { [double]$q.SpeedMBps } else { 0.0 }
+            QuickValid = if ($q) { [int]$q.Valid } else { 0 }
         }
     }
-} else {
-    Assert-Admin
-    $backup = Backup-Hosts
-    Say "已备份 hosts -> $backup" 'DarkGray'
+    $promoted = @($ranked | Where-Object { $_.QuickValid -ge 1 -and $_.QuickSpeed -gt 0 } |
+        Sort-Object @{ Expression = 'QuickSpeed'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false } |
+        Select-Object -First $RefineTop)
+
+    $picks = @()
+    if ($promoted.Count -gt 0) {
+        # 决赛：3 x 2MB，串行，避免互相抢带宽
+        $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1)
+        $finalMap = @{}
+        foreach ($f in $final) { if ($f) { $finalMap[$f.IP] = $f } }
+
+        $finalRows = foreach ($p in $promoted) {
+            $f = $finalMap[$p.IP]
+            [pscustomobject]@{
+                IP = $p.IP; Colo = $p.Colo; Loss = $p.Loss; Ttfb = $p.Ttfb
+                SpeedMBps = if ($f) { [double]$f.SpeedMBps } else { 0.0 }
+                Valid = if ($f) { [int]$f.Valid } else { 0 }
+                Reasons = if ($f) { $f.Reasons } else { '' }
+            }
+        }
+
+        Say ''
+        Say '决赛结果（只使用决赛成绩）：' 'Cyan'
+        $finalRows | Select-Object IP, Colo, Loss, Ttfb, SpeedMBps, Valid |
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+
+        $picks = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
+            Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false } |
+            Select-Object -First $TopN)
+    } else {
+        Say '警告：没有候选通过吞吐初测，本次不更新 hosts（保留现有映射）。' 'Yellow'
+    }
+
+    Say ''
+    Say '选定 IP：' 'Cyan'
+    if ($picks.Count -gt 0) {
+        $picks | Select-Object IP, Colo, Ttfb, SpeedMBps |
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+    } else {
+        Say '  （无）' 'Yellow'
+    }
+    Say ''
+
+    # ---- 逐域名验证 ----
+    $map = @{}
+    $verifyRows = @()
+    if ($picks.Count -gt 0) {
+        Say '逐域名验证（每域名每 IP 1 次 HEAD）...' 'Cyan'
+        foreach ($d in $domainList) {
+            $passed = @()
+            foreach ($p in $picks) {
+                $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe
+                $verifyRows += [pscustomobject]@{
+                    Domain = $d; IP = $p.IP; Colo = $p.Colo; Http = $r.Http; Class = $r.Class
+                    Ok = $r.Ok; RemoteIp = $r.RemoteIp; Ttfb = $r.Ttfb
+                }
+                if ($r.Ok) {
+                    $priority = if ($r.Class -eq 'ok') { 0 } else { 1 }
+                    $passed += [pscustomobject]@{ IP = $p.IP; Ttfb = $r.Ttfb; Priority = $priority; Class = $r.Class }
+                }
+                Start-Sleep -Milliseconds $VerifyDelayMs
+            }
+            if ($passed.Count -gt 0) {
+                $ordered = @($passed | Sort-Object Priority, Ttfb | Select-Object -First $TopN | ForEach-Object { $_.IP })
+                $map[$d] = $ordered
+                $classes = (@($passed | ForEach-Object { $_.Class } | Select-Object -Unique) -join ',')
+                Say ("  {0,-24} OK  {1}  [{2}]" -f $d, ($ordered -join ', '), $classes) 'Green'
+            } else {
+                Say ("  {0,-24} 失败，保留旧映射（非 CF 或不可用）" -f $d) 'Yellow'
+            }
+        }
+        Say ''
+    }
+
+    # ---- 读取并更新 hosts ----
+    $doc = Read-HostsDocument -Path $hostsPathResolved
     try {
-        Update-HostsFile -Path $HostsPath -Map $map -AllDomains $Domains
-        ipconfig /flushdns | Out-Null
-        Say '已写入 hosts 并刷新 DNS。' 'Green'
+        $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune
     } catch {
-        Copy-Item -LiteralPath $backup -Destination $HostsPath -Force
-        ipconfig /flushdns | Out-Null
-        Say "写入失败，已自动还原：$($_.Exception.Message)" 'Red'
-        throw
+        Fail $_.Exception.Message 4
+    }
+
+    if ($DryRun) {
+        Say 'DryRun：不修改 hosts。计划写入：' 'Cyan'
+        if ($update.FinalMap.Count -eq 0) {
+            Say '  （无变更）' 'Yellow'
+        } else {
+            foreach ($d in $update.FinalMap.Keys) {
+                foreach ($ip in @($update.FinalMap[$d])) { Say ("  {0,-16} {1}" -f $ip, $d) 'White' }
+            }
+        }
+        Say ''
+        Say "变更检测：$(if ($update.Changed) { '会修改 hosts' } else { '内容无变化，不会写入' })" 'DarkGray'
+    } else {
+        $backupDir = Get-HostsBackupDir -FallbackRoot $Root
+        try {
+            $write = Write-HostsDocument -Document $doc -Update $update -BackupDir $backupDir -Version $ScriptVersion
+        } catch {
+            Fail $_.Exception.Message 4
+        }
+        if ($write.Changed) {
+            Say "已写入 hosts（备份：$($write.Backup)）" 'Green'
+        } else {
+            Say 'hosts 内容无变化，未写入。' 'Green'
+        }
+        $flush = Clear-DnsCache
+        if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+    }
+
+    # ---- 解析核对 ----
+    if ($CheckResolved) {
+        Say ''
+        Say '解析核对（系统实际返回的地址）：' 'Cyan'
+        foreach ($d in $domainList) {
+            try {
+                $addrs = @([System.Net.Dns]::GetHostAddresses($d) | ForEach-Object { $_.IPAddressToString })
+                Say ("  {0,-24} {1}" -f $d, ($addrs -join ', ')) 'Gray'
+            } catch {
+                Say ("  {0,-24} 解析失败" -f $d) 'Yellow'
+            }
+        }
+    }
+
+    # ---- 报告 ----
+    if ($verifyRows.Count -gt 0) {
+        Say ''
+        Say '==== 验证结果 ====' 'Cyan'
+        $verifyRows | Select-Object Domain, IP, Colo, Http, Class, Ok, Ttfb |
+            Format-Table -AutoSize | Out-String -Width 220 | ForEach-Object { Say $_.TrimEnd() }
+    }
+
+    Say ''
+    Say '说明：' 'Cyan'
+    $failed = @($domainList | Where-Object { -not $map.ContainsKey($_) })
+    if ($failed.Count -gt 0) {
+        Say '以下域名本次未验证通过，已保留旧映射（可能非 CF 或暂不可用）：' 'Yellow'
+        foreach ($f in $failed) { Say "  - $f" 'DarkGray' }
+    }
+    Say 'hosts 只影响这些域名的网页/tracker；P2P 和 IPv6 对等连接不受影响。' 'DarkGray'
+    Say '写入 A 记录后，Windows 通常不再使用 DNS 的 AAAA；应用自带解析器可能不同。' 'DarkGray'
+    Say '回滚：.\pt-cf-optimize.ps1 -Rollback' 'DarkGray'
+    if ($script:ReportPathResolved) { Say "报告：$($script:ReportPathResolved)" 'DarkGray' }
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+$script:ReportPathResolved = $ReportPath
+if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Version -and -not $Rollback) {
+    $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
+}
+
+$exitCode = 0
+try {
+    $exitCode = Invoke-Main
+} catch {
+    $msg = $_.Exception.Message
+    Write-Host "错误：$msg" -ForegroundColor Red
+    $script:Log.Add("ERROR: $msg")
+    $exitCode = if ($script:FailCode) { $script:FailCode } else { 1 }
+}
+
+if ($script:ReportPathResolved) {
+    try {
+        $script:Log | Out-File -LiteralPath $script:ReportPathResolved -Encoding utf8
+    } catch {
+        Write-Host "警告：报告写入失败：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
-# --- 报告 ---
-Say ''
-Say '==== 验证结果 ====' 'Cyan'
-$verifyRows | Select-Object Domain, IP, Colo, Http, Ok, Ttfb |
-    Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
-
-Say ''
-Say '==== 说明 ====' 'Cyan'
-$failed = @($Domains | Where-Object { -not $map.ContainsKey($_) })
-if ($failed.Count -gt 0) {
-    Say '以下域名未通过验证，已保持原样（可能不是 Cloudflare 托管或当前不可用）：' 'Yellow'
-    foreach ($f in $failed) { Say "  - $f" 'DarkGray' }
-}
-Say 'hosts 只影响这些域名的网页/tracker；P2P 传输和 IPv6 对等连接不受影响。' 'DarkGray'
-Say '写入 A 记录后，Windows 对这些域名不再使用 DNS 的 AAAA（浏览器走 IPv4 优选）。' 'DarkGray'
-Say '回滚：.\pt-cf-optimize.ps1 -Rollback' 'DarkGray'
-Say "报告已保存：$ReportPath" 'DarkGray'
-
-$script:Log | Out-File -LiteralPath $ReportPath -Encoding utf8
-Say ''
-Say '完成。' 'Green'
+exit $exitCode

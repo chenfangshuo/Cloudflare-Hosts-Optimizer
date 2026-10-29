@@ -1,32 +1,16 @@
 #Requires -Version 7.0
 <#
-    Update-HostsFile 的离线测试。
+    hosts 解析/增量更新/写入/回滚的离线测试。
 
-    这个函数不依赖网络，也不碰真实 hosts。测试用 AST 从主脚本里提取函数定义，
-    避免执行整个脚本（主流程会扫描网络、可能修改 system hosts）。
+    不访问网络，不碰真实 hosts；所有文件都在 $TestDrive 里。
 #>
 
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
-    $scriptPath = Join-Path $repoRoot 'pt-cf-optimize.ps1'
+    $script:RepoRoot = $repoRoot
+    . (Join-Path $repoRoot 'lib\Domains.ps1')
+    . (Join-Path $repoRoot 'lib\HostsFile.ps1')
 
-    $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$parseErrors)
-    if ($parseErrors.Count -gt 0) {
-        throw "pt-cf-optimize.ps1 存在语法错误，无法测试"
-    }
-
-    $fn = $ast.FindAll({
-            param($n)
-            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            $n.Name -eq 'Update-HostsFile'
-        }, $true)[0]
-    if (-not $fn) { throw '未找到 Update-HostsFile 函数' }
-    Invoke-Expression $fn.Extent.Text
-
-    $script:BeginMarker = '# >>> pt-cf-optimize BEGIN (auto-generated; -Rollback to undo) >>>'
-    $script:EndMarker = '# <<< pt-cf-optimize END <<<'
-    $script:LegacyTag = '# [pt-cf-optimize] '
     $script:AllDomains = @('cf.example.net', 'example.org')
 
     function New-HostsFixture {
@@ -41,62 +25,204 @@ BeforeAll {
         )
         [IO.File]::WriteAllText($Path, (($lines -join "`r`n") + "`r`n"), [Text.ASCIIEncoding]::new())
     }
+
+    function New-Doc {
+        param([string]$Path)
+        New-HostsFixture -Path $Path
+        Read-HostsDocument -Path $Path
+    }
 }
 
-Describe 'Update-HostsFile' {
-    BeforeEach {
-        $script:tmp = Join-Path $TestDrive ('hosts-' + [guid]::NewGuid().ToString('N') + '.txt')
-        New-HostsFixture -Path $script:tmp
-        $script:map = @{ 'cf.example.net' = @('10.0.0.1'); 'example.org' = @('10.0.0.2') }
-        Update-HostsFile -Path $script:tmp -Map $script:map -AllDomains $script:AllDomains
-        $script:text = Get-Content -LiteralPath $script:tmp -Raw
+Describe 'Read-HostsDocument' {
+    It '接受纯 ASCII' {
+        $tmp = Join-Path $TestDrive 'ascii.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $doc.Encoding | Should -Be 'ASCII'
+        $doc.HasBom | Should -BeFalse
+        $doc.Text | Should -Match '127\.0\.0\.1 localhost'
     }
 
-    It '保留所有非管理行' {
-        $script:text | Should -Match '127\.0\.0\.1 localhost'
-        $script:text | Should -Match '0\.0\.0\.0 ads\.example\.com'
-        ([regex]::Matches($script:text, 'ads\.example\.com')).Count | Should -Be 1
-        $script:text | Should -Match '# user entries'
+    It '保留 UTF-8 BOM' {
+        $tmp = Join-Path $TestDrive 'bom.txt'
+        $bytes = [byte[]](0xEF, 0xBB, 0xBF) + [Text.Encoding]::UTF8.GetBytes("127.0.0.1 localhost`r`n")
+        [IO.File]::WriteAllBytes($tmp, $bytes)
+        $doc = Read-HostsDocument -Path $tmp
+        $doc.HasBom | Should -BeTrue
+        $doc.Encoding | Should -Be 'UTF8'
+        $doc.Text | Should -Not -Match "^﻿"
     }
 
-    It '注释管理域的旧条目而不是删除' {
-        $script:text | Should -Match ([regex]::Escape('# [pt-cf-optimize] 203.0.113.10 cf.example.net'))
-        $script:text | Should -Match ([regex]::Escape('# [pt-cf-optimize] 203.0.113.11 example.org'))
+    It '拒绝 GBK/ANSI' {
+        $tmp = Join-Path $TestDrive 'gbk.txt'
+        [IO.File]::WriteAllBytes($tmp, [byte[]](0x23, 0x20, 0xD6, 0xD0, 0xCE, 0xC4, 0x0D, 0x0A))
+        { Read-HostsDocument -Path $tmp } | Should -Throw '*GBK*'
     }
 
-    It '写入标记区块和新的 IP' {
-        $script:text | Should -Match ([regex]::Escape($script:BeginMarker))
-        $script:text | Should -Match ([regex]::Escape($script:EndMarker))
-        $script:text | Should -Match "10\.0\.0\.1`tcf\.example\.net"
-        $script:text | Should -Match "10\.0\.0\.2`texample\.org"
+    It '拒绝 UTF-16' {
+        $tmp = Join-Path $TestDrive 'utf16.txt'
+        [IO.File]::WriteAllBytes($tmp, [byte[]](0xFF, 0xFE, 0x31, 0x00, 0x0D, 0x00, 0x0A, 0x00))
+        { Read-HostsDocument -Path $tmp } | Should -Throw '*UTF-16*'
+    }
+}
+
+Describe '标记结构校验' {
+    It '缺 END 时拒绝' {
+        $tmp = Join-Path $TestDrive 'noend.txt'
+        [IO.File]::WriteAllText($tmp, "127.0.0.1 localhost`r`n$($script:BeginMarker)`r`n10.0.0.1 cf.example.net`r`n", [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Get-HostsBlockInfo -Lines @($doc.Text -split "`r?`n") } | Should -Throw '*BEGIN=1*'
     }
 
-    It '标记区块只出现一次' {
-        ([regex]::Matches($script:text, [regex]::Escape($script:BeginMarker))).Count | Should -Be 1
-        ([regex]::Matches($script:text, [regex]::Escape($script:EndMarker))).Count | Should -Be 1
+    It '重复 BEGIN 时拒绝' {
+        $tmp = Join-Path $TestDrive 'dup.txt'
+        $text = "$($script:BeginMarker)`r`n$($script:BeginMarker)`r`n$($script:EndMarker)`r`n"
+        [IO.File]::WriteAllText($tmp, $text, [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Get-HostsBlockInfo -Lines @($doc.Text -split "`r?`n") } | Should -Throw '*BEGIN=2*'
     }
 
-    It '重复运行是幂等的' {
-        $h1 = (Get-FileHash -LiteralPath $script:tmp -Algorithm SHA256).Hash
-        Update-HostsFile -Path $script:tmp -Map $script:map -AllDomains $script:AllDomains
-        $h2 = (Get-FileHash -LiteralPath $script:tmp -Algorithm SHA256).Hash
-        $h2 | Should -Be $h1
+    It '孤立 END 时拒绝' {
+        $tmp = Join-Path $TestDrive 'stray.txt'
+        [IO.File]::WriteAllText($tmp, "$($script:EndMarker)`r`n", [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Get-HostsBlockInfo -Lines @($doc.Text -split "`r?`n") } | Should -Throw '*BEGIN=0*'
+    }
+}
+
+Describe 'Update-HostsDocument' {
+    It '写入新区块并注释旧条目' {
+        $doc = New-Doc (Join-Path $TestDrive 'u1.txt')
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $u.Changed | Should -BeTrue
+        $u.Text | Should -Match "10\.0\.0\.1`tcf\.example\.net"
+        $u.Text | Should -Match ([regex]::Escape('# [pt-cf-optimize] 203.0.113.10 cf.example.net'))
+        $u.Text | Should -Match '0\.0\.0\.0 ads\.example\.com'
     }
 
-    It '缩小管理范围时还原旧条目' {
-        Update-HostsFile -Path $script:tmp -Map @{ 'cf.example.net' = @('10.0.0.9') } -AllDomains $script:AllDomains
-        $t2 = Get-Content -LiteralPath $script:tmp -Raw
-
-        $t2 | Should -Match '(?m)^203\.0\.113\.11 example\.org'
-        $t2 | Should -Not -Match '10\.0\.0\.2'
-        $t2 | Should -Match "10\.0\.0\.9`tcf\.example\.net"
-        $t2 | Should -Match ([regex]::Escape('# [pt-cf-optimize] 203.0.113.10 cf.example.net'))
+    It '重复运行幂等' {
+        $tmp = Join-Path $TestDrive 'u2.txt'
+        $doc = New-Doc $tmp
+        $map = @{ 'cf.example.net' = @('10.0.0.1') }
+        $u1 = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $script:AllDomains
+        [IO.File]::WriteAllText($tmp, $u1.Text, [Text.ASCIIEncoding]::new())
+        $doc2 = Read-HostsDocument -Path $tmp
+        $u2 = Update-HostsDocument -Document $doc2 -VerifiedMap $map -ManagedDomains $script:AllDomains
+        $u2.Changed | Should -BeFalse
     }
 
-    It '保留原有的 CRLF 换行' {
-        $bytes = [IO.File]::ReadAllBytes($script:tmp)
-        $raw = [Text.Encoding]::ASCII.GetString($bytes)
-        $raw | Should -Match "`r`n"
-        ([regex]::Matches($raw, "(?<!`r)`n")).Count | Should -Be 0
+    It '部分失败保留此前的映射' {
+        $tmp = Join-Path $TestDrive 'u3.txt'
+        $doc = New-Doc $tmp
+        $first = Update-HostsDocument -Document $doc -VerifiedMap @{
+            'cf.example.net' = @('10.0.0.1')
+            'example.org'    = @('10.0.0.2')
+        } -ManagedDomains $script:AllDomains
+        [IO.File]::WriteAllText($tmp, $first.Text, [Text.ASCIIEncoding]::new())
+        $doc2 = Read-HostsDocument -Path $tmp
+        # 本次 example.org 未通过验证（不在 map 里），应保留 10.0.0.2
+        $second = Update-HostsDocument -Document $doc2 -VerifiedMap @{ 'cf.example.net' = @('10.0.0.9') } -ManagedDomains $script:AllDomains
+        $second.FinalMap.Contains('example.org') | Should -BeTrue
+        $second.Text | Should -Match "10\.0\.0\.2`texample\.org"
+        $second.Text | Should -Match "10\.0\.0\.9`tcf\.example\.net"
+    }
+
+    It 'Prune 删除不再管理的域名并还原旧条目' {
+        $tmp = Join-Path $TestDrive 'u4.txt'
+        $doc = New-Doc $tmp
+        $first = Update-HostsDocument -Document $doc -VerifiedMap @{
+            'cf.example.net' = @('10.0.0.1')
+            'example.org'    = @('10.0.0.2')
+        } -ManagedDomains $script:AllDomains
+        [IO.File]::WriteAllText($tmp, $first.Text, [Text.ASCIIEncoding]::new())
+        $doc2 = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc2 -VerifiedMap @{ 'cf.example.net' = @('10.0.0.9') } -ManagedDomains @('cf.example.net') -Prune
+        $u.Text | Should -Not -Match '10\.0\.0\.2'
+        $u.Text | Should -Match '(?m)^203\.0\.113\.11 example\.org'
+    }
+
+    It '没有新结果且没有历史映射时不写' {
+        $doc = New-Doc (Join-Path $TestDrive 'u5.txt')
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{} -ManagedDomains $script:AllDomains
+        $u.Changed | Should -BeFalse
+    }
+
+    It '多别名行拒绝' {
+        $tmp = Join-Path $TestDrive 'u6.txt'
+        [IO.File]::WriteAllText($tmp, "1.2.3.4 other.example cf.example.net`r`n", [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Update-HostsDocument -Document $doc -VerifiedMap @{} -ManagedDomains $script:AllDomains } |
+            Should -Throw '*multi-alias*'
+    }
+
+    It 'IPv6 映射拒绝' {
+        $tmp = Join-Path $TestDrive 'u7.txt'
+        [IO.File]::WriteAllText($tmp, "::1 cf.example.net`r`n", [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Update-HostsDocument -Document $doc -VerifiedMap @{} -ManagedDomains $script:AllDomains } |
+            Should -Throw '*ipv6-mapping*'
+    }
+
+    It '其他工具的托管区块拒绝接管' {
+        $tmp = Join-Path $TestDrive 'u8.txt'
+        $text = "# S302 BEGIN abc`r`n203.0.113.50 cf.example.net`r`n# S302 END abc`r`n"
+        [IO.File]::WriteAllText($tmp, $text, [Text.ASCIIEncoding]::new())
+        $doc = Read-HostsDocument -Path $tmp
+        { Update-HostsDocument -Document $doc -VerifiedMap @{} -ManagedDomains $script:AllDomains } |
+            Should -Throw '*foreign-block:S302*'
+    }
+
+    It '保留 CRLF' {
+        $doc = New-Doc (Join-Path $TestDrive 'u9.txt')
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $u.Text | Should -Match "`r`n"
+        ([regex]::Matches($u.Text, "(?<!`r)`n")).Count | Should -Be 0
+    }
+}
+
+Describe '写入与回滚' {
+    It '备份、原子写入、回滚' {
+        $tmp = Join-Path $TestDrive 'w1.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $backupDir = Join-Path $TestDrive 'backup-w1'
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+
+        $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $backupDir -Version 'test'
+        $w.Changed | Should -BeTrue
+        (Get-Content $tmp -Raw) | Should -Match '10\.0\.0\.1'
+
+        $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $backupDir
+        (Get-Content $tmp -Raw) | Should -Match '203\.0\.113\.10 cf\.example\.net'
+        (Get-Content $tmp -Raw) | Should -Not -Match '10\.0\.0\.1'
+    }
+
+    It '回滚按文件名选最近，而不是 LastWriteTime' {
+        $tmp = Join-Path $TestDrive 'w2.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $backupDir = Join-Path $TestDrive 'backup-w2'
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+        $old = Join-Path $backupDir 'hosts-20260101-000000-aaaaaaaa.bak'
+        $new = Join-Path $backupDir 'hosts-20260201-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
+        # 故意把新备份的 LastWriteTime 设得更早
+        (Get-Item $new).LastWriteTime = (Get-Date).AddYears(-1)
+
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $backupDir | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'new'
+    }
+
+    It '内容无变化时不写、不产生备份' {
+        $tmp = Join-Path $TestDrive 'w3.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{} -ManagedDomains $script:AllDomains
+        $backupDir = Join-Path $TestDrive 'backup-w3'
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+        $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $backupDir -Version 'test'
+        $w.Changed | Should -BeFalse
+        @(Get-ChildItem $backupDir -Filter 'hosts-*.bak').Count | Should -Be 0
     }
 }

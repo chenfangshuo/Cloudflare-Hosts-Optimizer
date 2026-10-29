@@ -1,5 +1,8 @@
 # 本地个人配置（站点清单不公开）
 domains.txt
+domains.imported.txt
+*.imported.txt
+*.bak-*
 
 # 运行产物
 backup/

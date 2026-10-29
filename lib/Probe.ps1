@@ -1,0 +1,392 @@
+#Requires -Version 7.0
+<#
+    网络探测：curl 调用、吞吐样本有效性、CFST 解析、机房分层。
+
+    约定：
+      * 任何 curl 调用都以 -q 开头，忽略用户的 .curlrc。
+      * 统一 --noproxy '*'、--max-redirs 0、--proto '=https'。
+      * 吞吐样本必须同时满足：退出码 0、HTTP 200/206、字节数达标、remote_ip 匹配。
+#>
+
+$script:CfOfficialRanges = @(
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'
+)
+# 非官方列表、但实测有 CF 响应的网段；仅在 -ExperimentalRanges 时启用
+$script:CfExperimentalRanges = @('104.28.0.0/14')
+
+function Get-CurlExe {
+    [CmdletBinding()]
+    param()
+    $system = Join-Path $env:SystemRoot 'System32\curl.exe'
+    if (Test-Path -LiteralPath $system) { return $system }
+    $c = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $c) { throw '找不到 curl.exe（Windows 10/11 自带）。' }
+    return $c.Source
+}
+
+function Get-Median {
+    [CmdletBinding()]
+    param([double[]]$Values)
+    if (-not $Values -or $Values.Count -eq 0) { return $null }
+    $s = @($Values | Sort-Object)
+    $n = $s.Count
+    if ($n % 2 -eq 1) { return [double]$s[[int][math]::Floor($n / 2)] }
+    return ([double]$s[$n / 2 - 1] + [double]$s[$n / 2]) / 2.0
+}
+
+function Test-IpInCidr {
+    [CmdletBinding()]
+    param([string]$Ip, [string]$Cidr)
+    $ipAddr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$ipAddr)) { return $false }
+    $parts = $Cidr -split '/'
+    if ($parts.Count -ne 2) { return $false }
+    $netAddr = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$netAddr)) { return $false }
+    if ($ipAddr.AddressFamily -ne $netAddr.AddressFamily) { return $false }
+    $len = 0
+    if (-not [int]::TryParse($parts[1], [ref]$len)) { return $false }
+    $a = $ipAddr.GetAddressBytes()
+    $n = $netAddr.GetAddressBytes()
+    if ($len -lt 0 -or $len -gt ($a.Length * 8)) { return $false }
+    $full = [int][math]::Floor($len / 8)
+    $rem = $len % 8
+    for ($i = 0; $i -lt $full; $i++) {
+        if ($a[$i] -ne $n[$i]) { return $false }
+    }
+    if ($rem -gt 0) {
+        $mask = (0xFF -shl (8 - $rem)) -band 0xFF
+        if (([int]$a[$full] -band $mask) -ne ([int]$n[$full] -band $mask)) { return $false }
+    }
+    return $true
+}
+
+function Test-IpAllowed {
+    [CmdletBinding()]
+    param([string]$Ip, [string[]]$Ranges)
+    foreach ($r in $Ranges) {
+        if (Test-IpInCidr -Ip $Ip -Cidr $r) { return $true }
+    }
+    return $false
+}
+
+function Get-CfRanges {
+    [CmdletBinding()]
+    param([switch]$Experimental)
+    $r = @($script:CfOfficialRanges)
+    if ($Experimental) { $r += $script:CfExperimentalRanges }
+    return $r
+}
+
+function Invoke-CurlProbe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CurlExe,
+        [Parameter(Mandatory)][string]$Url,
+        [string]$Resolve,
+        [switch]$Head,
+        [int]$MaxTime = 10,
+        [string]$Output = 'NUL',
+        [string]$Proto = '=https'
+    )
+
+    $curlArgs = @('-q', '-sS', '--noproxy', '*', '--max-redirs', '0', '--proto', $Proto, '--max-time', [string]$MaxTime)
+    if ($Head) { $curlArgs += '-I' }
+    if ($Resolve) { $curlArgs += @('--resolve', $Resolve) }
+    if ($Output) { $curlArgs += @('-o', $Output) }
+    $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{remote_ip}'
+    $curlArgs += @('-w', $fmt)
+    $curlArgs += $Url
+
+    $raw = & $CurlExe @curlArgs 2>$null
+    $exit = $LASTEXITCODE
+    $s = ($raw -join "`n")
+    $p = (($s -split '\|@@\|')[-1]) -split '\|'
+
+    return [pscustomobject]@{
+        ExitCode = $exit
+        Http     = if ($p.Count -ge 1) { [string]$p[0] } else { '000' }
+        Bytes    = if ($p.Count -ge 2) { [double]$p[1] } else { 0.0 }
+        Total    = if ($p.Count -ge 3) { [double]$p[2] } else { 0.0 }
+        Connect  = if ($p.Count -ge 4) { [double]$p[3] } else { 0.0 }
+        Tls      = if ($p.Count -ge 5) { [double]$p[4] } else { 0.0 }
+        Ttfb     = if ($p.Count -ge 6) { [double]$p[5] } else { 0.0 }
+        RemoteIp = if ($p.Count -ge 7) { [string]$p[6] } else { '' }
+        Raw      = $s
+    }
+}
+
+function Split-SpeedTestUrl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$UrlTemplate)
+    $probeUrl = $UrlTemplate -replace '\{bytes\}', '1'
+    $uri = $null
+    if (-not [uri]::TryCreate($probeUrl, [System.UriKind]::Absolute, [ref]$uri)) { throw "SpeedTestUrl 不是合法 URL：$UrlTemplate" }
+    if ($uri.Scheme -ne 'https') { throw 'SpeedTestUrl 只允许 https。' }
+    if ($uri.UserInfo) { throw 'SpeedTestUrl 不允许包含凭据。' }
+    return [pscustomobject]@{
+        Host = $uri.Host
+        Port = if ($uri.Port -gt 0) { $uri.Port } else { 443 }
+    }
+}
+
+function Invoke-ThroughputTest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CurlExe,
+        [Parameter(Mandatory)]$Candidates,
+        [Parameter(Mandatory)][int]$Samples,
+        [Parameter(Mandatory)][int]$Bytes,
+        [Parameter(Mandatory)][string]$UrlTemplate,
+        [int]$ThrottleLimit = 6
+    )
+
+    $target = Split-SpeedTestUrl -UrlTemplate $UrlTemplate
+    $targetHost = $target.Host
+    $targetPort = $target.Port
+    Write-Host "吞吐测速：$($Candidates.Count) 个 IP x $Samples 次 x $([math]::Round($Bytes / 1MB, 1))MB（$targetHost）..." -ForegroundColor Cyan
+
+    $rows = $Candidates | ForEach-Object -Parallel {
+        $ip = $_.IP
+        $curlPath = $using:CurlExe
+        $sampleCount = $using:Samples
+        $byteCount = $using:Bytes
+        $urlTemplate = $using:UrlTemplate
+        $resolveHost = $using:targetHost
+        $resolvePort = $using:targetPort
+
+        $valid = @()
+        $failed = 0
+        $reasons = @()
+        for ($i = 0; $i -lt $sampleCount; $i++) {
+            $url = $urlTemplate -replace '\{bytes\}', [string]$byteCount
+            $fmt = '|@@|%{http_code}|%{size_download}|%{time_total}|%{remote_ip}'
+            $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
+                --max-time 40 --resolve "${resolveHost}:${resolvePort}:$ip" -o NUL -w $fmt $url 2>$null
+            $exit = $LASTEXITCODE
+            $p = (($raw -join '') -split '\|@@\|')[-1] -split '\|'
+            $http = if ($p.Count -ge 1) { [string]$p[0] } else { '000' }
+            $got = if ($p.Count -ge 2) { [double]$p[1] } else { 0.0 }
+            $total = if ($p.Count -ge 3) { [double]$p[2] } else { 0.0 }
+            $remote = if ($p.Count -ge 4) { [string]$p[3] } else { '' }
+
+            if ($exit -ne 0) { $failed++; $reasons += "exit=$exit"; continue }
+            if ($http -notin @('200', '206')) { $failed++; $reasons += "http=$http"; continue }
+            if ($got -lt ($byteCount * 0.95)) { $failed++; $reasons += "short=$([int]$got)"; continue }
+            if ($total -le 0) { $failed++; $reasons += 'time=0'; continue }
+            if ($remote -ne $ip) { $failed++; $reasons += "remote=$remote"; continue }
+            $valid += ($got / $total)
+        }
+
+        if ($valid.Count -eq 0) {
+            return [pscustomobject]@{ IP = $ip; SpeedMBps = 0.0; Valid = 0; Failed = $failed; Reasons = ($reasons | Select-Object -Unique) -join ',' }
+        }
+        $sorted = @($valid | Sort-Object)
+        $n = $sorted.Count
+        $median = if ($n % 2 -eq 1) { [double]$sorted[[int][math]::Floor($n / 2)] }
+                  else { ([double]$sorted[$n / 2 - 1] + [double]$sorted[$n / 2]) / 2.0 }
+        [pscustomobject]@{
+            IP = $ip; SpeedMBps = ($median / 1MB); Valid = $valid.Count; Failed = $failed
+            Reasons = ($reasons | Select-Object -Unique) -join ','
+        }
+    } -ThrottleLimit $ThrottleLimit
+
+    return @($rows)
+}
+
+function Invoke-CfstLatencyScan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Ranges = $script:CfOfficialRanges
+    )
+
+    $dir = Split-Path -Parent $Exe
+    $ipFile = Join-Path $dir 'ip.txt'
+    if (-not (Test-Path -LiteralPath $ipFile)) {
+        Write-Host "CFST 目录下缺少 ip.txt：$dir" -ForegroundColor Yellow
+        return @()
+    }
+
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('pt-cf-optimize-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $temp | Out-Null
+    $csv = Join-Path $temp 'result.csv'
+
+    $proxyVars = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
+    $saved = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    foreach ($k in $proxyVars) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+
+    Push-Location $dir
+    try {
+        foreach ($k in $proxyVars) { [Environment]::SetEnvironmentVariable($k, $null) }
+        # -dd：只测延迟/丢包，不做下载测速
+        $cfstArgs = @('-dd', '-tlr', '0.05', '-p', '0', '-o', $csv, '-f', 'ip.txt')
+        & $Exe @cfstArgs *> $null
+        $code = $LASTEXITCODE
+        Write-Host "CFST 延迟扫描退出码：$code" -ForegroundColor DarkGray
+        if ($code -ne 0 -or -not (Test-Path -LiteralPath $csv)) { return @() }
+
+        $rows = @()
+        foreach ($l in @(Get-Content -LiteralPath $csv -Encoding UTF8 | Select-Object -Skip 1)) {
+            if ([string]::IsNullOrWhiteSpace($l)) { continue }
+            $p = $l.Split(',')
+            if ($p.Count -lt 5) { continue }
+            $ip = $p[0].Trim()
+            if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { continue }
+            if (-not (Test-IpAllowed -Ip $ip -Ranges $Ranges)) { continue }
+
+            $loss = 1.0
+            $delay = 0.0
+            $okLoss = [double]::TryParse($p[3].Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$loss)
+            $okDelay = [double]::TryParse($p[4].Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$delay)
+            if (-not $okLoss -or -not $okDelay) { continue }
+            if ($loss -lt 0 -or $loss -gt 1) { continue }
+            if ($delay -le 0 -or $delay -gt 10000) { continue }
+
+            $rows += [pscustomobject]@{
+                IP = $ip; Loss = $loss; Ttfb = ($delay / 1000.0); Colo = ''; Source = 'cfst'
+            }
+        }
+        return $rows
+    } finally {
+        Pop-Location
+        foreach ($k in $proxyVars) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-BuiltinLatencyScan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CurlExe,
+        [Parameter(Mandatory)][int]$Candidates,
+        [Parameter(Mandatory)][int]$Samples,
+        [Parameter(Mandatory)][string[]]$Ranges
+    )
+
+    # 从允许网段里随机抽样
+    $ips = [System.Collections.Generic.List[string]]::new()
+    $rnd = [System.Random]::new()
+    $guard = 0
+    while ($ips.Count -lt $Candidates -and $guard -lt ($Candidates * 30)) {
+        $guard++
+        $cidr = $Ranges[$rnd.Next($Ranges.Count)]
+        $parts = $cidr -split '/'
+        $net = [System.Net.IPAddress]::Parse($parts[0])
+        $len = [int]$parts[1]
+        $bytes = $net.GetAddressBytes()
+        $hostBits = ($bytes.Length * 8) - $len
+        $rand = [long]($rnd.NextDouble() * [math]::Pow(2, $hostBits))
+        # 在主机位上加随机偏移
+        $val = [long]0
+        foreach ($b in $bytes) { $val = ($val -shl 8) -bor [long]$b }
+        $val += $rand
+        $o1 = [int](($val -shr 24) -band 255); $o2 = [int](($val -shr 16) -band 255)
+        $o3 = [int](($val -shr 8) -band 255); $o4 = [int]($val -band 255)
+        if ($o4 -eq 0 -or $o4 -eq 255) { continue }
+        $ip = "$o1.$o2.$o3.$o4"
+        if (-not $ips.Contains($ip)) { $ips.Add($ip) }
+    }
+
+    Write-Host "内置延迟扫描：$($ips.Count) 个候选 IP，每个 $Samples 次探测 ..." -ForegroundColor Cyan
+    $probe = $ips | ForEach-Object -Parallel {
+        $ip = $_
+        $curlPath = $using:CurlExe
+        $sampleCount = $using:Samples
+        $ok = 0; $ttf = @(); $colo = ''
+        for ($i = 0; $i -lt $sampleCount; $i++) {
+            $fmt = '|@@|%{time_connect}|%{time_appconnect}|%{time_starttransfer}'
+            $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
+                --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
+                -w $fmt 'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
+            $exit = $LASTEXITCODE
+            $s = ($raw -join "`n")
+            if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
+            if ($exit -ne 0) { continue }
+            $p = (($s -split '\|@@\|')[-1]) -split '\|'
+            if ($p.Count -lt 3) { continue }
+            $ok++
+            $ttf += [double]$p[2]
+        }
+        if ($ok -eq 0) { return }
+        $sortedTtf = @($ttf | Sort-Object)
+        $n = $sortedTtf.Count
+        $medianTtf = if ($n % 2 -eq 1) { [double]$sortedTtf[[int][math]::Floor($n / 2)] }
+                     else { ([double]$sortedTtf[$n / 2 - 1] + [double]$sortedTtf[$n / 2]) / 2.0 }
+        [pscustomobject]@{
+            IP = $ip; Colo = $colo; Loss = 1.0 - ($ok / [double]$sampleCount)
+            Ttfb = $medianTtf; Source = 'builtin'
+        }
+    } -ThrottleLimit 24
+
+    return @($probe | Where-Object { $_ -and $_.Ttfb -gt 0 -and $_.Loss -le 0.05 } | Sort-Object Ttfb)
+}
+
+function Resolve-Colo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CurlExe,
+        [Parameter(Mandatory)]$Candidates
+    )
+    $rows = $Candidates | ForEach-Object -Parallel {
+        $ip = $_.IP
+        $curlPath = $using:CurlExe
+        $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
+            --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
+            'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
+        $s = ($raw -join "`n")
+        $colo = ''
+        if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
+        [pscustomobject]@{ IP = $ip; Colo = $colo; Loss = $_.Loss; Ttfb = $_.Ttfb }
+    } -ThrottleLimit 16
+    return @($rows)
+}
+
+function Select-Stratified {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Candidates,
+        [Parameter(Mandatory)][int]$Count
+    )
+    # 先按 Ttfb 排序，组内也按 Ttfb 排序，避免采样受并行完成顺序影响
+    $sorted = @($Candidates | Sort-Object Ttfb)
+    $groups = @($sorted | Group-Object Colo | Sort-Object { ($_.Group | Measure-Object -Property Ttfb -Minimum).Minimum })
+    $picked = @()
+    $idx = 0
+    while ($picked.Count -lt $Count) {
+        $added = $false
+        foreach ($g in $groups) {
+            $members = @($g.Group | Sort-Object Ttfb)
+            if ($idx -lt $members.Count) {
+                $picked += $members[$idx]
+                $added = $true
+                if ($picked.Count -ge $Count) { break }
+            }
+        }
+        if (-not $added) { break }
+        $idx++
+    }
+    return @($picked)
+}
+
+# 可接受的 HTTP 状态：2xx/3xx + 401/403（登录墙/WAF）
+function Test-DomainIp {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][string]$Ip,
+        [Parameter(Mandatory)][string]$CurlExe
+    )
+    $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve "${Domain}:443:$Ip" -Head -MaxTime 10
+    $accepted = @('200', '204', '301', '302', '303', '307', '308', '401', '403')
+    $remoteOk = ($r.RemoteIp -eq $Ip)
+    $ok = ($r.ExitCode -eq 0 -and $r.Http -in $accepted -and $remoteOk)
+    $class = if (-not $ok) { 'bad' } elseif ($r.Http -eq '403') { 'waf' } else { 'ok' }
+    return [pscustomobject]@{
+        Ok = $ok; Http = $r.Http; Class = $class; Ttfb = $r.Ttfb
+        Connect = $r.Connect; Tls = $r.Tls; RemoteIp = $r.RemoteIp; Exit = $r.ExitCode
+    }
+}
