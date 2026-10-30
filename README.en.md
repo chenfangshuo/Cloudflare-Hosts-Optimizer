@@ -13,6 +13,14 @@ Windows 10/11 · PowerShell 7+ · built-in `curl.exe` · CFST optional
 > Detailed docs under `docs/` are currently in Chinese; commands and option names are
 > language-neutral.
 
+**Why this exists.** On my line most PT sites took over ten seconds to open. Picking IPs with
+[CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) (CFST) and editing hosts by
+hand did help — but the lowest-ping IP sometimes came back as Error 1034 (the site refuses that
+IP and the page simply won't load), and CFST's default speed-test URL is no longer maintained.
+So this chains it into one run: latency scan → throughput test → per-domain verification →
+hosts write → one-click rollback. **One PT site here went from >10s to about 3s; a single-site
+run measured TTFB 1.75s → 0.69s.**
+
 ## Quick start
 
 **1) Prepare domains**
@@ -69,8 +77,9 @@ with its risks.
 
 ## What a run looks like
 
-Domains and some numbers are placeholders; the real output also includes scan/throughput
-tables.
+Real numbers from my line: TTFB 1.75s → 0.69s on a single-site run. The output below is a
+multi-domain example; domains and some numbers are placeholders, and a real run also prints
+the scan and throughput tables.
 
 ```text
 ==== Cloudflare IP optimization -> hosts ====
@@ -154,7 +163,8 @@ To shorten a run:
 
 - No login, no cookies, no announce URLs, no passkeys. Only a small number of HEAD requests
   per domain (typically 6–10, at most 11; one IP is probed at most twice during the
-  pre-switch confirmation).
+  pre-switch confirmation). The budget grows with the candidate count and `-MaxDomainProbes`,
+  so raising it is not recommended.
 - **Egress IP is unchanged** as long as these domains are in your proxy bypass list. The
   script checks the WinINET bypass list and TUN adapters, but cannot detect every
   PAC/WPAD/WinHTTP/WFP setup.
@@ -174,6 +184,13 @@ See [docs/faq.md](docs/faq.md) for more.
 | Latency measurement | TCPing | HTTPS `cdn-cgi/trace` (includes TLS) |
 | Coverage | wider | limited sample |
 | Dependency | third-party GPL-3.0 binary | PowerShell + system `curl.exe` |
+
+**Why not just write CFST's ranking into hosts.** CFST ranks IPs for your line; it does not tell
+you whether an IP works for a given site — the same IP can serve site A and return 1034 on site
+B. Its download test also depends on `-url`, and the default URL is no longer maintained
+([issue #168](https://github.com/XIU2/CloudflareSpeedTest/issues/168)); the current version scores
+non-200 responses as failures. This tool borrows CFST's latency/loss screening only, measures
+throughput itself, and verifies every domain.
 
 Both share the same colo sampling, throughput final and per-domain selection. CFST is used
 for latency/loss only; its download test is not used.

@@ -8,6 +8,12 @@ Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 
 [English](README.en.md) · [下载发布包](https://github.com/chenfangshuo/pt-cf-optimize/releases)
 
+**为什么会有这个脚本。** 我这边访问 PT 站经常十几秒才打开。用
+[CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 优选后手动写 hosts 确实能改善，
+但 ping 最低的 IP 有时一访问就是 1034（这个 IP 不被该站接受，页面直接打不开），CFST 的默认测速
+地址也已经不由作者维护。所以干脆把「测延迟 → 测吞吐 → 逐站验证 → 写 hosts → 可回滚」串成一次
+运行。**我这边某个 PT 站首页从 >10s 降到 3s 左右；单站点实测 TTFB 1.75s → 0.69s。**
+
 ## 快速开始
 
 **1）[准备域名](#准备域名)**
@@ -95,7 +101,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 
 ## 运行效果
 
-域名和部分数字已替换为示例；实际输出会多出扫描和测速的表格。
+我这边的真实数字：单站点运行时 TTFB 1.75s → 0.69s（-60%）。下面是多站点的示例输出，
+域名和部分数字已替换；实际输出还会多出延迟扫描和吞吐测速的表格。
 
 ```text
 ==== Cloudflare 优选 IP -> hosts ====
@@ -159,7 +166,8 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 ## 安全边界（PT 站必看）
 
 - 不登录、不带 Cookie、不访问 announce URL、不读取 passkey；对目标站只做少量 HEAD
-  （每域名典型 6–10 次、最坏 11 次；准备切换时同一 IP 最多 2 次）。
+  （每域名典型 6–10 次、最坏 11 次；准备切换时同一 IP 最多 2 次）。请求预算会随候选数和
+  `-MaxDomainProbes` 一起涨，所以不建议调高。
 - **不改变出口 IP**：前提是这些域名在代理旁路里。脚本会检查 WinINET 旁路和 TUN，
   但无法完整识别 PAC/WPAD、WinHTTP、应用级代理和 WFP 透明转发。
 - 即使 Clash 开着也没关系：所有 curl 都带 `--noproxy '*'`，CFST 启动前清空代理环境变量；
@@ -178,6 +186,10 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 | 依赖 | 第三方 GPL-3.0 二进制 | 仅 PowerShell + 系统 `curl.exe` |
 | 速度 | 快 | 几十秒到一两分钟 |
 
+**为什么不直接用 CFST 的结果写 hosts。** CFST 给的是「本机到各个 IP」的速度排名，它不会告诉你
+这个 IP 对某个站点能不能用——同一个 IP 可能 A 站正常、B 站 1034；而它的下载测速依赖 `-url`，
+默认地址已不由作者维护（[issue #168](https://github.com/XIU2/CloudflareSpeedTest/issues/168)），
+当前版本对非 200 响应直接判失败。所以这里只借它的延迟/丢包筛查，吞吐自己测，能不能用逐站验证。
 两者共用后续的机房分层、吞吐决赛和逐域名选择；CFST 只用于延迟/丢包，**不做下载测速**。
 覆盖、参数和已知坑见 [docs/how-it-works.md](docs/how-it-works.md#cfst-与内置扫描)。
 
