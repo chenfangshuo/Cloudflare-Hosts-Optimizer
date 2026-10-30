@@ -1,6 +1,6 @@
 # pt-cf-optimize
 
-优选 Cloudflare 边缘 IP 并安全写入 Windows hosts，让 PT 站、论坛等 CF 站点的网页和 tracker 更快。
+优选 Cloudflare 边缘 IP 并安全写入 Windows hosts，让 PT 站、论坛等 CF 站点的网页打开更快。
 
 > 不代理、不登录、不改出口 IP；严格校验 hosts，增量更新，一键回滚。
 
@@ -69,6 +69,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
 ## 准备域名
 
 `domains.txt` 每行一个域名，`#` 开头为注释；已加入 `.gitignore`，站点清单不会进入版本库。
+只填正文站点的网页域名：**不要填 `tracker.example.com` 这类专门的汇报子域名**——announce 是
+每 30 分钟一次的几十字节请求，优选没有收益；映射一旦过期或变成 1034，反而会让汇报失败、红种。
+
 可以手动填写，也可以从下面这些来源导入：
 
 | 来源 | 命令 |
@@ -173,7 +176,9 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 - 即使 Clash 开着也没关系：所有 curl 都带 `--noproxy '*'`，CFST 启动前清空代理环境变量；
   探测和测速强制直连。
 - 不使用 VPN、机场、在线优选网站或公共反向代理访问 PT。
-- hosts 只影响这些域名的网页/tracker；**P2P 和 IPv6 对等连接不受影响**。
+- hosts 只影响这些域名的网页解析；announce 不会因此变快，也不建议把 tracker 子域名单独加进
+  列表（原因见 [FAQ](docs/faq.md#要不要把-tracker-域名加进-domainstxt)）；**P2P 和 IPv6
+  对等连接不受影响**。
 
 具体规则以各站为准；更多问答见 [docs/faq.md](docs/faq.md)。
 
@@ -261,7 +266,7 @@ Invoke-Pester -Path .\tests -Output Detailed
 ## English
 
 A Windows PowerShell tool that picks the fastest Cloudflare edge IPs and writes them into
-the hosts file, for Cloudflare-proxied sites (PT trackers, forums, etc.).
+the hosts file, for Cloudflare-proxied sites (PT forums, etc.).
 
 It uses CloudflareSpeedTest for latency/loss screening only, measures throughput independently,
 samples candidates across edge colos, verifies every domain with HEAD requests (one extra

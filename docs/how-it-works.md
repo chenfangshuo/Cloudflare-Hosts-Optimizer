@@ -180,7 +180,8 @@ SaaS 接入等），本质上无法优选。这时 DNS 回退找到的 IP 只是
 但这不是绝对的：应用自带解析器、DoH、缓存等可能有不同行为。`-CheckResolved`
 可以查看系统实际返回的地址。
 
-这只影响这些域名的网页/tracker；BitTorrent 的 IPv6 对等连接不受影响。
+这只影响这些域名的网页；BitTorrent 的 IPv6 对等连接不受影响。announce 不是优化目标，
+tracker 专用子域名也不建议写进列表（见 [FAQ](faq.md#要不要把-tracker-域名加进-domainstxt)）。
 
 ### 为什么默认不做 IPv6 优选
 

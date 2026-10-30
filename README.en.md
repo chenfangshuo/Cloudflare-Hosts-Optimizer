@@ -1,7 +1,7 @@
 # pt-cf-optimize
 
 Pick the fastest Cloudflare edge IPs and safely write them into the Windows hosts file,
-for Cloudflare-proxied sites such as PT trackers and forums.
+so Cloudflare-proxied sites such as PT forums load faster.
 
 > No proxy, no login, no egress IP change. Strict hosts validation, incremental updates,
 > one-click rollback.
@@ -35,6 +35,10 @@ curl.exe -sI https://example.com | findstr /i "server:"
 
 `server: cloudflare` is a hint, not proof. Non-CF sites are skipped during per-domain
 validation.
+
+List web hostnames only. **Do not list tracker-only hostnames** such as
+`tracker.example.com`: an announce is a few dozen bytes every 30 minutes, so there is nothing to
+gain, while a stale mapping or an Error 1034 would break announcements and turn torrents red.
 
 **2) Optional: add CFST (better coverage)**
 
@@ -171,8 +175,9 @@ To shorten a run:
 - Clash/proxy can stay on: every curl call uses `--noproxy '*'` and CFST clears proxy
   environment variables. Probes and speed tests always go direct.
 - Do not use VPNs, online IP-picking services or public reverse proxies to access PT sites.
-- hosts only affects HTTP/tracker resolution for these domains; **P2P and IPv6 peer
-  connections are unaffected**.
+- hosts only changes name resolution for these domains' web pages; announces do not get
+  faster, and tracker hostnames should not be listed (see the FAQ, Chinese); **P2P and IPv6
+  peer connections are unaffected**.
 
 See [docs/faq.md](docs/faq.md) for more.
 

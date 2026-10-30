@@ -12,6 +12,17 @@
 验证阶段每域名每 IP 最多发 2 次 HEAD（准备切换时复核一次），不登录、不带 Cookie、
 不访问 announce URL。具体规则以各站为准。
 
+## 要不要把 tracker 域名加进 domains.txt？
+
+不建议。announce 是客户端每 30 分钟发一次的几十字节请求，优选边缘 IP 对它没有任何可感知
+的收益；但映射一旦过期或 zone 开始返回 1034，汇报就会失败，客户端显示红种，要等下次重跑
+或回滚才恢复。收益为零、风险非零，所以只填网页域名。
+
+- tracker 在独立子域名（如 `tracker.example.com`）时，直接不写进列表即可。
+- NexusPHP 常见的 `example.com/announce.php` 和网页是同一个域名，分不开；这种情况只能靠
+  定期重跑、出问题 `-Rollback` 兜底。
+- 工具只对列表里的域名发根路径 HEAD，不访问 announce，也不连 tracker 端口。
+
 ## 需要关掉 Clash / 代理吗？
 
 不需要。脚本里所有 curl 都带 `--noproxy '*'`，CFST 启动前也会清空
@@ -103,8 +114,8 @@ hosts 不是带优先级的故障转移配置。即使按 TTFB 顺序写多行�
 
 ## 为什么下载速度没有变快？
 
-hosts 只影响这些域名的网页和 tracker 通告。PT 的 P2P 传输是 BitTorrent 直连，
-与 hosts 无关，取决于做种人数、你的 IPv6 连通性和运营商互联质量。
+hosts 只影响这些域名的网页解析（以及同域名的 tracker 汇报请求）。PT 的 P2P 传输是
+BitTorrent 直连，与 hosts 无关，取决于做种人数、你的 IPv6 连通性和运营商互联质量。
 网页变快 ≠ 下载变快。
 
 ## 1–2 周不重跑，会不会比不写 hosts 还慢？
