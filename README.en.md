@@ -17,8 +17,9 @@ Windows 10/11 · PowerShell 7+ · built-in `curl.exe` · CFST optional
 
 **1) Prepare domains**
 
-Copy `domains.example.txt` to `domains.txt`; one domain per line. Only add sites you have
-confirmed are proxied by Cloudflare:
+Copy `domains.example.txt` to `domains.txt`; one domain per line. Prefer sites you have
+confirmed are proxied by Cloudflare — a wrong entry won't corrupt anything, per-domain
+validation simply skips it, but the run is wasted:
 
 ```powershell
 curl.exe -sI https://example.com | findstr /i "server:"

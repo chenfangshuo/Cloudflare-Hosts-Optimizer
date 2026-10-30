@@ -12,7 +12,8 @@ Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 
 **1）[准备域名](#准备域名)**
 
-复制 `domains.example.txt` 为 `domains.txt`，每行一个域名。只填**确认由 Cloudflare 代理**的站点：
+复制 `domains.example.txt` 为 `domains.txt`，每行一个域名。建议只填**确认由 Cloudflare
+代理**的站点——填错了也不会写坏，逐站验证会跳过它，只是白跑一次：
 
 ```powershell
 curl.exe -sI https://example.com | findstr /i "server:"
