@@ -129,32 +129,50 @@ function Show-Menu {
     }
 }
 
-# 备用屏幕 + 原地重绘。选中行用反显。
+# 原地重绘（不使用备用屏幕）：菜单画在当前位置，选中行反显；
+# 选定后先擦掉整块菜单，动作输出从菜单原来的位置开始，不会被菜单内容覆盖。
 function Show-TuiMenu {
     param([string]$Menu, [string[]]$Header = @())
     $items = @(Get-MenuItems -Menu $Menu)
     if ($items.Count -eq 0) { return $null }
     $selected = 0
-    [Console]::Write("`e[?1049h`e[?25l")
+    $top = -1
+    $frameCount = 0
     try {
         while ($true) {
             $footer = '↑↓ 选择 · Enter 确认 · Esc 返回'
             $lines = @(Format-MenuFrame -Header $Header -Items $items -SelectedIndex $selected -Footer $footer)
             $selLine = $Header.Count + 1 + $selected
-            [Console]::Write("`e[H")
+            # 回到菜单块顶部重画；窗口缩放等导致位置失效时退回“从当前位置画”
+            if ($top -ge 0) {
+                try { [Console]::SetCursorPosition(0, $top) }
+                catch { $top = -1 }
+            }
+            if ($top -lt 0) {
+                try { $top = [Console]::CursorTop } catch { $top = 0 }
+            }
             for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($i -eq $selLine) { [Console]::Write("`e[7m" + $lines[$i] + "`e[K`e[0m`n") }
-                else { [Console]::Write($lines[$i] + "`e[K`n") }
+                if ($i -eq $selLine) { [Console]::Write("`e[7m" + $lines[$i] + "`e[K`e[0m`r`n") }
+                else { [Console]::Write($lines[$i] + "`e[K`r`n") }
             }
             [Console]::Write("`e[J")
+            $frameCount = $lines.Count
+            try { $top = [Math]::Max(0, [Console]::CursorTop - $frameCount) } catch { }
             $key = [Console]::ReadKey($true)
             switch ($key.Key) {
                 'UpArrow' { $selected = ($selected - 1 + $items.Count) % $items.Count }
                 'DownArrow' { $selected = ($selected + 1) % $items.Count }
                 'Home' { $selected = 0 }
                 'End' { $selected = $items.Count - 1 }
-                'Enter' { return $items[$selected] }
+                'Enter' {
+                    # 擦掉菜单块，动作输出从这里开始
+                    try { [Console]::SetCursorPosition(0, $top) } catch { }
+                    [Console]::Write("`e[J")
+                    return $items[$selected]
+                }
                 'Escape' {
+                    try { [Console]::SetCursorPosition(0, $top) } catch { }
+                    [Console]::Write("`e[J")
                     $back = @($items | Where-Object { $_.Kind -in @('Back', 'Exit') } | Select-Object -First 1)
                     if ($back.Count -gt 0) { return $back[0] }
                     return $null
@@ -162,7 +180,7 @@ function Show-TuiMenu {
             }
         }
     } finally {
-        [Console]::Write("`e[?25h`e[?1049l")
+        try { [Console]::Write("`e[?25h") } catch { }
     }
 }
 
@@ -191,7 +209,12 @@ function Invoke-ScriptAction {
         [void](Invoke-Elevated -Arguments @($Spec.Arguments))
         return
     }
-    $exit = Invoke-Child -FilePath $MainScript -Arguments @($Spec.Arguments)
+    # 菜单里的 DryRun 也写报告，方便「查看上次报告」；命令行 DryRun 默认仍然不写
+    $runArgs = @($Spec.Arguments)
+    if ($runArgs -contains '-DryRun' -and $runArgs -notcontains '-ReportPath') {
+        $runArgs += @('-ReportPath', $ReportPath)
+    }
+    $exit = Invoke-Child -FilePath $MainScript -Arguments $runArgs
     $color = if ($exit -eq 0) { 'Green' } else { 'Yellow' }
     Write-Host "退出码：$exit" -ForegroundColor $color
 }
@@ -287,6 +310,8 @@ function Show-Report {
         Write-Host '还没有报告：先跑一次 DryRun 或正式写入。' -ForegroundColor Yellow
         return
     }
+    $time = (Get-Item -LiteralPath $ReportPath).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    Write-Host "报告：$ReportPath（$time）" -ForegroundColor DarkGray
     Get-Content -LiteralPath $ReportPath -Tail 80 | ForEach-Object { Write-Host $_ }
 }
 
@@ -360,7 +385,7 @@ function Invoke-Choice {
         'EditDomains' { Invoke-EditDomains }
         'DomainOverview' { Show-DomainOverview }
         'ViewReport' { Show-Report }
-        'OpenReadme' { Start-Process (Join-Path $Root 'README.md') }
+        'OpenReadme' { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f (Join-Path $Root 'README.md')) }
     }
     Pause-Action
     return $true
