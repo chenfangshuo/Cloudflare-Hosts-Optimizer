@@ -30,7 +30,8 @@ curl.exe -sI https://example.com | findstr /i "server:"
 **2）可选：放好 CFST（效果更好）**
 
 从 [CloudflareSpeedTest releases](https://github.com/XIU2/CloudflareSpeedTest/releases)
-下载后，把 `cfst.exe` 和 `ip.txt` 放到脚本旁的 `cfst\` 目录：
+下载后把 `cfst.exe` 和 `ip.txt` 放到脚本旁的 `cfst\` 目录（发布包里已经建好这个目录，
+里面有一份 `PUT-CFST-HERE.txt` 说明，可以直接删掉）：
 
 ```text
 Cloudflare-Hosts-Optimizer\

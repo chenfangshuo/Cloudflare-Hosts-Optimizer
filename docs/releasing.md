@@ -18,10 +18,15 @@ Cloudflare-Hosts-Optimizer-0.4.0.zip
 └─ Cloudflare-Hosts-Optimizer\
      Cloudflare-Hosts-Optimizer.ps1
      Import-Domains.ps1
+     cfst\
+       PUT-CFST-HERE.txt
      lib\
      docs\
      ...
 ```
+
+`cfst\` 目录里只有一份给用户的说明，不放 CFST 本体；`.gitignore` 用 `cfst/*` 加白名单
+保证二进制仍然不入库。
 
 `Package-Release.ps1` 会在打包后读一遍 zip 条目，确认所有条目都在这个前缀下、且主脚本
 存在，本地和 CI 都会因此失败而不是发出结构错误的包。

@@ -43,7 +43,8 @@ gain, while a stale mapping or an Error 1034 would break announcements and turn 
 **2) Optional: add CFST (better coverage)**
 
 Download [CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest/releases) and put
-`cfst.exe` and `ip.txt` into a `cfst\` folder next to the script:
+`cfst.exe` and `ip.txt` into the `cfst\` folder next to the script (the release archive already
+creates this folder with a `PUT-CFST-HERE.txt` note you can delete):
 
 ```text
 Cloudflare-Hosts-Optimizer\

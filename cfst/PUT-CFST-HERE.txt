@@ -1,0 +1,19 @@
+把 CloudflareSpeedTest 的 cfst.exe 和 ip.txt 放进这个目录
+========================================================
+
+目录结构应该是：
+
+    Cloudflare-Hosts-Optimizer\
+      cfst\
+        cfst.exe            <- 从下面的发布页下载
+        ip.txt              <- 同一个压缩包里自带
+        PUT-CFST-HERE.txt   <- 本说明，可以删掉
+
+下载地址：
+    https://github.com/XIU2/CloudflareSpeedTest/releases/latest
+
+说明：
+
+1. 本仓库不包含 CFST 本体（GPL-3.0），需要你自己下载。
+2. 不放也能用：脚本会自动回退到内置扫描，但候选池更小、效果可能差一些。
+3. 发布包只带这个说明文件；cfst.exe、ip.txt 等第三方文件不会被打包，也不会提交到仓库。

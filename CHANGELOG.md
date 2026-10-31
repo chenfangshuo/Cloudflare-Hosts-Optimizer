@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 - 2026-10-31
+
+### Changed
+
+- 发布包里已经建好 `cfst\` 目录，并附一份 `PUT-CFST-HERE.txt` 说明要放 `cfst.exe` 和
+  `ip.txt`。仍然不包含 CFST 本体（GPL-3.0）。
+- `.gitignore` 的 `cfst/` 改为 `cfst/*` 加白名单，只有说明文件入库，二进制照旧忽略。
+
 ## 0.4.0 - 2026-10-31
 
 ### Added

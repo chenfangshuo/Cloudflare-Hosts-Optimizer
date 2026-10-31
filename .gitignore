@@ -22,8 +22,9 @@ result.csv
 # 发布构建产物
 dist/
 
-# 第三方二进制（GPL-3.0，不随本仓库分发）
-cfst/
+# 第三方二进制（GPL-3.0，不随本仓库分发）；目录里只保留给用户的说明文件
+cfst/*
+!cfst/PUT-CFST-HERE.txt
 cfst.exe
 CloudflareST.exe
 
