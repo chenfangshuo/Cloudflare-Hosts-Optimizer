@@ -93,6 +93,29 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
+# 生成一屏文字；选中的那一行用 "> " 标记。Menu.ps1 再给它加反显。
+function Format-MenuFrame {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][string[]]$Header = @(),
+        [Parameter(Mandatory)]$Items,
+        [int]$SelectedIndex = 0,
+        [AllowEmptyString()][string]$Footer = ''
+    )
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($h in $Header) { $lines.Add($h) }
+    $lines.Add('')
+    for ($i = 0; $i -lt @($Items).Count; $i++) {
+        $marker = if ($i -eq $SelectedIndex) { '>' } else { ' ' }
+        $lines.Add(('{0} {1}' -f $marker, @($Items)[$i].Label))
+    }
+    if ($Footer) {
+        $lines.Add('')
+        $lines.Add($Footer)
+    }
+    return @($lines)
+}
+
 # 域名总览：domains.txt 的列表、hosts 托管区块里的映射、两边差集。
 function Get-DomainOverview {
     [CmdletBinding()]

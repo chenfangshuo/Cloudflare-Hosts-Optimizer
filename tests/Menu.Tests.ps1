@@ -143,3 +143,24 @@ Describe 'Get-MenuStatus' {
         $s.Cfst | Should -Be '未安装'
     }
 }
+
+Describe 'Format-MenuFrame' {
+    It '标记选中项并保留头部和页脚' {
+        $items = @(
+            (New-MenuSpec '1' '第一项' 'Script'),
+            (New-MenuSpec '2' '第二项' 'Script')
+        )
+        $lines = @(Format-MenuFrame -Header @('标题', '状态') -Items $items -SelectedIndex 1 -Footer '↑↓ 选择')
+        $lines[0] | Should -Be '标题'
+        $lines[1] | Should -Be '状态'
+        $lines[2] | Should -Be ''
+        $lines[3] | Should -Be '  第一项'
+        $lines[4] | Should -Be '> 第二项'
+        $lines[-1] | Should -Be '↑↓ 选择'
+    }
+
+    It '没有页脚时不额外加空行' {
+        $items = @((New-MenuSpec '1' 'A' 'Script'))
+        @(Format-MenuFrame -Header @() -Items $items -SelectedIndex 0).Count | Should -Be 2
+    }
+}

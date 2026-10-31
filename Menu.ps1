@@ -1,10 +1,13 @@
 #Requires -Version 7.0
 <#
-    双击 Start.bat 后进入的菜单。
-    只负责显示、读输入、调用子进程；动作定义在 lib\Menu.ps1。
+    双击 Start.bat 后进入的菜单（TUI：上下箭头选择）。
 
-    注意：不能用 dot-source 调主脚本——它末尾有 exit，会把菜单一起结束。
-    写入 hosts / 回滚 / AutoApply 任务需要管理员时，用 Start-Process -Verb RunAs 单独提权。
+    - 交互终端里使用备用屏幕缓冲区（ESC[?1049h）画菜单，退出后原样恢复滚动内容；
+      动作执行前会先退出备用屏幕，输出留在正常屏幕上。
+    - 输出/输入被重定向、或终端不支持 VT 时，自动退回编号输入。
+      `$env:CFO_PLAIN_MENU='1'` 可强制使用编号输入。
+    - 不能用 dot-source 调主脚本——它末尾有 exit，会把菜单一起结束。
+    - 写入 hosts / 回滚 / AutoApply 任务需要管理员时，用 Start-Process -Verb RunAs 单独提权。
 #>
 [CmdletBinding()]
 param([string]$Action)
@@ -39,10 +42,34 @@ function Test-IsAdmin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-TuiSupported {
+    if ($env:CFO_PLAIN_MENU -eq '1') { return $false }
+    try {
+        if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
+        if (-not $Host.UI.SupportsVirtualTerminal) { return $false }
+        [void][Console]::WindowWidth
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 $script:Pwsh = Get-PwshPath
+$script:IsAdmin = Test-IsAdmin
+$script:Tui = if ($Action) { $false } else { Test-TuiSupported }
+$script:Version = ''
+try {
+    $m = Select-String -LiteralPath $MainScript -Pattern "ScriptVersion\s*=\s*'([^']+)'" | Select-Object -First 1
+    if ($m) { $script:Version = $m.Matches[0].Groups[1].Value }
+} catch { }
 
 function Pause-Menu {
     [void](Read-Host '按回车返回菜单')
+}
+
+function Pause-Action {
+    if ($script:Tui) { [void](Read-Host '按回车返回菜单') }
+    else { Pause-Menu }
 }
 
 function Confirm-Action {
@@ -77,27 +104,21 @@ function Invoke-Elevated {
     }
 }
 
-function Write-Header {
-    $version = ''
-    try {
-        $m = Select-String -LiteralPath $MainScript -Pattern "ScriptVersion\s*=\s*'([^']+)'" | Select-Object -First 1
-        if ($m) { $version = $m.Matches[0].Groups[1].Value }
-    } catch { }
+function Get-MenuHeader {
     $st = Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
-
-    $title = if ($version) { "Cloudflare-Hosts-Optimizer $version" } else { 'Cloudflare-Hosts-Optimizer' }
     $dot = [string][char]0x00B7
+    $title = if ($script:Version) { "Cloudflare-Hosts-Optimizer $($script:Version)" } else { 'Cloudflare-Hosts-Optimizer' }
     $hostsText = if ($st.HostsError) { 'hosts 结构异常' } else { "hosts 已写入 $($st.Managed) 个" }
     $invalidText = if ($st.Invalid -gt 0) { "（$($st.Invalid) 个非法）" } else { '' }
     $lastText = if ($st.LastRun) { "$dot 上次运行 $($st.LastRun)" } else { '' }
-    $status = "域名 $($st.Listed) 个$invalidText $dot $hostsText $dot CFST $($st.Cfst) $lastText"
-
-    Write-Host ''
-    Write-Host $title -ForegroundColor Cyan
-    Write-Host $status -ForegroundColor DarkGray
-    if (-not (Test-IsAdmin)) {
-        Write-Host '当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。' -ForegroundColor DarkGray
+    $lines = @(
+        $title
+        "域名 $($st.Listed) 个$invalidText $dot $hostsText $dot CFST $($st.Cfst) $lastText"
+    )
+    if (-not $script:IsAdmin) {
+        $lines += '当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。'
     }
+    return $lines
 }
 
 function Show-Menu {
@@ -108,22 +129,75 @@ function Show-Menu {
     }
 }
 
+# 备用屏幕 + 原地重绘。选中行用反显。
+function Show-TuiMenu {
+    param([string]$Menu, [string[]]$Header = @())
+    $items = @(Get-MenuItems -Menu $Menu)
+    if ($items.Count -eq 0) { return $null }
+    $selected = 0
+    [Console]::Write("`e[?1049h`e[?25l")
+    try {
+        while ($true) {
+            $footer = '↑↓ 选择 · Enter 确认 · Esc 返回'
+            $lines = @(Format-MenuFrame -Header $Header -Items $items -SelectedIndex $selected -Footer $footer)
+            $selLine = $Header.Count + 1 + $selected
+            [Console]::Write("`e[H")
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($i -eq $selLine) { [Console]::Write("`e[7m" + $lines[$i] + "`e[K`e[0m`n") }
+                else { [Console]::Write($lines[$i] + "`e[K`n") }
+            }
+            [Console]::Write("`e[J")
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow' { $selected = ($selected - 1 + $items.Count) % $items.Count }
+                'DownArrow' { $selected = ($selected + 1) % $items.Count }
+                'Home' { $selected = 0 }
+                'End' { $selected = $items.Count - 1 }
+                'Enter' { return $items[$selected] }
+                'Escape' {
+                    $back = @($items | Where-Object { $_.Kind -in @('Back', 'Exit') } | Select-Object -First 1)
+                    if ($back.Count -gt 0) { return $back[0] }
+                    return $null
+                }
+            }
+        }
+    } finally {
+        [Console]::Write("`e[?25h`e[?1049l")
+    }
+}
+
+function Read-MenuChoice {
+    param([string]$Menu, [string[]]$ExtraHeader = @())
+    $header = @(Get-MenuHeader) + @($ExtraHeader)
+    if ($script:Tui) {
+        return Show-TuiMenu -Menu $Menu -Header $header
+    }
+    Write-Host ''
+    if ($header.Count -gt 0) { Write-Host $header[0] -ForegroundColor Cyan }
+    for ($i = 1; $i -lt $header.Count; $i++) { Write-Host $header[$i] -ForegroundColor DarkGray }
+    Show-Menu -Menu $Menu
+    while ($true) {
+        $key = Read-Host '请选择'
+        $spec = Get-MenuActionSpec -Menu $Menu -Key $key
+        if ($spec) { return $spec }
+        Write-Host '无效选项' -ForegroundColor Yellow
+    }
+}
+
 function Invoke-ScriptAction {
-    param($Spec, [switch]$NoPause)
+    param($Spec)
     if ($Spec.Confirm -and -not (Confirm-Action $Spec.Label)) { return }
-    if ($Spec.RequiresAdmin -and -not (Test-IsAdmin)) {
+    if ($Spec.RequiresAdmin -and -not $script:IsAdmin) {
         [void](Invoke-Elevated -Arguments @($Spec.Arguments))
-        if (-not $NoPause) { Pause-Menu }
         return
     }
     $exit = Invoke-Child -FilePath $MainScript -Arguments @($Spec.Arguments)
     $color = if ($exit -eq 0) { 'Green' } else { 'Yellow' }
     Write-Host "退出码：$exit" -ForegroundColor $color
-    if (-not $NoPause) { Pause-Menu }
 }
 
 function Invoke-ImportAction {
-    param($Spec, [switch]$NoPause)
+    param($Spec)
     $path = ''
     if ($Spec.InputKind -eq 'Path') {
         $path = (Read-Host '输入文件路径（可把文件拖进来）').Trim('"').Trim()
@@ -135,7 +209,6 @@ function Invoke-ImportAction {
     $exit = Invoke-Child -FilePath $ImportScript -Arguments $args
     if ($exit -ne 0) {
         Write-Host "导入失败（退出码 $exit）。" -ForegroundColor Red
-        if (-not $NoPause) { Pause-Menu }
         return
     }
     $lines = @(Get-Content -LiteralPath $out -ErrorAction SilentlyContinue |
@@ -154,7 +227,6 @@ function Invoke-ImportAction {
         $exit2 = Invoke-Child -FilePath $ImportScript -Arguments $mergeArgs
         if ($exit2 -eq 0) { Write-Host '已合并到 domains.txt。' -ForegroundColor Green }
     }
-    if (-not $NoPause) { Pause-Menu }
 }
 
 function Invoke-EditDomains {
@@ -226,17 +298,13 @@ function Show-CfstMenu {
             try { $ver = Get-CfstVersion -Exe $st.Exe } catch { }
         }
         $stateText = if ($st.Installed) { "已安装$(if ($ver) { " v$ver" })" } elseif ($st.HasExe) { '缺少 ip.txt' } else { '未安装' }
-        Write-Host ''
-        Write-Host "CFST：$stateText" -ForegroundColor Cyan
-        Show-Menu -Menu Cfst
-        $key = Read-Host '请选择'
-        $spec = Get-MenuActionSpec -Menu Cfst -Key $key
-        if (-not $spec) { Write-Host '无效选项' -ForegroundColor Yellow; continue }
-        if ($spec.Kind -eq 'Back') { return }
+        $spec = Read-MenuChoice -Menu Cfst -ExtraHeader @("CFST：$stateText")
+        if (-not $spec -or $spec.Kind -eq 'Back') { return }
+
         if ($spec.Kind -eq 'OpenUrl') {
             Start-Process $spec.Target
             Write-Host '已在浏览器打开下载页；下载后选「从本地 zip 安装」。' -ForegroundColor DarkGray
-            Pause-Menu
+            Pause-Action
             continue
         }
         if ($spec.Kind -eq 'InstallCfst') {
@@ -254,54 +322,47 @@ function Show-CfstMenu {
             }
             $exit = Invoke-Child -FilePath $CfstScript -Arguments $cfstArgs
             Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
-            Pause-Menu
+            Pause-Action
         }
     }
 }
 
 function Show-TaskMenu {
     while ($true) {
-        Show-Menu -Menu Task
-        $key = Read-Host '请选择'
-        $spec = Get-MenuActionSpec -Menu Task -Key $key
-        if (-not $spec) { Write-Host '无效选项' -ForegroundColor Yellow; continue }
-        if ($spec.Kind -eq 'Back') { return }
-        Invoke-ScriptAction -Spec $spec
+        $spec = Read-MenuChoice -Menu Task
+        if (-not $spec -or $spec.Kind -eq 'Back') { return }
+        [void](Invoke-Choice -Spec $spec)
     }
 }
 
 function Show-ImportMenu {
     while ($true) {
-        Show-Menu -Menu Import
-        $key = Read-Host '请选择'
-        $spec = Get-MenuActionSpec -Menu Import -Key $key
-        if (-not $spec) { Write-Host '无效选项' -ForegroundColor Yellow; continue }
-        switch ($spec.Kind) {
-            'Back' { return }
-            'EditDomains' { Invoke-EditDomains; Pause-Menu }
-            'Import' { Invoke-ImportAction -Spec $spec }
-        }
+        $spec = Read-MenuChoice -Menu Import
+        if (-not $spec -or $spec.Kind -eq 'Back') { return }
+        [void](Invoke-Choice -Spec $spec)
     }
 }
 
 function Invoke-Choice {
-    param($Spec, [switch]$NoPause)
+    param($Spec)
+    if ($Spec.Kind -eq 'Exit') { return $false }
     switch ($Spec.Kind) {
-        'Exit' { return $false }
         'Submenu' {
             switch ($Spec.Target) {
                 'Import' { Show-ImportMenu }
                 'Cfst' { Show-CfstMenu }
                 'Task' { Show-TaskMenu }
             }
+            return $true
         }
-        'Script' { Invoke-ScriptAction -Spec $Spec -NoPause:$NoPause }
-        'Import' { Invoke-ImportAction -Spec $Spec -NoPause:$NoPause }
-        'EditDomains' { Invoke-EditDomains; if (-not $NoPause) { Pause-Menu } }
-        'DomainOverview' { Show-DomainOverview; if (-not $NoPause) { Pause-Menu } }
-        'ViewReport' { Show-Report; if (-not $NoPause) { Pause-Menu } }
+        'Script' { Invoke-ScriptAction -Spec $Spec }
+        'Import' { Invoke-ImportAction -Spec $Spec }
+        'EditDomains' { Invoke-EditDomains }
+        'DomainOverview' { Show-DomainOverview }
+        'ViewReport' { Show-Report }
         'OpenReadme' { Start-Process (Join-Path $Root 'README.md') }
     }
+    Pause-Action
     return $true
 }
 
@@ -311,17 +372,14 @@ if ($Action) {
         Write-Host "不支持的 -Action：$Action（可用：1/3/4/5/6/9/10）" -ForegroundColor Red
         exit 2
     }
-    [void](Invoke-Choice -Spec $spec -NoPause)
+    [void](Invoke-Choice -Spec $spec)
     exit 0
 }
 
 try {
     while ($true) {
-        Write-Header
-        Show-Menu -Menu Main
-        $key = Read-Host '请选择'
-        $spec = Get-MenuActionSpec -Menu Main -Key $key
-        if (-not $spec) { Write-Host '无效选项' -ForegroundColor Yellow; continue }
+        $spec = Read-MenuChoice -Menu Main
+        if (-not $spec -or $spec.Kind -eq 'Exit') { break }
         $keep = Invoke-Choice -Spec $spec
         if (-not $keep) { break }
     }
