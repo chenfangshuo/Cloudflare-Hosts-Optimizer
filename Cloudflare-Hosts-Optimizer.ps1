@@ -155,7 +155,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.9'
+$ScriptVersion = '0.3.10'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -221,12 +221,14 @@ function Show-ProxyCheck {
         return
     }
     Say "代理：WinINET 系统代理已开启 -> $($p.Server)" 'Yellow'
-    Say '  注意：本工具的 curl 都带 --noproxy *，CFST 也会清空代理环境变量；探测和测速强制直连，不走这个代理。' 'DarkGray'
+    Say '  说明：本工具的 curl 带 --noproxy *、CFST 启动前会清空代理环境变量，所以探测和测速不走这个 HTTP 代理。' 'DarkGray'
+    Say '  但 TUN / WFP / PAC 这类透明转发无法这样绕过，是否直连要看下面的网卡检查。' 'DarkGray'
     $missing = @($TargetDomains | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $p.Bypass) })
     if ($missing.Count -eq 0) {
-        Say '旁路：目标域名均在 ProxyOverride 中（仅代表 WinINET 层直连）。' 'Green'
+        Say '旁路：目标域名均在 ProxyOverride 中（只代表浏览器等 WinINET 程序直连，与测速无关）。' 'Green'
     } else {
-        Say '旁路：以下域名不在 ProxyOverride 中，可能走代理、导致出口 IP 变化：' 'Red'
+        Say '旁路：以下域名不在 ProxyOverride 中：浏览器等 WinINET 程序可能走代理、出口 IP 可能变化。' 'Red'
+        Say '  本工具的探测和测速不受这一项影响（不走 HTTP 代理）；但开着代理时，这些程序可能不用 hosts 里的映射。' 'DarkGray'
         foreach ($m in $missing) { Say "  - $m" 'Red' }
     }
 }
@@ -240,11 +242,11 @@ function Test-TunAdapter {
             $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'TAP|TUN|Wintun|WireGuard|Tailscale|Clash|Mihomo'
         })
     if ($tun.Count -gt 0) {
-        Say '警告：检测到可能处于 TUN 模式的网卡（可能接管流量）：' 'Red'
+        Say '警告：检测到可能处于 TUN 模式的网卡，流量可能被它接管（--noproxy 绕不过 TUN）：' 'Red'
         foreach ($t in $tun) { Say "  - $($t.Name) / $($t.InterfaceDescription)" 'Red' }
         return $true
     }
-    Say '网卡：未发现已知 TUN 虚拟网卡（这不等于已证明直连）。' 'Green'
+    Say '网卡：未发现已知 TUN 虚拟网卡（这只说明没有已知 TUN，不排除 WFP/透明代理）。' 'Green'
     return $false
 }
 
@@ -302,7 +304,7 @@ function Invoke-Main {
     Show-ProxyCheck -TargetDomains $domainList
     $tun = Test-TunAdapter
     if ($tun -and -not $DryRun -and -not $planMode -and -not $Force) {
-        Fail '检测到 TUN 网卡。为避免测速和访问走代理，已中止；确认风险后加 -Force 继续。' 3
+        Fail '检测到 TUN 网卡。--noproxy 只能绕过 HTTP 代理，绕不过 TUN；为避免测速和访问走代理，已中止。确认风险后加 -Force 继续。' 3
     }
     Say ''
 
