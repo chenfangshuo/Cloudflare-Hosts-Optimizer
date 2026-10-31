@@ -35,6 +35,34 @@
 .PARAMETER Version
     打印版本号并退出。
 
+.PARAMETER Doctor
+    只读自检：检查 PowerShell/curl、hosts 结构与编码、域名文件、CFST、探测与测速端点、
+    代理与 TUN、备份目录、机房缓存和已注册的计划任务，然后退出。
+    不写 hosts、不需要管理员；只向 Cloudflare 公共端点发少量请求，不访问目标站点。
+    有失败项时退出码为 1。
+
+.PARAMETER InstallTask
+    注册计划任务并退出。默认注册 DryRun 任务（只生成报告、不写 hosts、不需要管理员）；
+    AutoApply 需要管理员。任务每 -TaskIntervalDays 天在 -TaskAt 运行一次。
+
+.PARAMETER UninstallTask
+    删除计划任务并退出。不带 -TaskName 时删除两个默认任务（DryRun/AutoApply）。
+
+.PARAMETER TaskMode
+    计划任务模式：DryRun（默认）或 AutoApply（自动写入 hosts，需要管理员）。
+
+.PARAMETER TaskIntervalDays
+    计划任务的间隔天数（1-30，默认 14）。
+
+.PARAMETER TaskAt
+    计划任务的运行时间（24 小时 HH:mm）。默认 DryRun 10:00、AutoApply 04:00。
+
+.PARAMETER TaskName
+    自定义任务名；-UninstallTask 时也可以只删指定的一个。
+
+.PARAMETER TaskForce
+    覆盖已存在的同名计划任务。与全局 -Force 无关。
+
 .PARAMETER NoCfst
     不使用 cfst.exe，改用内置扫描（从 Cloudflare 官方 IPv4 段随机抽样）。
 
@@ -97,6 +125,10 @@
 .PARAMETER SpeedTestUrl
     吞吐测速地址，支持 {bytes} 占位符。必须是 https，且由 Cloudflare 托管。
 
+.PARAMETER ProbeUrl
+    延迟扫描和机房探测使用的 cdn-cgi/trace 地址（默认 speed.cloudflare.com）。
+    只允许 https，且必须是 Cloudflare 托管的站点。显式指定后不会自动回退到备用端点。
+
 .PARAMETER HostsPath
     高级选项：hosts 文件路径，默认系统 hosts。用于测试/沙箱。
 
@@ -122,6 +154,14 @@ param(
     [switch]$Rollback,
     [string]$RollbackFrom,
     [switch]$Version,
+    [switch]$Doctor,
+    [switch]$InstallTask,
+    [switch]$UninstallTask,
+    [ValidateSet('DryRun', 'AutoApply')][string]$TaskMode = 'DryRun',
+    [ValidateRange(1, 30)][int]$TaskIntervalDays = 14,
+    [string]$TaskAt,
+    [string]$TaskName,
+    [switch]$TaskForce,
     [switch]$NoCfst,
     [switch]$Force,
     [switch]$Prune,
@@ -142,6 +182,7 @@ param(
     [string]$DomainsFile,
     [string]$CfstPath,
     [string]$SpeedTestUrl = 'https://speed.cloudflare.com/__down?bytes={bytes}',
+    [string]$ProbeUrl,
     [string]$HostsPath,
     [string]$ReportPath,
     [string]$PlanPath,
@@ -155,7 +196,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.10'
+$ScriptVersion = '0.4.0'
+# 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
+# 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
+$script:ScriptBoundParameters = @{}
+foreach ($k in $PSBoundParameters.Keys) { $script:ScriptBoundParameters[$k] = $PSBoundParameters[$k] }
+$script:ProbeUrlExplicit = $PSBoundParameters.ContainsKey('ProbeUrl')
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
@@ -169,6 +215,9 @@ $script:RepoRoot = $Root
 . (Join-Path $Root 'lib\Domains.ps1')
 . (Join-Path $Root 'lib\HostsFile.ps1')
 . (Join-Path $Root 'lib\Probe.ps1')
+. (Join-Path $Root 'lib\Endpoint.ps1')
+. (Join-Path $Root 'lib\Doctor.ps1')
+. (Join-Path $Root 'lib\Schedule.ps1')
 
 $script:Log = [System.Collections.Generic.List[string]]::new()
 $script:FailCode = 0
@@ -233,14 +282,21 @@ function Show-ProxyCheck {
     }
 }
 
+function Get-TunAdapters {
+    # 返回已启用的已知 TUN 虚拟网卡；缺少 NetAdapter 模块时返回 $null（与"没有 TUN"区分）
+    if (-not (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue)) { return $null }
+    # 前置逗号：空数组直接输出会被折叠成 $null，和"模块缺失"混淆
+    return , @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+            $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'TAP|TUN|Wintun|WireGuard|Tailscale|Clash|Mihomo'
+        })
+}
+
 function Test-TunAdapter {
-    if (-not (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue)) {
+    $tun = Get-TunAdapters
+    if ($null -eq $tun) {
         Say '网卡：当前环境缺少 NetAdapter 模块，跳过 TUN 检测。' 'Yellow'
         return $false
     }
-    $tun = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-            $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'TAP|TUN|Wintun|WireGuard|Tailscale|Clash|Mihomo'
-        })
     if ($tun.Count -gt 0) {
         Say '警告：检测到可能处于 TUN 模式的网卡，流量可能被它接管（--noproxy 绕不过 TUN）：' 'Red'
         foreach ($t in $tun) { Say "  - $($t.Name) / $($t.InterfaceDescription)" 'Red' }
@@ -250,7 +306,320 @@ function Test-TunAdapter {
     return $false
 }
 
+function Invoke-Doctor {
+    # 只读自检：不写 hosts、不需要管理员；联网项只打 Cloudflare 公共端点。
+    $checks = [System.Collections.Generic.List[object]]::new()
+    $add = {
+        param([string]$Group, [string]$Name, [string]$Status, [string]$Detail)
+        $checks.Add((New-DoctorCheck -Group $Group -Name $Name -Status $Status -Detail $Detail))
+    }
+
+    # ---- 环境 ----
+    $bits = if ([Environment]::Is64BitProcess) { '64 位' } else { '32 位' }
+    & $add '环境' 'PowerShell' 'OK' ("{0}（{1}）" -f $PSVersionTable.PSVersion, $bits)
+
+    $curlExe = $null
+    try {
+        $curlExe = Get-CurlExe
+        $verLine = @(& $curlExe --version 2>$null | Select-Object -First 1)
+        & $add '环境' 'curl.exe' 'OK' ("{0}；{1}" -f $curlExe, ($verLine -join ' '))
+    } catch {
+        & $add '环境' 'curl.exe' 'FAIL' $_.Exception.Message
+    }
+
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    & $add '环境' '管理员权限' 'OK' $(if ($isAdmin) {
+            '当前是管理员；正式写入 hosts 可用。'
+        } else {
+            '当前不是管理员；-Doctor/-DryRun/-Plan 不需要，正式写入 hosts 时才需要。'
+        })
+
+    # ---- hosts ----
+    $doctorHostsPath = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
+    $hostsInfo = Get-HostsDoctorInfo -HostsPath $doctorHostsPath
+    if ($hostsInfo.Error) {
+        & $add 'hosts' '文件与结构' 'FAIL' $hostsInfo.Error
+    } elseif ($hostsInfo.Conflicts.Count -gt 0) {
+        $detail = ($hostsInfo.Conflicts | ForEach-Object {
+                "第 $($_.Line) 行 [$($_.Reason)]：$($_.Hosts)"
+            }) -join '；'
+        & $add 'hosts' '区块外冲突' 'FAIL' "正式运行会因此中止且不改写：$detail"
+    } else {
+        $blockText = if ($hostsInfo.HasBlock) { "有（受管域名 $($hostsInfo.ManagedCount) 个）" } else { '无（下次运行会新建）' }
+        & $add 'hosts' '文件与结构' 'OK' ("{0}；编码 {1}；托管区块：{2}" -f $doctorHostsPath, $hostsInfo.Encoding, $blockText)
+    }
+
+    # ---- 域名 ----
+    $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
+    $domainList = @()
+    if ($Domains) {
+        $bad = @($Domains | Where-Object { -not (ConvertTo-NormalizedDomain -Value $_ -Strict) })
+        if ($bad.Count -gt 0) {
+            & $add '域名' '域名列表' 'FAIL' "非法项：$($bad -join ', ')"
+        } else {
+            $domainList = @($Domains | ForEach-Object { ConvertTo-NormalizedDomain -Value $_ -Strict })
+            & $add '域名' '域名列表' 'OK' "来自 -Domains，共 $($domainList.Count) 个"
+        }
+    } elseif (-not (Test-Path -LiteralPath $domainsFileResolved)) {
+        & $add '域名' 'domains.txt' 'SKIP' "不存在：$domainsFileResolved（可以用 domains.example.txt 或 Import-Domains.ps1 生成）"
+    } else {
+        try {
+            $res = Read-DomainsFile -Path $domainsFileResolved
+            if ($res.Invalid.Count -gt 0) {
+                & $add '域名' 'domains.txt' 'FAIL' "非法项：$($res.Invalid -join ', ')"
+            } elseif (@($res.Domains).Count -eq 0) {
+                & $add '域名' 'domains.txt' 'WARN' "文件里没有域名：$domainsFileResolved"
+            } else {
+                $domainList = @($res.Domains)
+                & $add '域名' 'domains.txt' 'OK' ("{0} 个域名（{1}）" -f $domainList.Count, $domainsFileResolved)
+            }
+        } catch {
+            & $add '域名' 'domains.txt' 'FAIL' $_.Exception.Message
+        }
+    }
+
+    # ---- CFST ----
+    $cfst = Get-CfstDoctorInfo -CfstPath $CfstPath -Root $Root -BuiltinRanges (Get-CfRanges)
+    if ($cfst.Error) {
+        & $add 'CFST' 'cfst.exe' 'FAIL' $cfst.Error
+    } elseif (-not $cfst.Found) {
+        & $add 'CFST' 'cfst.exe' 'SKIP' '未找到（会自动回退到内置扫描）；想要更好的覆盖可放到 cfst\cfst.exe'
+    } else {
+        $ver = if ($cfst.Version) { "v$($cfst.Version)" } else { '版本未知' }
+        & $add 'CFST' 'cfst.exe' 'OK' "$ver；$($cfst.Path)"
+        if (-not (Test-Path -LiteralPath $cfst.IpFile)) {
+            & $add 'CFST' 'ip.txt' 'WARN' "缺少：$($cfst.IpFile)（CFST 会运行失败，自动回退内置扫描）"
+        } else {
+            $ipDetail = "$($cfst.CidrCount) 个网段"
+            if ($cfst.ExtraInIpFile -gt 0) {
+                $ipDetail += "；$($cfst.ExtraInIpFile) 个 /24 不在内置列表（$($cfst.ExtraExamples -join ', ') 等），会被过滤，除非 -ExperimentalRanges"
+            }
+            if ($cfst.MissingFromIpFile -gt 0) {
+                $ipDetail += "；$($cfst.MissingFromIpFile) 个内置 /24 不在 ip.txt（$($cfst.MissingExamples -join ', ') 等），只有内置扫描覆盖"
+            }
+            & $add 'CFST' 'ip.txt' 'OK' $ipDetail
+        }
+    }
+
+    # ---- 端点 ----
+    if ($curlExe) {
+        $probeArgs = @{ CurlExe = $curlExe; AllowFallback = $true }
+        if ($ProbeUrl) { $probeArgs['PrimaryUrl'] = $ProbeUrl }
+        $probe = Resolve-ProbeEndpoint @probeArgs
+        if (-not $probe.Ok) {
+            & $add '端点' '探测端点' 'FAIL' "$($probe.Url)：$($probe.Detail)。正式运行会中止（退出码 3）。"
+        } elseif ($probe.UsedFallback) {
+            & $add '端点' '探测端点' 'WARN' $probe.Detail
+        } else {
+            & $add '端点' '探测端点' 'OK' "$($probe.Url)（$($probe.Detail)）"
+        }
+
+        $speed = Test-SpeedEndpoint -CurlExe $curlExe -UrlTemplate $SpeedTestUrl
+        $speedHost = (Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl).Host
+        if (-not $speed.Ok) {
+            & $add '端点' '测速端点' 'FAIL' "$speedHost：$($speed.Detail)。可以用 -SpeedTestUrl 换一个地址。"
+        } elseif ($speed.Skipped) {
+            & $add '端点' '测速端点' 'WARN' "$speedHost：$($speed.Detail)"
+        } else {
+            & $add '端点' '测速端点' 'OK' "$speedHost：$($speed.Detail)"
+        }
+    } else {
+        & $add '端点' '探测/测速端点' 'SKIP' '缺少 curl.exe，无法检查'
+    }
+
+    # ---- 网络 ----
+    $proxy = Get-ProxyState
+    if (-not $proxy.Enabled) {
+        & $add '网络' 'WinINET 代理' 'OK' '未启用系统代理（这不排除 PAC/TUN/应用级代理）'
+    } else {
+        $proxyStatus = 'OK'
+        $proxyDetail = "已开启 -> $($proxy.Server)"
+        if ($domainList.Count -gt 0) {
+            $notBypassed = @($domainList | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $proxy.Bypass) })
+            if ($notBypassed.Count -eq 0) {
+                $proxyDetail += '；目标域名都在 ProxyOverride 中'
+            } else {
+                $proxyStatus = 'WARN'
+                $proxyDetail += "；$($notBypassed.Count) 个域名不在 ProxyOverride：$($notBypassed -join ', ')"
+            }
+        }
+        & $add '网络' 'WinINET 代理' $proxyStatus $proxyDetail
+    }
+
+    $tun = Get-TunAdapters
+    if ($null -eq $tun) {
+        & $add '网络' 'TUN 网卡' 'SKIP' '缺少 NetAdapter 模块，无法检测'
+    } elseif ($tun.Count -gt 0) {
+        $names = ($tun | ForEach-Object { "$($_.Name)/$($_.InterfaceDescription)" }) -join '；'
+        & $add '网络' 'TUN 网卡' 'WARN' "$names。正式运行会中止，除非 -Force。"
+    } else {
+        & $add '网络' 'TUN 网卡' 'OK' '未发现已知 TUN 虚拟网卡（不排除 WFP/透明代理）'
+    }
+
+    # ---- 存储 ----
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    $backupDir = if ($programData) { Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup' } else { Join-Path $Root 'backup' }
+    $bk = Get-BackupDoctorInfo -BackupDir $backupDir -TestWritable:$isAdmin
+    if (-not $bk.Exists) {
+        & $add '存储' '备份目录' 'WARN' "尚未创建：$backupDir（第一次正式运行会创建）"
+    } elseif ($isAdmin -and $bk.Writable -eq $false) {
+        & $add '存储' '备份目录' 'WARN' "不可写：$backupDir（正式运行会回退到 $Root\backup）"
+    } else {
+        $newest = if ($bk.Newest) { $bk.Newest } else { '暂无备份' }
+        $note = if (-not $isAdmin) { '；非管理员，未测试写入' } else { '' }
+        & $add '存储' '备份目录' 'OK' ("{0}；{1} 个备份，最近 {2}{3}" -f $backupDir, $bk.Count, $newest, $note)
+    }
+
+    $cacheFile = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    if (-not (Test-Path -LiteralPath $cacheFile)) {
+        & $add '存储' '机房缓存' 'SKIP' "尚未生成：$cacheFile（首次运行会全量探测）"
+    } else {
+        $cached = Read-ColoCache -Path $cacheFile -MaxAgeDays $ColoCacheMaxAgeDays
+        if ($cached) {
+            & $add '存储' '机房缓存' 'OK' ("{0} 个区域（{1}）：{2}" -f $cached.Colos.Count,
+                $cached.UpdatedAt.ToLocalTime().ToString('yyyy-MM-dd'), ($cached.Colos -join '/'))
+        } else {
+            & $add '存储' '机房缓存' 'WARN' '已过期或无法读取，下次运行会全量探测（只影响耗时，不影响结果）'
+        }
+    }
+
+    # ---- 计划任务 ----
+    $taskInfo = Get-ScheduledTaskDoctorInfo
+    if (-not $taskInfo.Available) {
+        & $add '计划' '计划任务' 'SKIP' '缺少 ScheduledTasks 模块，无法查询'
+    } elseif (@($taskInfo.Tasks).Count -eq 0) {
+        & $add '计划' '计划任务' 'SKIP' '未注册（可选：-InstallTask -TaskMode DryRun）'
+    } else {
+        foreach ($t in @($taskInfo.Tasks)) {
+            $status = 'OK'
+            $detail = "状态 $($t.State)"
+            if ($t.NextRun) { $detail += "，下次 $($t.NextRun)" }
+            if ($t.LastRun) { $detail += "，上次 $($t.LastRun)（结果 $($t.LastResult)）" }
+            if ($t.State -eq 'Disabled') { $status = 'WARN'; $detail += '；任务已禁用' }
+            if ($t.ScriptExists -eq $false) {
+                $status = 'WARN'
+                $detail += "；任务指向的脚本不存在：$($t.ScriptPath)（移动过目录后需要重新注册）"
+            }
+            # 267011 = SCHED_S_TASK_HAS_NOT_RUN，刚注册还没跑过的任务不该报警
+            if ($t.LastResult -ne $null -and $t.LastResult -ne 0 -and $t.LastResult -ne 267011 -and $t.LastRun) {
+                $status = 'WARN'
+                $detail += "；上次运行返回 $($t.LastResult)"
+            }
+            & $add '计划' $t.TaskName $status $detail
+        }
+    }
+
+    # ---- 解析核对（只在 -CheckResolved 时做，只查 DNS） ----
+    if ($CheckResolved -and $domainList.Count -gt 0) {
+        foreach ($d in $domainList) {
+            try {
+                $addrs = @([System.Net.Dns]::GetHostAddresses($d) | ForEach-Object { $_.IPAddressToString })
+                $v4 = @($addrs | Where-Object { $_ -notmatch ':' })
+                $v6 = @($addrs | Where-Object { $_ -match ':' })
+                $st = if ($v4.Count -gt 0) { 'OK' } else { 'WARN' }
+                $detail = "A $($v4.Count) 个$(if ($v4.Count -gt 0) { "（$($v4[0])）" })；AAAA $($v6.Count) 个"
+                & $add '域名解析' $d $st $detail
+            } catch {
+                & $add '域名解析' $d 'WARN' '解析失败'
+            }
+        }
+    }
+
+    Say ''
+    Say '==== Cloudflare-Hosts-Optimizer Doctor ====' 'Cyan'
+    foreach ($line in (Format-DoctorReport -Checks $checks)) {
+        $color = if ($line.StartsWith('[FAIL]')) { 'Red' }
+                 elseif ($line.StartsWith('[WARN]')) { 'Yellow' }
+                 elseif ($line.StartsWith('[ OK ]')) { 'Green' }
+                 elseif ($line.StartsWith('== ')) { 'Cyan' }
+                 else { 'Gray' }
+        Say $line $color
+    }
+    return (Get-DoctorExitCode -Checks $checks)
+}
+
+function Invoke-TaskInstall {
+    if ($TaskMode -eq 'AutoApply') { Assert-Admin }
+    if ($script:ScriptBoundParameters.ContainsKey('Domains')) {
+        Fail '-InstallTask 不支持 -Domains：域名数组没法安全写进任务命令行，也会把站点清单暴露在任务参数里。请用 domains.txt 或 -DomainsFile。' 2
+    }
+    $df = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
+    if (-not (Test-Path -LiteralPath $df)) { Fail "找不到域名文件：$df。计划任务每次运行都要用它。" 2 }
+    $res = Read-DomainsFile -Path $df
+    if ($res.Invalid.Count -gt 0) { Fail "域名文件含非法项：$($res.Invalid -join ', ')" 2 }
+    if (@($res.Domains).Count -eq 0) { Fail "域名文件里没有域名：$df" 2 }
+
+    $extra = @{}
+    foreach ($k in $script:TaskPassThroughParams) {
+        if ($script:ScriptBoundParameters.ContainsKey($k)) { $extra[$k] = $script:ScriptBoundParameters[$k] }
+    }
+    if ($DomainsFile) { $extra['DomainsFile'] = $DomainsFile }
+    $report = if ($ReportPath) { $ReportPath } else { Join-Path $Root 'last-report.txt' }
+
+    try {
+        $spec = New-OptimizerTaskSpec -Root $Root -Mode $TaskMode -IntervalDays $TaskIntervalDays -At $TaskAt `
+            -ReportPath $report -TaskName $TaskName -ExtraParameters $extra
+    } catch { Fail $_.Exception.Message 2 }
+
+    try { $null = Install-OptimizerTask -Spec $spec -TaskForce:$TaskForce }
+    catch { Fail $_.Exception.Message 1 }
+
+    Say "已注册计划任务：$($spec.TaskName)" 'Green'
+    Say "  频率：每 $($spec.IntervalDays) 天，$($spec.At)（从注册后的下一个该时间开始）" 'Gray'
+    Say "  模式：$(if ($spec.Mode -eq 'DryRun') { 'DryRun —— 只写报告，不修改 hosts' } else { 'AutoApply —— 自动写入 hosts（需要管理员）' })" 'Gray'
+    Say "  程序：$($spec.Execute)" 'DarkGray'
+    Say "  报告：$($spec.ReportPath)" 'DarkGray'
+    Say "  删除：.\Cloudflare-Hosts-Optimizer.ps1 -UninstallTask -TaskName '$($spec.TaskName)'" 'DarkGray'
+    return 0
+}
+
+function Invoke-TaskUninstall {
+    $names = if ($TaskName) { @($TaskName) } else { $script:DefaultTaskNames }
+    try { $rows = @(Uninstall-OptimizerTask -TaskName $names) }
+    catch { Fail $_.Exception.Message 1 }
+
+    $failed = @()
+    foreach ($r in $rows) {
+        if ($r.Removed) {
+            Say "$($r.TaskName)：$($r.Detail)" 'Green'
+        } else {
+            Say "$($r.TaskName)：$($r.Detail)" 'Red'
+            $failed += $r
+        }
+    }
+    if ($failed.Count -gt 0) { Fail '有任务没有删除成功；AutoApply 任务需要管理员 PowerShell。' 1 }
+    return 0
+}
+
 function Invoke-Main {
+    # ---- 模式互斥 ----
+    if ($InstallTask -and $UninstallTask) { Fail '-InstallTask 和 -UninstallTask 只能选一个。' 2 }
+    if (($InstallTask -or $UninstallTask) -and ($DryRun -or $Plan -or $PlanPath -or $Rollback -or $Doctor)) {
+        Fail '-InstallTask/-UninstallTask 不能与 -DryRun/-Plan/-Rollback/-Doctor 同时使用；要注册只读任务请用 -TaskMode DryRun。' 2
+    }
+    if (-not $InstallTask) {
+        foreach ($p in @('TaskIntervalDays', 'TaskAt', 'TaskMode', 'TaskForce')) {
+            if ($script:ScriptBoundParameters.ContainsKey($p)) {
+                Fail "-$p 只能与 -InstallTask 一起使用（-UninstallTask 可以用 -TaskName）。" 2
+            }
+        }
+    }
+    if (-not $InstallTask -and -not $UninstallTask -and $script:ScriptBoundParameters.ContainsKey('TaskName')) {
+        Fail '-TaskName 只能与 -InstallTask/-UninstallTask 一起使用。' 2
+    }
+    if ($Doctor) {
+        if ($Rollback -or $Plan -or $PlanPath) {
+            Fail '-Doctor 不能与 -Rollback/-Plan 同时使用。' 2
+        }
+        $script:ExitCode = Invoke-Doctor
+        return 0
+    }
+
+    # ---- 计划任务 ----
+    if ($InstallTask) { return (Invoke-TaskInstall) }
+    if ($UninstallTask) { return (Invoke-TaskUninstall) }
+
     $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
@@ -291,6 +660,10 @@ function Invoke-Main {
 
     # 测速地址是参数错误，尽早失败，不要扫完几分钟才发现。
     try { $null = Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl } catch { Fail $_.Exception.Message 2 }
+    # -ProbeUrl 是参数错误也尽早失败，不要等扫描前的预检才抛异常
+    if ($ProbeUrl) {
+        try { $null = Split-ProbeUrl -Url $ProbeUrl } catch { Fail $_.Exception.Message 2 }
+    }
 
     if (-not $DryRun -and -not $planMode) { Assert-AdminForPath $hostsPathResolved }
     $curlExe = Get-CurlExe
@@ -330,6 +703,28 @@ function Invoke-Main {
         Fail $_.Exception.Message 4
     }
 
+    # ---- 端点预检 ----
+    # 先确认 trace / 测速端点活着，否则要扫几分钟才发现测不到速度。
+    $probeArgs = @{ CurlExe = $curlExe; AllowFallback = (-not $script:ProbeUrlExplicit) }
+    if ($ProbeUrl) { $probeArgs['PrimaryUrl'] = $ProbeUrl }
+    $probe = Resolve-ProbeEndpoint @probeArgs
+    if ($probe.UsedFallback) { Say "警告：$($probe.Detail)" 'Yellow' }
+    if (-not $probe.Ok) {
+        Fail ("探测端点不可用：$($probe.Url)（$($probe.Detail)）。请检查网络；也可以用 -ProbeUrl 换一个 Cloudflare 托管的 trace 地址。") 3
+    }
+    Say "探测端点：$($probe.Host)" 'DarkGray'
+
+    $speedCheck = Test-SpeedEndpoint -CurlExe $curlExe -UrlTemplate $SpeedTestUrl
+    $speedHost = (Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl).Host
+    if (-not $speedCheck.Ok) {
+        Fail ("测速端点不可用：$speedHost（$($speedCheck.Detail)）。可以换 -SpeedTestUrl，或检查网络/代理。") 3
+    }
+    if ($speedCheck.Skipped) {
+        Say "测速端点：$speedHost（$($speedCheck.Detail)）" 'Yellow'
+    } else {
+        Say "测速端点：$speedHost，$($speedCheck.Detail)" 'DarkGray'
+    }
+
     # ---- 延迟筛选 ----
     $ranges = Get-CfRanges -Experimental:$ExperimentalRanges
     $latency = @()
@@ -348,7 +743,7 @@ function Invoke-Main {
     if ($latency.Count -eq 0) {
         if ($NoCfst) { Say '已指定 -NoCfst，使用内置扫描。' 'Yellow' }
         elseif (-not $cfst) { Say '未找到 cfst.exe，使用内置扫描。' 'Yellow' }
-        $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples -Ranges $ranges)
+        $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples -Ranges $ranges -ProbeUrl $probe.Url)
     }
     if ($latency.Count -eq 0) { Fail '没有扫到任何可用 IP。请检查网络后重试。' 3 }
 
@@ -383,7 +778,7 @@ function Invoke-Main {
     Say "探测候选落地区域（$($pool.Count) 个，可能需要几分钟，每 32 个打印一次进度）..." 'Cyan'
     try {
         $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool -EarlyStopColos $cachedColos `
-                -EarlyStopMinProbe ([int][math]::Max(64, $ThroughputCandidates * 2)) -OnProgress {
+                -EarlyStopMinProbe ([int][math]::Max(64, $ThroughputCandidates * 2)) -ProbeUrl $probe.Url -OnProgress {
                 param($Done, $Total, $ElapsedSec)
                 $pct = if ($Total -gt 0) { [int](100 * $Done / $Total) } else { 100 }
                 Write-Progress -Activity '探测候选落地区域' -Status "$Done/$Total" -PercentComplete $pct
@@ -778,7 +1173,7 @@ function Invoke-Main {
 # 入口
 # ---------------------------------------------------------------------------
 $script:ReportPathResolved = $ReportPath
-if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not $PlanPath -and -not $Version -and -not $Rollback) {
+if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not $PlanPath -and -not $Version -and -not $Rollback -and -not $Doctor -and -not $InstallTask -and -not $UninstallTask) {
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
 

@@ -17,6 +17,10 @@ $script:CfOfficialRanges = @(
 # 非官方列表、但实测有 CF 响应的网段；仅在 -ExperimentalRanges 时启用
 $script:CfExperimentalRanges = @('104.28.0.0/14')
 
+# 延迟扫描和机房探测都用这个地址的 colo= 判断落地区域；
+# 换主机必须仍是 Cloudflare 托管的站点（--resolve 会把任意 CF 边缘 IP 指到这个名字）。
+$script:DefaultProbeUrl = 'https://speed.cloudflare.com/cdn-cgi/trace'
+
 # curl -w 字段的唯一定义：格式串由它生成，解析器按名字取索引，
 # 增删字段时两边不会再各改一处、静默错位。
 $script:CurlWriteFields = @(
@@ -319,7 +323,8 @@ function Invoke-BuiltinLatencyScan {
         [Parameter(Mandatory)][string]$CurlExe,
         [Parameter(Mandatory)][int]$Candidates,
         [Parameter(Mandatory)][int]$Samples,
-        [Parameter(Mandatory)][string[]]$Ranges
+        [Parameter(Mandatory)][string[]]$Ranges,
+        [string]$ProbeUrl = $script:DefaultProbeUrl
     )
 
     # 从允许网段里随机抽样
@@ -347,16 +352,20 @@ function Invoke-BuiltinLatencyScan {
     }
 
     Write-Host "内置延迟扫描：$($ips.Count) 个候选 IP，每个 $Samples 次探测 ..." -ForegroundColor Cyan
+    $probeUrl = $ProbeUrl
+    $probeHost = ([uri]$ProbeUrl).Host
     $probe = $ips | ForEach-Object -Parallel {
         $ip = $_
         $curlPath = $using:CurlExe
         $sampleCount = $using:Samples
+        $traceUrl = $using:probeUrl
+        $traceHost = $using:probeHost
         $ok = 0; $ttf = @(); $colo = ''
         for ($i = 0; $i -lt $sampleCount; $i++) {
             $fmt = '|@@|%{time_connect}|%{time_appconnect}|%{time_starttransfer}'
             $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
-                --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
-                -w $fmt 'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
+                --max-time 6 --resolve "${traceHost}:443:$ip" `
+                -w $fmt $traceUrl 2>$null
             $exit = $LASTEXITCODE
             $s = ($raw -join "`n")
             if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
@@ -487,8 +496,11 @@ function Resolve-Colo {
         [int]$EarlyStopMinPerColo = 2,
         [int]$EarlyStopMinProbe = 64,
         # 每批探测多少个；调小便于测试
-        [ValidateRange(1, 128)][int]$ChunkSize = 32
+        [ValidateRange(1, 128)][int]$ChunkSize = 32,
+        [string]$ProbeUrl = $script:DefaultProbeUrl
     )
+    $probeUrl = $ProbeUrl
+    $probeHost = ([uri]$ProbeUrl).Host
     $list = @($Candidates)
     $total = $list.Count
     $rows = [System.Collections.Generic.List[object]]::new()
@@ -501,9 +513,11 @@ function Resolve-Colo {
         $part = $chunk | ForEach-Object -Parallel {
             $ip = $_.IP
             $curlPath = $using:CurlExe
+            $traceUrl = $using:probeUrl
+            $traceHost = $using:probeHost
             $raw = & $curlPath -q -sS --noproxy '*' --max-redirs 0 --proto '=https' `
-                --max-time 6 --resolve "speed.cloudflare.com:443:$ip" `
-                'https://speed.cloudflare.com/cdn-cgi/trace' 2>$null
+                --max-time 6 --resolve "${traceHost}:443:$ip" `
+                $traceUrl 2>$null
             $s = ($raw -join "`n")
             $colo = ''
             if ($s -match 'colo=([A-Za-z]{3})') { $colo = $matches[1].ToUpperInvariant() }
