@@ -184,6 +184,21 @@ v0.2.0 曾把 403 一律当成 WAF 放行，因此可能写入这种 IP。v0.2.1
 hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16，
 脚本会拒绝改写，以免损坏原文件。用记事本/VS Code 另存为 UTF-8 后重试。
 
+## 跑不通 / 测不出速度，怎么排查？
+
+先跑 `-Doctor`。它只读、不需要管理员、不访问目标站：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Doctor
+```
+
+它会按 `OK / WARN / FAIL / SKIP` 列出环境、hosts 结构、域名文件、CFST 与 `ip.txt`、
+探测/测速端点、代理/TUN、备份目录、机房缓存和计划任务；有 FAIL 时退出码为 1。
+最常见的两类：
+
+- **测速端点 FAIL**：换 `-SpeedTestUrl`，或检查网络；
+- **区块外冲突 FAIL**：按提示的行号手动处理 hosts 后再运行。
+
 ## 测速地址 403 怎么办？
 
 默认测速地址是 `https://speed.cloudflare.com/__down?bytes={bytes}`。
@@ -212,12 +227,20 @@ hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16
 
 ## 怎么完全卸载？
 
+先删掉可能注册过的计划任务（没注册过会显示「不存在（无需删除）」）：
+
+```powershell
+.\Cloudflare-Hosts-Optimizer.ps1 -UninstallTask
+```
+
+再回滚 hosts：
+
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
-然后删除整个目录。脚本不会安装服务、驱动或计划任务。
-备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`，机房缓存在
+然后删除整个目录。脚本本身不安装服务或驱动；只有显式运行 `-InstallTask` 才会注册
+计划任务。备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`，机房缓存在
 `%LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json`，都可以一并删除。
 
 ## 会覆盖 hosts 里的其他内容吗？

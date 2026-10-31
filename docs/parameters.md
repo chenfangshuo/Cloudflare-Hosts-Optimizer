@@ -11,6 +11,14 @@
 | `-Rollback` | | 用最近一次备份恢复 hosts（不依赖 domains.txt） |
 | `-RollbackFrom` | 最近一次 | 与 `-Rollback` 同用，恢复指定的 `hosts-*.bak`，用于退回更早状态 |
 | `-Version` | | 打印版本号并退出 |
+| `-Doctor` | | 只读自检（环境、hosts、CFST、端点、代理/TUN、备份、计划任务），有失败项退出码 1 |
+| `-InstallTask` | | 注册计划任务并退出（默认 DryRun，不需要管理员） |
+| `-UninstallTask` | | 删除计划任务并退出；不带 `-TaskName` 时删两个默认任务 |
+| `-TaskMode` | `DryRun` | 计划任务模式：`DryRun` 只写报告，`AutoApply` 自动写入 hosts（需管理员） |
+| `-TaskIntervalDays` | 14 | 计划任务间隔天数（1–30） |
+| `-TaskAt` | DryRun `10:00` / AutoApply `04:00` | 计划任务运行时间（`HH:mm`） |
+| `-TaskName` | 自动 | 自定义任务名；`-UninstallTask` 时可以只删指定的一个 |
+| `-TaskForce` | | 覆盖已存在的同名计划任务（与 `-Force` 无关） |
 | `-NoCfst` | | 不查找 cfst.exe，强制内置扫描 |
 | `-Force` | | 回滚时允许覆盖被其他程序改过的 hosts；或允许在 TUN 环境下继续 |
 | `-Prune` | | 删除不再出现在域名列表中的历史托管映射 |
@@ -31,6 +39,7 @@
 | `-DomainsFile` | `.\domains.txt` | 域名文件路径 |
 | `-CfstPath` | 自动查找 | cfst.exe 路径，可传文件或目录 |
 | `-SpeedTestUrl` | `https://speed.cloudflare.com/__down?bytes={bytes}` | 吞吐测速地址（只允许 https） |
+| `-ProbeUrl` | `https://speed.cloudflare.com/cdn-cgi/trace` | 延迟扫描和机房探测的 trace 地址；必须是 Cloudflare 托管的域名、443 端口 |
 | `-HostsPath` | 系统 hosts | 高级选项：测试/沙箱用 |
 | `-ReportPath` | 正常运行时 `.\last-report.txt` | 报告文件；DryRun 默认不写 |
 | `-ScanSamples` | 2 | 内置扫描每个 IP 的探测次数 |

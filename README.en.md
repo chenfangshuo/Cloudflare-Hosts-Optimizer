@@ -76,12 +76,31 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
+**6) Diagnose problems first**
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Doctor
+```
+
+Read-only: checks the environment, hosts structure, CFST, probe/speed endpoints, proxy/TUN,
+backups and scheduled tasks. No admin, no requests to the target sites; exit code 1 if any
+check fails.
+
+**7) Schedule it (optional)**
+
+Run a DryRun every 14 days (writes `last-report.txt` only, no hosts changes, no admin):
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode DryRun
+```
+
+Use `-TaskMode AutoApply` to apply automatically (needs admin), `-UninstallTask` to remove it.
+See [docs/scheduling.md](docs/scheduling.md).
+
 A full run takes about **8–15 minutes**. The `probing candidate colos (256)` phase takes
 several minutes by itself; it prints progress every 32 candidates, so it is not stuck.
 
-For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts; see
-[docs/scheduling.md](docs/scheduling.md) for three scheduling options, including auto-apply
-with its risks.
+For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts.
 
 ## What a run looks like
 
@@ -189,7 +208,7 @@ See [docs/faq.md](docs/faq.md) for more.
 
 | | CFST (`cfst\cfst.exe`) | Built-in (`-NoCfst` / not found) |
 | --- | --- | --- |
-| Candidate source | 25 CIDRs from `ip.txt` | random sample of `-MaxCandidates` (default 192) |
+| Candidate source | 25 CIDRs from `ip.txt`; does not cover 172.68–172.71 (the built-in list does), and includes 104.28.0.0/14 (needs `-ExperimentalRanges`) | random sample of `-MaxCandidates` (default 192) |
 | Latency measurement | TCPing | HTTPS `cdn-cgi/trace` (includes TLS) |
 | Coverage | wider | limited sample |
 | Dependency | third-party GPL-3.0 binary | PowerShell + system `curl.exe` |
@@ -213,6 +232,9 @@ for latency/loss only; its download test is not used.
 | `-Rollback` | | Restore hosts from the latest backup |
 | `-RollbackFrom` | latest | With `-Rollback`, restore a specific `hosts-*.bak` |
 | `-Prune` | | Remove managed entries no longer in the domain list |
+| `-Doctor` | | Read-only self-check (no hosts changes, no admin) |
+| `-InstallTask` | | Register a scheduled task (DryRun, every 14 days) |
+| `-UninstallTask` | | Remove scheduled tasks |
 | `-NoCfst` | | Force the built-in scanner |
 | `-TopN` | 1 | Maximum IPs written per domain |
 | `-MinImprovementPct` | 15 | Minimum percentage improvement to switch |

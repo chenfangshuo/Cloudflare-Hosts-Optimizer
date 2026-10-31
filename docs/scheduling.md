@@ -1,138 +1,126 @@
 # 定时运行
 
-CF 路由、运营商互联和 zone 白名单都会变，建议每 1–2 周重跑一次。这里给三种用法：
+CF 路由、运营商互联和 zone 白名单都会变，建议每 1–2 周重跑一次。脚本内置计划任务注册，
+不用再手写 `Register-ScheduledTask`。
 
-| 方案 | 是否改 hosts | 需要管理员 | 适合 |
+| 模式 | 是否改 hosts | 需要管理员 | 适合 |
 | --- | --- | --- | --- |
-| A：定时 DryRun | 否 | 否 | 想先看结果、人工确认 |
-| B：`-Plan` + 自己的监控 | 否 | 否 | 给面板/脚本消费 JSON |
-| C：定时自动写入 | 是 | 是 | 已经稳定跑过几次、不想每次手动 |
+| `DryRun`（默认） | 否，只写 `last-report.txt` | 否 | 想先看结果、人工确认 |
+| `AutoApply` | 是 | 是（注册和运行都需要） | 已经稳定手动跑过几次、不想每次手动 |
 
-## 先说明：下面的代码怎么运行
+## 一条命令安装
 
-下面的 `Register-*.ps1` 是**注册计划任务的一次性脚本**，不是每次都要执行的命令：
-
-1. 用记事本/VS Code 新建文件，把代码粘进去；
-2. 改掉第一行的 `$root`（脚本所在目录，必须是绝对路径）；
-3. 保存为 `Register-DryRunTask.ps1` 或 `Register-AutoApplyTask.ps1`；
-4. 打开 PowerShell，运行：
+**DryRun**（推荐，普通 PowerShell 即可）：
 
 ```powershell
-pwsh -NoProfile -File .\Register-DryRunTask.ps1
+.\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode DryRun
 ```
 
-5. 用 `Start-ScheduledTask` 立即测试一次，再去任务计划程序或报告里看结果。
-
-`domains.txt` 必须已经在 `$root` 下；计划任务不会帮你创建它。
-
-如果任务启动失败，先检查 `pwsh.exe` 路径：
+默认每 14 天运行一次，时间 10:00。想改频率和时间：
 
 ```powershell
-(Get-Command pwsh).Source
+.\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode DryRun -TaskIntervalDays 7 -TaskAt '09:30'
 ```
 
-把 `-Execute 'pwsh.exe'` 换成上面的完整路径即可（计划任务的 PATH 可能和你的终端不同）。
-
-## 方案 A：定时 DryRun（保守，推荐）
-
-保存为 `Register-DryRunTask.ps1`，用**普通 PowerShell**运行一次，不需要管理员：
+**AutoApply**（管理员 PowerShell）：
 
 ```powershell
-$root = 'C:\path\to\Cloudflare-Hosts-Optimizer'
-$report = Join-Path $root 'last-report.txt'
-
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\Cloudflare-Hosts-Optimizer.ps1`" -DryRun -ReportPath `"$report`""
-
-$trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 2 -DaysOfWeek Sunday -At 10am
-
-Register-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun' `
-  -Action $action -Trigger $trigger `
-  -Description '每两周生成一次优选计划，不修改 hosts' -Force
+.\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode AutoApply
 ```
 
-立即测试并查看结果：
+AutoApply 默认 04:00 运行。安装前会校验 `domains.txt` 存在且没有非法项——否则任务每次
+都会失败。
+
+## 查看
+
+```powershell
+Get-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer*' | Get-ScheduledTaskInfo
+```
+
+或直接跑 `.\Cloudflare-Hosts-Optimizer.ps1 -Doctor`，它会把任务状态、下次运行时间和上次
+结果列在「计划」一组里，并检查任务指向的脚本是否还存在。
+
+立即测试一次：
 
 ```powershell
 Start-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun'
 Get-Content .\last-report.txt
 ```
 
-确认报告没问题后，再用**管理员 PowerShell**手动正式写入。这个方案的缺点就是需要你手动执行最后一步。
+## 卸载
 
-## 方案 B：`-Plan` + 自己的监控
+```powershell
+.\Cloudflare-Hosts-Optimizer.ps1 -UninstallTask
+```
 
-需要给面板/脚本消费结果时，用 JSON：
+不带 `-TaskName` 时删除 DryRun 和 AutoApply 两个默认任务；只删一个就加
+`-TaskName 'Cloudflare-Hosts-Optimizer AutoApply'`。任务本来就不存在时视为成功。
+
+## 参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `-TaskMode` | `DryRun`（默认）或 `AutoApply` |
+| `-TaskIntervalDays` | 间隔天数，1–30，默认 14 |
+| `-TaskAt` | 运行时间 `HH:mm`，默认 DryRun 10:00、AutoApply 04:00 |
+| `-TaskName` | 自定义任务名；`-UninstallTask` 时只删指定的一个 |
+| `-TaskForce` | 覆盖已存在的同名任务（与全局 `-Force` 无关） |
+
+## 会被带进任务的参数
+
+注册任务时，命令行里显式给出的这些参数会一并写进任务：
+
+`-NoCfst`、`-ExperimentalRanges`、`-NoColoCache`、`-ColoCachePath`、
+`-ColoCacheMaxAgeDays`、`-TopN`、`-CandidatesPerDomain`、`-BackfillCandidates`、
+`-MaxDomainProbes`、`-VerifyTimeoutSec`、`-MinImprovementPct`、`-MinImprovementMs`、
+`-DomainsFile`、`-CfstPath`、`-SpeedTestUrl`、`-ProbeUrl`、`-ScanSamples`、
+`-MaxCandidates`、`-ThroughputCandidates`、`-ThroughputSamples`、`-ThroughputBytes`、
+`-RefineTop`、`-VerifyDelayMs`、`-CheckResolved`。
+
+`-Force`、`-DropUnreachable`、`-Prune` 永远不会写进任务；`-Domains` 也不支持（域名数组
+没法安全地放进命令行，而且会暴露站点清单）。请用 `domains.txt` 或 `-DomainsFile`。
+
+## 风险（AutoApply 务必看）
+
+- **你不在场**：任务运行时如果某个 zone 返回 1034、或选到不合适的 IP，站点可能短暂
+  打不开；工具会保留旧映射和备份，但需要你事后处理。
+- **不是持续监控**：它只是定期刷新，不能保证这期间 CF 路由不变。
+- **环境依赖**：休眠、断网、代理/TUN 开启时任务可能失败或中止（检测到 TUN 默认中止）。
+  任务已设置为允许电池运行、错过时间后补跑、超时 2 小时。
+- **账户要求**：写 hosts 需要管理员；任务以当前管理员账户 `Interactive` 运行，不用 SYSTEM。
+- **只在登录时运行**：`Interactive` 不会在你注销后执行；要注销后也跑需要保存凭据，
+  风险和复杂度都更高，不推荐。
+- **脚本目录**：AutoApply 以最高权限运行，脚本却放在普通用户可写的目录。任何能以你的
+  身份写文件的程序都能改脚本、等下次任务触发时提权。介意的话，把工具放到只有管理员
+  可写的目录。
+- **移动过目录**：任务里记的是绝对路径，移动后要重新 `-InstallTask`（先 `-UninstallTask`）；
+  `-Doctor` 会提示任务指向的脚本不存在。
+
+## 降低风险
+
+- 频率保持 2 周一次，不要每天跑；
+- 时间选凌晨或不用网的时候；
+- 固定 `-ReportPath`（默认 `last-report.txt`），隔一段时间看一眼；
+- 先手动跑 2–3 次，确认 `domains.txt` 稳定；
+- 出问题用 `-Rollback`，备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`。
+
+## 不用内置命令时
+
+需要自定义触发器（例如「只在每周日 4 点」或「空闲时」）可以直接用任务计划程序，或者
+给面板/脚本消费 JSON：
 
 ```powershell
 .\Cloudflare-Hosts-Optimizer.ps1 -Plan -PlanPath .\plan.json
 ```
 
-`plan.json` 里的 `Decisions`、`Plan`、`Warnings` 可以直接被其他程序读取。它同样不会
-修改 hosts，也不需要管理员。
+`plan.json` 里的 `Decisions`、`Plan`、`Warnings` 可以直接被其他程序读取，不写 hosts、
+不需要管理员。
 
-## 方案 C：定时自动写入 hosts（有风险）
+任务参数的最小写法：
 
-适合已经手动跑过 2–3 次、域名列表不常变、能接受“出问题时自己回滚”的人。
-它仍然逐站验证、拒绝 1034、未达改善门槛就保留旧映射，不是盲目写入；但计划任务运行时
-你不在场，所以风险要自己承担。
-
-保存为 `Register-AutoApplyTask.ps1`，用**管理员 PowerShell**运行一次：
-
-```powershell
-$root = 'C:\path\to\Cloudflare-Hosts-Optimizer'
-$report = Join-Path $root 'last-report.txt'
-
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\Cloudflare-Hosts-Optimizer.ps1`" -ReportPath `"$report`""
-
-$trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 2 -DaysOfWeek Sunday -At 4am
-
-# 以当前管理员账户运行；只在登录时执行（Interactive），不保存密码
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-  -LogonType Interactive -RunLevel Highest
-
-Register-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer AutoApply' `
-  -Action $action -Trigger $trigger -Principal $principal `
-  -Description '每两周自动优选并写入 hosts（有风险，保留报告和备份）' -Force
+```text
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\Cloudflare-Hosts-Optimizer\Cloudflare-Hosts-Optimizer.ps1" -DryRun -ReportPath "C:\path\to\Cloudflare-Hosts-Optimizer\last-report.txt"
 ```
 
-立即测试一次：
-
-```powershell
-Start-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer AutoApply'
-Get-Content .\last-report.txt
-```
-
-确认站点正常；如果某个站打不开，先回滚：
-
-```powershell
-.\Cloudflare-Hosts-Optimizer.ps1 -Rollback
-```
-
-### 风险（务必看）
-
-- **你不在场**：任务运行时如果某个 zone 返回 1034、或选到不合适的 IP，站点可能短暂
-  打不开；工具会保留旧映射/备份，但需要你事后处理。
-- **不是持续监控**：它只是每两周刷新一次，不能保证这期间 CF 路由不变。
-- **环境依赖**：笔记本休眠、断网、代理/TUN 开启时任务可能失败或中止（检测到 TUN
-  默认中止，这是有意的）。
-- **账户要求**：写 hosts 需要管理员；任务以当前管理员账户运行，**不要用 SYSTEM**。
-- **不要乱加参数**：不要加 `-Force` 或 `-DropUnreachable`，除非你清楚后果。
-- **只在登录时运行**：`Interactive` 不会在你注销后执行；如果要注销后也跑，需要保存
-  凭据，风险和复杂度都更高，不推荐。
-
-### 降低风险
-
-- 频率保持 2 周一次，不要每天跑；
-- 时间选凌晨或不用网的时候；
-- 固定 `-ReportPath`，每隔一段时间看一眼；
-- 先手动跑 2–3 次，确认 `domains.txt` 稳定；
-- 出问题用 `-Rollback`，备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`。
-
-## 不管用哪种方案
-
-- 计划任务里的路径都写绝对路径；
-- 工具的所有探测都强制直连，不需要给计划任务配代理；
-- 用 `-HostsPath` 做沙箱时，备份在独立的 `targets\<hash>` 子目录，不会和系统 hosts
-  的备份混在一起。
+路径都用绝对路径；计划任务的 PATH 可能和终端不同，`pwsh.exe` 建议写完整路径
+（`(Get-Command pwsh).Source`）。

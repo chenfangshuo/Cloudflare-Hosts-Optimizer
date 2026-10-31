@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 - 2026-10-31
+
+### Added
+
+- `-Doctor`：只读自检。检查 PowerShell/curl、当前是否管理员、hosts 结构与编码、域名文件、
+  CFST 与 `ip.txt` 的覆盖差异、探测/测速端点、代理与 TUN、备份目录、机房缓存和已注册的
+  计划任务；有失败项时退出码为 1。不写 hosts、不需要管理员，只打 Cloudflare 公共端点。
+- `-InstallTask` / `-UninstallTask`：一条命令注册/删除计划任务。默认
+  `-TaskMode DryRun`（只生成报告、不需要管理员）；`-TaskMode AutoApply` 自动写入 hosts，
+  注册和使用都需要管理员。任务显式允许电池运行、错过补跑，超时 2 小时。
+- `-ProbeUrl`：延迟扫描和机房探测使用的 `cdn-cgi/trace` 地址可替换
+  （默认仍是 `speed.cloudflare.com`）。只接受 https 域名、443 端口。
+- 启动预检：先确认探测端点和测速端点可用，失败时立即中止并给出提示，不再扫描几分钟后
+  才报「没有候选通过吞吐初测」。
+
+### Changed
+
+- 默认探测端点不可用时自动回退到 `https://cloudflare.com/cdn-cgi/trace` 并告警；
+  显式指定 `-ProbeUrl` 时不回退，避免静默换掉用户的选择。
+- 新增参数都有默认值，现有命令的行为不变。
+
+### Fixed
+
+- `-Doctor` 会把 CFST 的 `ip.txt` 与内置网段做 /24 覆盖比较，指出
+  `ip.txt` 不含 172.68–172.71（只有内置扫描覆盖）、并额外包含 104.28.0.0/14
+  （需要 `-ExperimentalRanges`）。
+
 ## 0.3.10 - 2026-10-31
 
 ### Changed

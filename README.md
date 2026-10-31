@@ -63,11 +63,30 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
+**6）跑不通先自检**
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Doctor
+```
+
+只读检查环境、hosts、CFST、探测/测速端点、代理/TUN、备份和计划任务，不需要管理员，
+也不会访问目标站点。有失败项时退出码为 1。
+
 第一次运行约 **8–15 分钟**。`探测候选落地区域（256 个）` 本身就要几分钟，现在每 32 个
 会打印一次 `已探测 x/256`，不会看起来像卡死。各阶段耗时见[运行时间](#大概要跑多久)。
 
-需要给面板/脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）；
-定时运行的三种方案（含自动写入的风险）见 [docs/scheduling.md](docs/scheduling.md)。
+需要给面板/脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）。
+
+**7）定时运行（可选）**
+
+每 14 天自动跑一次 DryRun（只写 `last-report.txt`，不改 hosts、不需要管理员）：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode DryRun
+```
+
+改成 `-TaskMode AutoApply` 会在任务里自动写入 hosts（需要管理员）；删除用 `-UninstallTask`。
+频率、时间和风险见 [docs/scheduling.md](docs/scheduling.md)。
 
 ## 准备域名
 
@@ -189,7 +208,7 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 
 | | CFST（`cfst\cfst.exe`） | 内置扫描（`-NoCfst` / 未找到） |
 | --- | --- | --- |
-| 候选覆盖 | `ip.txt` 当前 25 个网段，更广 | 随机抽 `-MaxCandidates` 个（默认 192） |
+| 候选覆盖 | `ip.txt` 当前 25 个网段；不含 172.68–172.71（内置扫描覆盖），额外包含 104.28.0.0/14（需 `-ExperimentalRanges`） | 随机抽 `-MaxCandidates` 个（默认 192） |
 | 延迟测量 | TCPing（TCP RTT） | HTTPS `cdn-cgi/trace`（含 TLS） |
 | 依赖 | 第三方 GPL-3.0 二进制 | 仅 PowerShell + 系统 `curl.exe` |
 | 速度 | 快 | 几十秒到一两分钟 |
@@ -212,6 +231,9 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 | `-RollbackFrom` | 最近一次 | 与 `-Rollback` 同用，恢复到指定的 `hosts-*.bak` |
 | `-Prune` | | 删除不再出现在域名列表中的历史托管映射 |
 | `-CheckResolved` | | 写入后解析每个域名，报告系统实际返回的地址 |
+| `-Doctor` | | 只读自检（不写 hosts、不需要管理员） |
+| `-InstallTask` | | 注册计划任务（默认 DryRun，每 14 天） |
+| `-UninstallTask` | | 删除计划任务 |
 | `-NoCfst` | | 强制内置扫描 |
 | `-TopN` | 1 | 每个域名最多写入的 IP 数 |
 | `-MinImprovementPct` | 15 | 相对基线至少改善多少百分比才切换 |
@@ -239,7 +261,8 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 - 网页变快 ≠ 下载变快：hosts 不影响 P2P 传输。
 - 写入 A 记录后，Windows 通常不再使用 DNS 的 AAAA；应用自带解析器可能不同。
 - hosts 多行不保证优先级或故障转移，所以默认只写 1 个 IP。
-- CF 路由会变，建议每 1–2 周或感觉变慢时重跑。
+- CF 路由会变，建议每 1–2 周或感觉变慢时重跑；也可以 `-InstallTask` 自动跑。
+- 跑不通、测不出速度，先跑 `-Doctor`。
 
 ## 开发与测试
 
