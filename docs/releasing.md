@@ -14,7 +14,7 @@
 解压后是一个顶层目录，不会把文件铺散：
 
 ```text
-Cloudflare-Hosts-Optimizer-0.3.9.zip
+Cloudflare-Hosts-Optimizer-0.4.0.zip
 └─ Cloudflare-Hosts-Optimizer\
      Cloudflare-Hosts-Optimizer.ps1
      Import-Domains.ps1
@@ -43,14 +43,14 @@ gh run list --limit 3
 3. 打 tag 并推送。配置了 SSH 签名（`tag.gpgsign=true`）时，`git tag -a` 会自动签名：
 
 ```powershell
-git tag -a v0.3.9 -m "v0.3.9"
-git push origin v0.3.9
+git tag -a v0.4.0 -m "v0.4.0"
+git push origin v0.4.0
 ```
 
 本地验证签名（需要 `gpg.ssh.allowedSignersFile`）：
 
 ```powershell
-git tag -v v0.3.9
+git tag -v v0.4.0
 ```
 
 4. 等 Release workflow 跑完（约 2–3 分钟）：
@@ -62,29 +62,29 @@ gh run list --workflow release.yml --limit 3
 5. 检查 Release 页面和附件：
 
 ```powershell
-gh release view v0.3.9
+gh release view v0.4.0
 ```
 
-发布说明取 `CHANGELOG.md` 中 `## 0.3.9` 这一节，并自动附加安装提示；找不到对应小节时
+发布说明取 `CHANGELOG.md` 中 `## 0.4.0` 这一节，并自动附加安装提示；找不到对应小节时
 用 GitHub 自动生成的变更列表。
 
 ## 手动发布（workflow 失败时的回退）
 
 ```powershell
-pwsh -NoProfile -File .\scripts\Package-Release.ps1 -Version 0.3.9
+pwsh -NoProfile -File .\scripts\Package-Release.ps1 -Version 0.4.0
 
-gh release create v0.3.9 `
-  .\dist\Cloudflare-Hosts-Optimizer-0.3.9.zip `
-  .\dist\Cloudflare-Hosts-Optimizer-0.3.9.zip.sha256 `
-  --title "v0.3.9" `
-  --notes-file .\release-notes-0.3.9.md
+gh release create v0.4.0 `
+  .\dist\Cloudflare-Hosts-Optimizer-0.4.0.zip `
+  .\dist\Cloudflare-Hosts-Optimizer-0.4.0.zip.sha256 `
+  --title "v0.4.0" `
+  --notes-file .\release-notes-0.4.0.md
 ```
 
-手动发布时说明文件放在仓库外（如 `release-notes-0.3.9.md`），不要提交进仓库。
+手动发布时说明文件放在仓库外（如 `release-notes-0.4.0.md`），不要提交进仓库。
 发布后下载 zip 核对 SHA256：
 
 ```powershell
-Get-FileHash .\Cloudflare-Hosts-Optimizer-0.3.9.zip -Algorithm SHA256
+Get-FileHash .\Cloudflare-Hosts-Optimizer-0.4.0.zip -Algorithm SHA256
 ```
 
 ## 注意
