@@ -23,6 +23,11 @@ run measured TTFB 1.75s → 0.69s.**
 
 ## Quick start
 
+**Prefer clicking?** Extract the release and double-click `Start.bat`. It finds PowerShell 7
+or offers to install it with winget, then shows a menu: Doctor, import/edit domains, domain
+overview, DryRun, apply, rollback, CFST download and scheduled tasks. See
+[docs/launcher.md](docs/launcher.md) (Chinese).
+
 **1) Prepare domains**
 
 Copy `domains.example.txt` to `domains.txt`; one domain per line. Prefer sites you have

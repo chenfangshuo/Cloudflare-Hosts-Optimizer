@@ -45,8 +45,33 @@ try {
         $entries = @($archive.Entries | ForEach-Object FullName)
         $outside = @($entries | Where-Object { -not $_.StartsWith($prefix) })
         if ($outside.Count -gt 0) { throw "zip 顶层结构不正确：$($outside[0])" }
-        if ($entries -notcontains "${prefix}Cloudflare-Hosts-Optimizer.ps1") {
-            throw 'zip 中缺少 Cloudflare-Hosts-Optimizer.ps1。'
+
+        $required = @(
+            'Cloudflare-Hosts-Optimizer.ps1', 'Start.bat', 'Menu.ps1', 'Install-Cfst.ps1',
+            'lib/Menu.ps1', 'lib/CfstInstaller.ps1'
+        )
+        foreach ($r in $required) {
+            if ($entries -notcontains ($prefix + $r)) { throw "zip 中缺少 $r。" }
+        }
+
+        # Start.bat 必须是纯 ASCII + CRLF，否则 cmd 可能解析失败
+        $bat = $archive.GetEntry("${prefix}Start.bat")
+        if ($bat) {
+            $sr = [IO.StreamReader]::new($bat.Open())
+            try { $batText = $sr.ReadToEnd() } finally { $sr.Dispose() }
+            if ($batText -match '[^\x00-\x7F]') { throw 'Start.bat 含非 ASCII 字符（cmd 可能乱码）。' }
+            if ($batText -notmatch "`r`n") { throw 'Start.bat 不是 CRLF 换行。' }
+        }
+
+        # 包内所有 .ps1 至少能通过语法解析
+        foreach ($e in @($archive.Entries | Where-Object { $_.FullName -like '*.ps1' })) {
+            $sr = [IO.StreamReader]::new($e.Open())
+            try { $src = $sr.ReadToEnd() } finally { $sr.Dispose() }
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput($src, $e.FullName, [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+                throw "包内脚本语法错误：$($e.FullName)：$($errs[0].Message)"
+            }
         }
     } finally {
         $archive.Dispose()

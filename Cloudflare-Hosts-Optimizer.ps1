@@ -196,7 +196,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.4.1'
+$ScriptVersion = '0.5.0'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}

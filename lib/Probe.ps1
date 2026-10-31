@@ -912,6 +912,29 @@ function Find-Cfst {
     return $null
 }
 
+# 从 `cfst.exe -h` 的输出里取版本号。纯函数，便于测试。
+function ConvertFrom-CfstHelpText {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text = '')
+    if (-not $Text) { return '' }
+    $m = [regex]::Match($Text, 'CloudflareSpeedTest\s+v?([0-9][0-9A-Za-z\.\-]*)', 'IgnoreCase')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
+# 用 -h 读取版本（-v 会顺带联网查更新）。读不到时返回空串，不影响调用方。
+function Get-CfstVersion {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Exe)
+    if (-not (Test-Path -LiteralPath $Exe)) { return '' }
+    try {
+        $out = @(& $Exe -h 2>&1 | Select-Object -First 4)
+        return ConvertFrom-CfstHelpText -Text ($out -join "`n")
+    } catch {
+        return ''
+    }
+}
+
 # 组装机器可读的 -Plan 文档。纯函数，便于测试字段和结构。
 function New-PlanDocument {
     [CmdletBinding()]

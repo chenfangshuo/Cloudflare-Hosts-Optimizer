@@ -41,13 +41,18 @@ jobs:
       - name: Parse check
         shell: pwsh
         run: |
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'Cloudflare-Hosts-Optimizer.ps1'), [ref]$null, [ref]$errors)
-          if ($errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Error ("{0} line {1}: {2}" -f $_.ErrorId, $_.Extent.StartLineNumber, $_.Message) }
-            exit 1
-          }
+          $fail = 0
+          Get-ChildItem -Path $PWD -Filter *.ps1 -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](\.git|dist)[\\/]' } |
+            ForEach-Object {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+              if ($errors.Count -gt 0) {
+                $errors | ForEach-Object { Write-Error ("{0} line {1}: {2}" -f $_.ErrorId, $_.Extent.StartLineNumber, $_.Message) }
+                $fail = 1
+              }
+            }
+          if ($fail -ne 0) { exit 1 }
 
       - name: Pester
         shell: pwsh
@@ -92,10 +97,15 @@ jobs:
 
           Download ``Cloudflare-Hosts-Optimizer-$version.zip`` and verify it against the attached
           ``.sha256``. The archive contains a top-level ``Cloudflare-Hosts-Optimizer/`` folder;
-          Windows Explorer's "Extract All" nests it under a folder named after the zip, so enter
-          the inner ``Cloudflare-Hosts-Optimizer`` folder and run
-          ``pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -DryRun``.
-          No installer; CFST is optional and not bundled.
+          Windows Explorer's "Extract All" nests it under a folder named after the zip.
+
+          Double-click ``Start.bat`` for a menu (it finds or installs PowerShell 7, and can
+          download CFST), or run
+          ``pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -DryRun``
+          from the inner folder.
+
+          CFST is optional, GPL-3.0, and not bundled; ``Install-Cfst.ps1`` downloads it from the
+          official release on request.
           "@
           $packageNote = $packageNote.Trim()
           $header = if ($section) { $section } else { "v$version" }

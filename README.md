@@ -16,6 +16,12 @@ Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 
 ## 快速开始
 
+**不想敲命令：** 下载发布包解压后双击 `Start.bat`。它会检查 PowerShell 7（没有就用
+winget 安装），然后给出菜单：Doctor、导入/编辑域名、查看域名、DryRun、写入 hosts、
+回滚、下载 CFST、定时任务。详见 [docs/launcher.md](docs/launcher.md)。
+
+下面的命令行走法是同样的功能，适合脚本化和排查。
+
 **1）[准备域名](#准备域名)**
 
 复制 `domains.example.txt` 为 `domains.txt`，每行一个域名。建议只填**确认由 Cloudflare
@@ -29,9 +35,18 @@ curl.exe -sI https://example.com | findstr /i "server:"
 
 **2）可选：放好 CFST（效果更好）**
 
-从 [CloudflareSpeedTest releases](https://github.com/XIU2/CloudflareSpeedTest/releases)
-下载后把 `cfst.exe` 和 `ip.txt` 放到脚本旁的 `cfst\` 目录（发布包里已经建好这个目录，
-里面有一份 `PUT-CFST-HERE.txt` 说明，可以直接删掉）：
+菜单里可以直接「下载 / 更新 CFST」；命令行等价于：
+
+```powershell
+.\Install-Cfst.ps1              # 直连 GitHub
+.\Install-Cfst.ps1 -UseProxy    # 走系统代理（Clash 的系统代理模式即可）
+.\Install-Cfst.ps1 -FromFile .\cfst_windows_amd64.zip   # 手动下载的 zip
+```
+
+它会从 [CloudflareSpeedTest releases](https://github.com/XIU2/CloudflareSpeedTest/releases)
+下载 `cfst.exe` 和 `ip.txt` 到脚本旁的 `cfst\` 目录（发布包已经建好这个目录）。CFST 是
+GPL-3.0 第三方软件，本工具不包含也不修改它。国内访问 GitHub 不稳时，可以在浏览器打开
+作者提供的[蓝奏云](https://xiu.lanzoub.com/b0742hkxe)下载 zip，再用 `-FromFile` 安装。
 
 ```text
 Cloudflare-Hosts-Optimizer\

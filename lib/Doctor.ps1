@@ -198,12 +198,7 @@ function Get-CfstDoctorInfo {
     if (-not $exe) { return $result }
     $result.Found = $true
     $result.Path = $exe
-
-    try {
-        $out = @(& $exe -h 2>&1 | Select-Object -First 4)
-        $m = [regex]::Match(($out -join "`n"), 'CloudflareSpeedTest\s+v?([0-9][0-9A-Za-z\.\-]*)')
-        if ($m.Success) { $result.Version = $m.Groups[1].Value }
-    } catch { }
+    $result.Version = Get-CfstVersion -Exe $exe
 
     $ipFile = Join-Path (Split-Path -Parent $exe) 'ip.txt'
     $result.IpFile = $ipFile

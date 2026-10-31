@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 - 2026-10-31
+
+### Added
+
+- 双击启动：`Start.bat` 自动查找 PowerShell 7（PATH / WindowsApps / Program Files），
+  缺失时可用 winget 安装；随后进入 `Menu.ps1`，可运行 Doctor、导入或手动编辑域名、
+  查看域名、DryRun、正式写入、回滚、下载 CFST、定时任务、查看报告。
+- `Install-Cfst.ps1`：从官方 GitHub Release 下载 `cfst.exe` + `ip.txt` 到 `cfst\`。
+  支持直连、WinINET 系统代理、本地 zip；逐项校验 zip 结构与内容；CFST 本体仍不打包
+  （GPL-3.0，仅运行时由用户下载）。
+- 菜单「查看域名」：同时显示 `domains.txt` 和 hosts 托管区块，以及只在一边的差集。
+- 菜单「手动编辑 domains.txt」：记事本编辑后自动校验条数和非法行。
+- CFST 版本的解析抽成 `lib\Probe.ps1` 的 `ConvertFrom-CfstHelpText` / `Get-CfstVersion`，
+  Doctor 复用。
+
+### Changed
+
+- 发布包新增 `Start.bat`、`Menu.ps1`、`Install-Cfst.ps1`、`lib\Menu.ps1`、
+  `lib\CfstInstaller.ps1`；`.gitattributes` 固定 `.bat` 为 CRLF。
+- 发布说明从 “No installer” 改为“解压后双击 `Start.bat`，或继续用命令行”。
+
 ## 0.4.1 - 2026-10-31
 
 ### Changed
