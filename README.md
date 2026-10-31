@@ -73,8 +73,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -
 只读检查环境、hosts、CFST、探测/测速端点、代理/TUN、备份和计划任务，不需要管理员，
 也不会访问目标站点。有失败项时退出码为 1。
 
-第一次运行约 **8–15 分钟**。`探测候选落地区域（256 个）` 本身就要几分钟，现在每 32 个
-会打印一次 `已探测 x/256`，不会看起来像卡死。各阶段耗时见[运行时间](#大概要跑多久)。
+第一次运行约 **8–15 分钟**。每个大步骤会先打印一行 `[n/6] 步骤名 · 预计时间`，过程中底部
+有一行转轮动画（例如 `| 96/256 · 45s`），步骤结束打印实际用时，不会看起来像卡死。
+各阶段耗时见[运行时间](#大概要跑多久)。
 
 需要给面板/脚本消费结果时，用 `-Plan -PlanPath .\plan.json` 输出 JSON（不写 hosts）。
 
@@ -131,33 +132,49 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -
 域名和部分数字已替换；实际输出还会多出延迟扫描和吞吐测速的表格。
 
 ```text
-==== Cloudflare 优选 IP -> hosts ====
+Cloudflare-Hosts-Optimizer 0.4.1 · 写入 hosts · 12 个域名
 hosts: C:\Windows\System32\drivers\etc\hosts
-域名数: 12
 
-代理：WinINET 系统代理已开启 -> 127.0.0.1:7890
-  注意：本工具的 curl 都带 --noproxy *，CFST 也会清空代理环境变量；探测和测速强制直连，不走这个代理。
-旁路：目标域名均在 ProxyOverride 中（仅代表 WinINET 层直连）。
-网卡：未发现已知 TUN 虚拟网卡（这不等于已证明直连）。
+[1/6] 检查环境与端点  ·  约 5 秒
+代理：已开启（WinINET 127.0.0.1:7890）
+浏览器等 WinINET 程序走它；本工具的探测和测速带 --noproxy，不走它。
+TUN / WFP / PAC 这类透明转发不受 --noproxy 影响，见下面的网卡检查。
+旁路：目标域名都在 ProxyOverride 中
+浏览器开着代理时也会直连，hosts 映射可以生效。
+网卡：未发现已知 TUN 虚拟网卡
+只说明没有已知 TUN，不排除 WFP / 透明代理。
+探测端点：speed.cloudflare.com
+延迟扫描和机房判断用的 trace 地址。
+测速端点：speed.cloudflare.com，HTTP 200，65536 字节
+只确认端点可用，不参与排名。
+完成 · 用时 5 秒
 
+[2/6] 延迟筛选  ·  约 1–3 分钟
 使用 CFST 做全量延迟扫描（可能需要 1–3 分钟）：...\cfst\cfst.exe
 延迟/丢包筛选后可用 IP：1631，最佳 162.159.146.94（133ms）
-探测候选落地区域（256 个，可能需要几分钟，每 32 个打印一次进度）...
-  已探测 32/256（38s）
-  已探测 64/256（79s）
+完成 · 用时 1 分 32 秒
+
+[3/6] 探测机房  ·  约 2–6 分钟
+探测候选落地区域（256 个，可能需要几分钟）...
 分层抽样 32 个（SJC x8, LAX x8, HKG x4, FRA x1, ...）
 ...
+[5/6] 逐站验证  ·  约 1–3 分钟
 逐域名验证与选择（基线 = 当前 hosts/DNS 路径）...
-  pt.example.com          切换 104.17.143.151 -> 162.159.160.5  [confirmed]
-  forum.example.org       保留 104.17.131.149  [below-threshold]
+pt.example.com          切换 104.17.143.151 -> 162.159.160.5  [复核确认]
+forum.example.org       保留 104.17.131.149  [未达阈值]
+完成 · 用时 21 秒
 
+[6/6] 写入 hosts  ·  几秒
 已写入 hosts（备份：C:\ProgramData\Cloudflare-Hosts-Optimizer\backup\hosts-20261029-120000-xxxxxxxx.bak）
+完成 · 用时 1 秒
+
+结果：更新 1 · 保留 11 · 用时 3 分 20 秒
 
 ==== 逐域名决策 ====
-Domain            BaselineIP      BaseState BaseTTFB ChosenIP        ChosenTTFB BestTTFB ImprovePct Reason           Action
-------            ----------      --------- -------- --------        ---------- -------- ---------- ------           ------
-pt.example.com    104.17.143.151  ok            1.01 162.159.160.5        0.62     0.62      39.30 confirmed       update
-forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57     0.53       7.30 below-threshold keep
+Domain            BaselineIP      BaseState BaseTTFB ChosenIP        ChosenTTFB BestTTFB ImprovePct Reason    Action
+------            ----------      --------- -------- --------        ---------- -------- ---------- ------    ------
+pt.example.com    104.17.143.151  ok            1.01 162.159.160.5        0.62     0.62      39.30 复核确认  更新
+forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57     0.53       7.30 未达阈值  保留
 ```
 
 ## 它怎么选 IP
@@ -177,7 +194,7 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 | 阶段 | 典型耗时 | 说明 |
 | --- | --- | --- |
 | CFST 延迟/丢包扫描 | 1–3 分钟 | `-NoCfst` 内置扫描通常更快但覆盖小 |
-| 探测候选落地区域（256 个） | 2–6 分钟 | 每个候选最多 6 秒、16 并发；每 32 个打印进度 |
+| 探测候选落地区域（256 个） | 2–6 分钟 | 每个候选最多 6 秒、16 并发；显示转轮动画和 x/y 进度 |
 | ↳ 14 天内有缓存时 | 约 1 分钟 | 覆盖上次的机房后提前结束；过期或区域变化时自动全量探测 |
 | 吞吐初测 + 决赛 | 1–3 分钟 | 约 70MB 下载，取决于带宽 |
 | 逐域名验证与复核 | 1–3 分钟 | 每站约 6–10 次 HEAD，间隔 400ms |
