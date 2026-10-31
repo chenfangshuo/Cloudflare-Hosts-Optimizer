@@ -1,12 +1,12 @@
-# pt-cf-optimize
+# Cloudflare-Hosts-Optimizer
 
-优选 Cloudflare 边缘 IP 并安全写入 Windows hosts，让 PT 站、论坛等 CF 站点的网页打开更快。
+优选 Cloudflare 边缘 IP 并安全写入 Windows hosts，让经 Cloudflare 代理的站点（PT 站、论坛等）网页打开更快。
 
 > 不代理、不登录、不改出口 IP；严格校验 hosts，增量更新，一键回滚。
 
 Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 
-[English](README.en.md) · [下载发布包](https://github.com/chenfangshuo/pt-cf-optimize/releases)
+[English](README.en.md) · [下载发布包](https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/releases)
 
 **为什么会有这个脚本。** 我这边访问 PT 站经常十几秒才打开。用
 [CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) 优选后手动写 hosts 确实能改善，
@@ -33,7 +33,7 @@ curl.exe -sI https://example.com | findstr /i "server:"
 下载后，把 `cfst.exe` 和 `ip.txt` 放到脚本旁的 `cfst\` 目录：
 
 ```text
-pt-cf-optimize\
+Cloudflare-Hosts-Optimizer\
   cfst\
     cfst.exe
     ip.txt
@@ -42,22 +42,25 @@ pt-cf-optimize\
 不放也能用，脚本会自动回退到内置扫描；覆盖和速度差异见
 [CFST vs 内置扫描](#cfst-vs-内置扫描)。
 
+发布包解压后就是这个结构。Windows 的「全部解压缩」会先建一个以压缩包命名的目录，
+里面才是 `Cloudflare-Hosts-Optimizer\`；进入内层目录运行脚本即可。
+
 **3）先看结果**（不需要管理员，不修改 hosts）
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -DryRun
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -DryRun
 ```
 
 **4）正式写入**（管理员 PowerShell）
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1
 ```
 
 **5）出问题一键回滚**
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
 第一次运行约 **8–15 分钟**。`探测候选落地区域（256 个）` 本身就要几分钟，现在每 32 个
@@ -128,7 +131,7 @@ hosts: C:\Windows\System32\drivers\etc\hosts
   pt.example.com          切换 104.17.143.151 -> 162.159.160.5  [confirmed]
   forum.example.org       保留 104.17.131.149  [below-threshold]
 
-已写入 hosts（备份：C:\ProgramData\pt-cf-optimize\backup\hosts-20261029-120000-xxxxxxxx.bak）
+已写入 hosts（备份：C:\ProgramData\Cloudflare-Hosts-Optimizer\backup\hosts-20261029-120000-xxxxxxxx.bak）
 
 ==== 逐域名决策 ====
 Domain            BaselineIP      BaseState BaseTTFB ChosenIP        ChosenTTFB BestTTFB ImprovePct Reason           Action
@@ -162,8 +165,8 @@ forum.example.org 104.17.131.149  ok            0.57 104.17.131.149       0.57  
 想缩短时间：
 
 ```powershell
-.\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
-.\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
+.\Cloudflare-Hosts-Optimizer.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
+.\Cloudflare-Hosts-Optimizer.ps1 -NoCfst -MaxCandidates 128
 ```
 
 ## 安全边界（PT 站必看）

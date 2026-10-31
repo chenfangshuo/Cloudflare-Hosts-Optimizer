@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 使用问题 / FAQ
-    url: https://github.com/chenfangshuo/pt-cf-optimize/blob/main/docs/faq.md
+    url: https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/blob/main/docs/faq.md
     about: 先看 README 和 FAQ；提问时不要贴真实站点清单或 passkey。
   - name: 安全漏洞
-    url: https://github.com/chenfangshuo/pt-cf-optimize/security/advisories/new
+    url: https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/security/advisories/new
     about: 请用私密漏洞报告，不要开公开 issue。

@@ -96,7 +96,7 @@ Describe 'Update-HostsDocument' {
         $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
         $u.Changed | Should -BeTrue
         $u.Text | Should -Match "10\.0\.0\.1`tcf\.example\.net"
-        $u.Text | Should -Match ([regex]::Escape('# [pt-cf-optimize] 203.0.113.10 cf.example.net'))
+        $u.Text | Should -Match ([regex]::Escape("$($script:LegacyTag)203.0.113.10 cf.example.net"))
         $u.Text | Should -Match '0\.0\.0\.0 ads\.example\.com'
     }
 

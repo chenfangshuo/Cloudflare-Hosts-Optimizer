@@ -27,7 +27,7 @@
 
 ## 备份
 
-- 目录：`%ProgramData%\pt-cf-optimize\backup`（不可写时回退项目目录）。
+- 目录：`%ProgramData%\Cloudflare-Hosts-Optimizer\backup`（不可写时回退项目目录）。
 - 非系统 `-HostsPath` 使用 `targets\<路径哈希>` 子目录；回滚时校验 manifest 的 `hostsPath`，
   避免沙箱备份被系统 hosts 的回滚选中。
 - 文件名含时间戳和 GUID，附带 JSON 清单（pre/post 哈希）；按文件名选最近，

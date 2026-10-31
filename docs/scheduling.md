@@ -38,15 +38,15 @@ pwsh -NoProfile -File .\Register-DryRunTask.ps1
 保存为 `Register-DryRunTask.ps1`，用**普通 PowerShell**运行一次，不需要管理员：
 
 ```powershell
-$root = 'C:\path\to\pt-cf-optimize'
+$root = 'C:\path\to\Cloudflare-Hosts-Optimizer'
 $report = Join-Path $root 'last-report.txt'
 
 $action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\pt-cf-optimize.ps1`" -DryRun -ReportPath `"$report`""
+  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\Cloudflare-Hosts-Optimizer.ps1`" -DryRun -ReportPath `"$report`""
 
 $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 2 -DaysOfWeek Sunday -At 10am
 
-Register-ScheduledTask -TaskName 'pt-cf-optimize DryRun' `
+Register-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun' `
   -Action $action -Trigger $trigger `
   -Description '每两周生成一次优选计划，不修改 hosts' -Force
 ```
@@ -54,7 +54,7 @@ Register-ScheduledTask -TaskName 'pt-cf-optimize DryRun' `
 立即测试并查看结果：
 
 ```powershell
-Start-ScheduledTask -TaskName 'pt-cf-optimize DryRun'
+Start-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun'
 Get-Content .\last-report.txt
 ```
 
@@ -65,7 +65,7 @@ Get-Content .\last-report.txt
 需要给面板/脚本消费结果时，用 JSON：
 
 ```powershell
-.\pt-cf-optimize.ps1 -Plan -PlanPath .\plan.json
+.\Cloudflare-Hosts-Optimizer.ps1 -Plan -PlanPath .\plan.json
 ```
 
 `plan.json` 里的 `Decisions`、`Plan`、`Warnings` 可以直接被其他程序读取。它同样不会
@@ -80,11 +80,11 @@ Get-Content .\last-report.txt
 保存为 `Register-AutoApplyTask.ps1`，用**管理员 PowerShell**运行一次：
 
 ```powershell
-$root = 'C:\path\to\pt-cf-optimize'
+$root = 'C:\path\to\Cloudflare-Hosts-Optimizer'
 $report = Join-Path $root 'last-report.txt'
 
 $action = New-ScheduledTaskAction -Execute 'pwsh.exe' `
-  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\pt-cf-optimize.ps1`" -ReportPath `"$report`""
+  -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\Cloudflare-Hosts-Optimizer.ps1`" -ReportPath `"$report`""
 
 $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 2 -DaysOfWeek Sunday -At 4am
 
@@ -92,7 +92,7 @@ $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 2 -DaysOfWeek Sunday 
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
   -LogonType Interactive -RunLevel Highest
 
-Register-ScheduledTask -TaskName 'pt-cf-optimize AutoApply' `
+Register-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer AutoApply' `
   -Action $action -Trigger $trigger -Principal $principal `
   -Description '每两周自动优选并写入 hosts（有风险，保留报告和备份）' -Force
 ```
@@ -100,14 +100,14 @@ Register-ScheduledTask -TaskName 'pt-cf-optimize AutoApply' `
 立即测试一次：
 
 ```powershell
-Start-ScheduledTask -TaskName 'pt-cf-optimize AutoApply'
+Start-ScheduledTask -TaskName 'Cloudflare-Hosts-Optimizer AutoApply'
 Get-Content .\last-report.txt
 ```
 
 确认站点正常；如果某个站打不开，先回滚：
 
 ```powershell
-.\pt-cf-optimize.ps1 -Rollback
+.\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
 ### 风险（务必看）
@@ -128,7 +128,7 @@ Get-Content .\last-report.txt
 - 时间选凌晨或不用网的时候；
 - 固定 `-ReportPath`，每隔一段时间看一眼；
 - 先手动跑 2–3 次，确认 `domains.txt` 稳定；
-- 出问题用 `-Rollback`，备份在 `%ProgramData%\pt-cf-optimize\backup`。
+- 出问题用 `-Rollback`，备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`。
 
 ## 不管用哪种方案
 

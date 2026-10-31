@@ -192,7 +192,7 @@ tracker 专用子域名也不建议写进列表（见 [FAQ](faq.md#要不要把-
 
 - 只用一对标记界定管理范围。
 - 标记结构必须合法：0 对或恰好 1 对，BEGIN 在 END 之前；否则中止。
-- 受管域名的旧条目改成 `# [pt-cf-optimize] <原内容>`，不删除。
+- 受管域名的旧条目改成 `# [Cloudflare-Hosts-Optimizer] <原内容>`，不删除。
 - 多别名行、IPv6 映射、其他工具的托管区块（例如 `# S302 BEGIN/END`）→ 中止。
 - 编码只支持 ASCII / UTF-8（含 BOM）；UTF-16、GBK 等 → 中止。
 - 增量合并，重复运行幂等。
@@ -200,9 +200,9 @@ tracker 专用子域名也不建议写进列表（见 [FAQ](faq.md#要不要把-
 
 ## 事务与回滚
 
-- 全局互斥锁 `Global\pt-cf-optimize`。
+- 全局互斥锁 `Global\Cloudflare-Hosts-Optimizer`。
 - 提交前重新读取 hosts，哈希与开始时不一致 → 中止。
-- 备份目录：`%ProgramData%\pt-cf-optimize\backup`（不可写时回退项目目录）。
+- 备份目录：`%ProgramData%\Cloudflare-Hosts-Optimizer\backup`（不可写时回退项目目录）。
   非系统 `-HostsPath` 使用 `targets\<路径哈希>` 子目录；回滚时还会校验 manifest 的
   `hostsPath`，避免沙箱备份被系统 hosts 的回滚选中。
 - 备份名：`hosts-<yyyyMMdd-HHmmss>-<8位GUID>.bak`，附 JSON 清单（pre/post 哈希）。

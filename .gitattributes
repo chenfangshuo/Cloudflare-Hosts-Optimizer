@@ -3,3 +3,12 @@
 *.md text eol=lf
 *.yml text eol=lf
 *.txt text eol=lf
+
+# git archive（发布包）不带开发文件；GitHub 自动生成的 Source code 包同样受影响
+/.github export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/tests export-ignore
+/scripts export-ignore
+/CONTRIBUTING.md export-ignore
+/docs/releasing.md export-ignore

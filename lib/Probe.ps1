@@ -266,7 +266,7 @@ function Invoke-CfstLatencyScan {
         return @()
     }
 
-    $temp = Join-Path ([IO.Path]::GetTempPath()) ('pt-cf-optimize-' + [guid]::NewGuid().ToString('N'))
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ('Cloudflare-Hosts-Optimizer-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
     $csv = Join-Path $temp 'result.csv'
 
@@ -385,7 +385,7 @@ function Get-ColoCacheDefaultPath {
     param([string]$Root)
     # 缓存是运行产物，优先放在用户本地目录，避免脚本目录只读或位于同步盘
     $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-    if ($local) { return (Join-Path $local 'pt-cf-optimize\colo-cache.json') }
+    if ($local) { return (Join-Path $local 'Cloudflare-Hosts-Optimizer\colo-cache.json') }
     $fallback = if ($Root) { $Root } else { $PSScriptRoot }
     return (Join-Path $fallback 'colo-cache.json')
 }

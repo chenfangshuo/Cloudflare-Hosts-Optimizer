@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    从本地来源提取域名候选，供 pt-cf-optimize.ps1 使用。
+    从本地来源提取域名候选，供 Cloudflare-Hosts-Optimizer.ps1 使用。
 
 .DESCRIPTION
     支持四种来源：

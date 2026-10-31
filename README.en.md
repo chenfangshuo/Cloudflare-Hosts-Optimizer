@@ -1,14 +1,14 @@
-# pt-cf-optimize
+# Cloudflare-Hosts-Optimizer
 
 Pick the fastest Cloudflare edge IPs and safely write them into the Windows hosts file,
-so Cloudflare-proxied sites such as PT forums load faster.
+so any Cloudflare-proxied site (PT forums, etc.) loads faster.
 
 > No proxy, no login, no egress IP change. Strict hosts validation, incremental updates,
 > one-click rollback.
 
 Windows 10/11 · PowerShell 7+ · built-in `curl.exe` · CFST optional
 
-[中文说明](README.md) · [Releases](https://github.com/chenfangshuo/pt-cf-optimize/releases)
+[中文说明](README.md) · [Releases](https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/releases)
 
 > Detailed docs under `docs/` are currently in Chinese; commands and option names are
 > language-neutral.
@@ -46,7 +46,7 @@ Download [CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest/relea
 `cfst.exe` and `ip.txt` into a `cfst\` folder next to the script:
 
 ```text
-pt-cf-optimize\
+Cloudflare-Hosts-Optimizer\
   cfst\
     cfst.exe
     ip.txt
@@ -54,22 +54,26 @@ pt-cf-optimize\
 
 Without it the built-in scanner is used automatically.
 
+The release archive extracts to exactly this layout. Windows Explorer's "Extract All" first
+creates a folder named after the zip, with `Cloudflare-Hosts-Optimizer\` inside it; run the
+script from the inner folder.
+
 **3) Dry run** (no admin, no hosts changes)
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -DryRun
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -DryRun
 ```
 
 **4) Apply** (elevated PowerShell)
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1
 ```
 
 **5) Roll back**
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
 A full run takes about **8–15 minutes**. The `probing candidate colos (256)` phase takes
@@ -101,7 +105,7 @@ per-domain validation (baseline = current hosts/DNS path)...
   pt.example.com      switch 104.17.143.151 -> 162.159.160.5  [confirmed]
   forum.example.org   keep   104.17.131.149  [below-threshold]
 
-hosts written (backup: C:\ProgramData\pt-cf-optimize\backup\hosts-...bak)
+hosts written (backup: C:\ProgramData\Cloudflare-Hosts-Optimizer\backup\hosts-...bak)
 ```
 
 ## How it picks IPs
@@ -159,8 +163,8 @@ Do not merge an entire backup or bypass list without reviewing it.
 To shorten a run:
 
 ```powershell
-.\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
-.\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
+.\Cloudflare-Hosts-Optimizer.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
+.\Cloudflare-Hosts-Optimizer.ps1 -NoCfst -MaxCandidates 128
 ```
 
 ## Safety

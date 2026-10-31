@@ -55,7 +55,7 @@
     不使用上次的机房缓存，每次都探测全部候选（默认使用缓存，最长 14 天）。
 
 .PARAMETER ColoCachePath
-    机房缓存文件路径，默认 %LOCALAPPDATA%\pt-cf-optimize\colo-cache.json。
+    机房缓存文件路径，默认 %LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json。
 
 .PARAMETER ColoCacheMaxAgeDays
     机房缓存的有效天数（0-365，默认 14）。0 表示不使用缓存。
@@ -104,16 +104,16 @@
     报告文件路径。默认正常运行时写 .\last-report.txt；-DryRun 默认不写。
 
 .EXAMPLE
-    .\pt-cf-optimize.ps1 -DryRun
+    .\Cloudflare-Hosts-Optimizer.ps1 -DryRun
 
 .EXAMPLE
-    .\pt-cf-optimize.ps1
+    .\Cloudflare-Hosts-Optimizer.ps1
 
 .EXAMPLE
-    .\pt-cf-optimize.ps1 -Rollback
+    .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 
 .EXAMPLE
-    .\pt-cf-optimize.ps1 -Prune -TopN 1
+    .\Cloudflare-Hosts-Optimizer.ps1 -Prune -TopN 1
 #>
 [CmdletBinding()]
 param(
@@ -155,11 +155,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3.8'
+$ScriptVersion = '0.3.9'
 
 # -Version 放在加载 lib 之前，库缺失/损坏时也能用
 if ($Version) {
-    [Console]::Out.WriteLine("pt-cf-optimize $ScriptVersion")
+    [Console]::Out.WriteLine("Cloudflare-Hosts-Optimizer $ScriptVersion")
     exit 0
 }
 
@@ -766,7 +766,7 @@ function Invoke-Main {
     }
     Say 'hosts 只影响这些域名的网页/tracker；P2P 和 IPv6 对等连接不受影响。' 'DarkGray'
     Say '写入 A 记录后，Windows 通常不再使用 DNS 的 AAAA；应用自带解析器可能不同。' 'DarkGray'
-    Say '回滚：.\pt-cf-optimize.ps1 -Rollback' 'DarkGray'
+    Say '回滚：.\Cloudflare-Hosts-Optimizer.ps1 -Rollback' 'DarkGray'
     if ($script:ReportPathResolved) { Say "报告：$($script:ReportPathResolved)" 'DarkGray' }
 
     return 0

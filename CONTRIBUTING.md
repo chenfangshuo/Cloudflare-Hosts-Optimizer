@@ -25,7 +25,7 @@ Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
 改完优选/验证/hosts 逻辑后，用一个临时 hosts 跑小规模 DryRun：
 
 ```powershell
-.\pt-cf-optimize.ps1 -DryRun -HostsPath .\tmp-hosts -Domains example.com `
+.\Cloudflare-Hosts-Optimizer.ps1 -DryRun -HostsPath .\tmp-hosts -Domains example.com `
   -NoCfst -MaxCandidates 16 -ThroughputCandidates 4 -RefineTop 2 -VerifyDelayMs 100
 ```
 

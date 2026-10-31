@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.9 - 2026-10-31
+
+### Changed (breaking)
+
+- 项目更名为 **Cloudflare-Hosts-Optimizer**：仓库、主脚本（`Cloudflare-Hosts-Optimizer.ps1`）、
+  发布包、文档和所有内部标识都改了名，不保留旧名称兼容。
+- hosts 托管标记改为 `# >>> Cloudflare-Hosts-Optimizer BEGIN ... >>>` /
+  `# <<< Cloudflare-Hosts-Optimizer END <<<`；旧条目前缀改为 `# [Cloudflare-Hosts-Optimizer] `。
+- 全局互斥锁改为 `Global\Cloudflare-Hosts-Optimizer`；备份目录改为
+  `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`；机房缓存改为
+  `%LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json`。
+- **从 0.3.8 升级**：新版本不认识旧标记。把 hosts 托管区块的 BEGIN/END 两行里的
+  `pt-cf-optimize` 改成 `Cloudflare-Hosts-Optimizer`（区块里的映射不动），或者删掉整个
+  区块让新版本重建；之后只运行新版本。旧的备份目录和缓存目录可以删除。
+
+### Fixed
+
+- 发布 zip 现在带顶层 `Cloudflare-Hosts-Optimizer/` 目录，解压不再是一堆散文件；
+  `Package-Release.ps1` 会在打包后校验 zip 结构。
+
+### Changed
+
+- 发布包不再包含 `.github/`、`tests/`、`scripts/`、`CONTRIBUTING.md`、`docs/releasing.md`
+  （`.gitattributes` 的 `export-ignore`）；GitHub 自动生成的 Source code 包同样少这些文件。
+- 安装提示写清解压后要进入内层文件夹再运行。
+
 ## 0.3.8 - 2026-10-29
 
 ### Fixed

@@ -9,9 +9,9 @@
       * 备份按文件名排序，不依赖 LastWriteTime。
 #>
 
-if (-not $script:BeginMarker) { $script:BeginMarker = '# >>> pt-cf-optimize BEGIN (auto-generated; -Rollback to undo) >>>' }
-if (-not $script:EndMarker) { $script:EndMarker = '# <<< pt-cf-optimize END <<<' }
-if (-not $script:LegacyTag) { $script:LegacyTag = '# [pt-cf-optimize] ' }
+if (-not $script:BeginMarker) { $script:BeginMarker = '# >>> Cloudflare-Hosts-Optimizer BEGIN (auto-generated; -Rollback to undo) >>>' }
+if (-not $script:EndMarker) { $script:EndMarker = '# <<< Cloudflare-Hosts-Optimizer END <<<' }
+if (-not $script:LegacyTag) { $script:LegacyTag = '# [Cloudflare-Hosts-Optimizer] ' }
 
 function Read-HostsDocument {
     [CmdletBinding()]
@@ -374,7 +374,7 @@ function Get-HostsBackupDir {
     $base = $null
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
     if ($programData) {
-        $candidate = Join-Path $programData 'pt-cf-optimize\backup'
+        $candidate = Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup'
         try {
             if (-not (Test-Path -LiteralPath $candidate)) {
                 New-Item -ItemType Directory -Force -Path $candidate | Out-Null
@@ -458,11 +458,11 @@ function Write-HostsDocument {
         return [pscustomobject]@{ Changed = $false; Backup = $null }
     }
 
-    $mutex = [Threading.Mutex]::new($false, 'Global\pt-cf-optimize')
+    $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
     $acquired = $false
     try {
         try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { throw '另一个 pt-cf-optimize 实例正在运行，已中止。' }
+        if (-not $acquired) { throw '另一个 Cloudflare-Hosts-Optimizer 实例正在运行，已中止。' }
 
         # 提交前确认文件没有被其他程序改动
         $currentHash = (Get-FileHash -LiteralPath $Document.Path -Algorithm SHA256).Hash
@@ -476,7 +476,7 @@ function Write-HostsDocument {
         $bytes = $enc.GetBytes($Update.Text)
 
         $dir = Split-Path -Parent $Document.Path
-        $temp = Join-Path $dir ('.pt-cf-optimize.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer.' + [guid]::NewGuid().ToString('N') + '.tmp')
         try {
             [IO.File]::WriteAllBytes($temp, $bytes)
             # 读回校验
@@ -598,7 +598,7 @@ function Invoke-HostsRollback {
     }
 
     $dir = Split-Path -Parent $HostsPath
-    $temp = Join-Path $dir ('.pt-cf-optimize-rollback.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer-rollback.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::WriteAllBytes($temp, [IO.File]::ReadAllBytes($latest.FullName))
         [IO.File]::Replace($temp, $HostsPath, [NullString]::Value)

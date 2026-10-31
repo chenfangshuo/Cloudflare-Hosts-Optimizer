@@ -43,7 +43,7 @@
 有。用 `-Plan` 输出 JSON（不修改 hosts、不需要管理员）：
 
 ```powershell
-.\pt-cf-optimize.ps1 -Plan -PlanPath .\plan.json
+.\Cloudflare-Hosts-Optimizer.ps1 -Plan -PlanPath .\plan.json
 ```
 
 文件里包含 `Decisions`、`Plan`（最终 hosts 的完整 IP→域名映射，包含保留下来的旧条目）
@@ -213,11 +213,12 @@ hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16
 ## 怎么完全卸载？
 
 ```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\pt-cf-optimize.ps1 -Rollback
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
 ```
 
 然后删除整个目录。脚本不会安装服务、驱动或计划任务。
-备份在 `%ProgramData%\pt-cf-optimize\backup`，可一并删除。
+备份在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`，机房缓存在
+`%LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json`，都可以一并删除。
 
 ## 会覆盖 hosts 里的其他内容吗？
 

@@ -25,7 +25,7 @@
 | `-MinImprovementMs` | 30 | 切换所需的最小绝对改善（毫秒），避免噪声内切换 |
 | `-DropUnreachable` | | 旧映射连接失败时也删除（默认保留并告警） |
 | `-NoColoCache` | | 不使用上次的机房缓存，每次全量探测 |
-| `-ColoCachePath` | `%LOCALAPPDATA%\pt-cf-optimize\colo-cache.json` | 机房缓存路径 |
+| `-ColoCachePath` | `%LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json` | 机房缓存路径 |
 | `-ColoCacheMaxAgeDays` | 14 | 缓存有效天数；0 等于不使用 |
 | `-Domains` | | 直接指定域名（严格模式：拒绝 URL/端口/路径） |
 | `-DomainsFile` | `.\domains.txt` | 域名文件路径 |
@@ -45,26 +45,26 @@
 
 ```powershell
 # 只看计划，不写 hosts
-.\pt-cf-optimize.ps1 -DryRun
+.\Cloudflare-Hosts-Optimizer.ps1 -DryRun
 
 # 输出 JSON 计划（供面板/脚本消费，不写 hosts）
-.\pt-cf-optimize.ps1 -Plan -PlanPath .\plan.json
+.\Cloudflare-Hosts-Optimizer.ps1 -Plan -PlanPath .\plan.json
 
 # 缩短运行时间
-.\pt-cf-optimize.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
+.\Cloudflare-Hosts-Optimizer.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
 
 # 不用 CFST，内置扫描
-.\pt-cf-optimize.ps1 -NoCfst -MaxCandidates 128
+.\Cloudflare-Hosts-Optimizer.ps1 -NoCfst -MaxCandidates 128
 
 # 写入后核对系统实际解析结果
-.\pt-cf-optimize.ps1 -CheckResolved
+.\Cloudflare-Hosts-Optimizer.ps1 -CheckResolved
 
 # 删除已经从 domains.txt 移除的历史条目
-.\pt-cf-optimize.ps1 -Prune
+.\Cloudflare-Hosts-Optimizer.ps1 -Prune
 
 # 回到更早的备份（先看备份目录里有哪些 hosts-*.bak）
-.\pt-cf-optimize.ps1 -Rollback -RollbackFrom 'C:\ProgramData\pt-cf-optimize\backup\hosts-20261029-040000-abcd1234.bak'
+.\Cloudflare-Hosts-Optimizer.ps1 -Rollback -RollbackFrom 'C:\ProgramData\Cloudflare-Hosts-Optimizer\backup\hosts-20261029-040000-abcd1234.bak'
 
 # 强制每次全量探测机房（不使用缓存）
-.\pt-cf-optimize.ps1 -NoColoCache
+.\Cloudflare-Hosts-Optimizer.ps1 -NoColoCache
 ```

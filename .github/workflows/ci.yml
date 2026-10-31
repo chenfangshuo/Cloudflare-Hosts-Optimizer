@@ -16,7 +16,7 @@ jobs:
         run: |
           $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Join-Path $PWD 'pt-cf-optimize.ps1'), [ref]$null, [ref]$errors)
+            (Join-Path $PWD 'Cloudflare-Hosts-Optimizer.ps1'), [ref]$null, [ref]$errors)
           if ($errors.Count -gt 0) {
             $errors | ForEach-Object { Write-Error ("{0} line {1}: {2}" -f $_.ErrorId, $_.Extent.StartLineNumber, $_.Message) }
             exit 1
