@@ -465,3 +465,18 @@ Describe 'Resolve-Colo 提前结束' {
         $rows.Count | Should -Be 8
     }
 }
+
+Describe 'Get-ReasonText / Get-ActionText' {
+    It '把内部代码翻译成中文' {
+        Get-ReasonText -Reason 'below-threshold' | Should -Be '未达阈值'
+        Get-ReasonText -Reason 'confirmed' | Should -Be '复核确认'
+        Get-ReasonText -Reason 'baseline-is-best' | Should -Be '基线已最优'
+        Get-ActionText -Action 'keep-unreachable' | Should -Be '保留（未验证）'
+        Get-ActionText -Action 'release' | Should -Be '交还 DNS'
+    }
+
+    It '未知代码原样返回' {
+        Get-ReasonText -Reason 'something-new' | Should -Be 'something-new'
+        Get-ActionText -Action '' | Should -Be ''
+    }
+}

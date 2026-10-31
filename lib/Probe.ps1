@@ -38,6 +38,21 @@ function Get-CurlExe {
     return $c.Source
 }
 
+# 面向用户的状态行。主脚本里 Progress.ps1 会先擦掉动画行再写；
+# 单独加载 Probe.ps1（测试）时退回 Write-Host。
+function Write-ProbeStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [string]$Color = 'Cyan'
+    )
+    if (Get-Command Write-StatusLine -ErrorAction SilentlyContinue) {
+        Write-StatusLine -Text $Text -Color $Color
+    } else {
+        Write-Host $Text -ForegroundColor $Color
+    }
+}
+
 function Get-Median {
     [CmdletBinding()]
     param([double[]]$Values)
@@ -199,13 +214,16 @@ function Invoke-ThroughputTest {
         [Parameter(Mandatory)][int]$Bytes,
         [Parameter(Mandatory)][string]$UrlTemplate,
         [int]$ThrottleLimit = 6,
-        [int]$MaxTime = 20
+        [int]$MaxTime = 20,
+        # 显示用前缀：初测 / 决赛，只影响那一行状态文字
+        [string]$Phase = ''
     )
 
     $target = Split-SpeedTestUrl -UrlTemplate $UrlTemplate
     $targetHost = $target.Host
     $targetPort = $target.Port
-    Write-Host "吞吐测速：$($Candidates.Count) 个 IP x $Samples 次 x $([math]::Round($Bytes / 1MB, 1))MB（$targetHost）..." -ForegroundColor Cyan
+    $phaseText = if ($Phase) { "$Phase：" } else { '' }
+    Write-ProbeStatus "${phaseText}吞吐测速：$($Candidates.Count) 个 IP x $Samples 次 x $([math]::Round($Bytes / 1MB, 1))MB（$targetHost）..."
 
     $rows = $Candidates | ForEach-Object -Parallel {
         $ip = $_.IP
@@ -266,7 +284,7 @@ function Invoke-CfstLatencyScan {
     $dir = Split-Path -Parent $Exe
     $ipFile = Join-Path $dir 'ip.txt'
     if (-not (Test-Path -LiteralPath $ipFile)) {
-        Write-Host "CFST 目录下缺少 ip.txt：$dir" -ForegroundColor Yellow
+        Write-ProbeStatus "CFST 目录下缺少 ip.txt：$dir" 'Yellow'
         return @()
     }
 
@@ -285,7 +303,7 @@ function Invoke-CfstLatencyScan {
         $cfstArgs = @('-dd', '-tlr', '0.05', '-p', '0', '-o', $csv, '-f', 'ip.txt')
         & $Exe @cfstArgs *> $null
         $code = $LASTEXITCODE
-        Write-Host "CFST 延迟扫描退出码：$code" -ForegroundColor DarkGray
+        Write-ProbeStatus "CFST 延迟扫描退出码：$code" 'DarkGray'
         if ($code -ne 0 -or -not (Test-Path -LiteralPath $csv)) { return @() }
 
         $rows = @()
@@ -351,7 +369,7 @@ function Invoke-BuiltinLatencyScan {
         if (-not $ips.Contains($ip)) { $ips.Add($ip) }
     }
 
-    Write-Host "内置延迟扫描：$($ips.Count) 个候选 IP，每个 $Samples 次探测 ..." -ForegroundColor Cyan
+    Write-ProbeStatus "内置延迟扫描：$($ips.Count) 个候选 IP，每个 $Samples 次探测 ..."
     $probeUrl = $ProbeUrl
     $probeHost = ([uri]$ProbeUrl).Host
     $probe = $ips | ForEach-Object -Parallel {
@@ -704,6 +722,46 @@ function Select-DomainIp {
 
 # 本次没有可用决策时，如何处理旧映射。
 # 只有明确的 1034/1003 才自动丢弃；连接失败默认保留，除非显式 -DropUnreachable。
+# 展示用的中文化映射。只影响控制台表格和逐站结果行，plan.json 里仍是原始代码。
+function Get-ReasonText {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Reason = '')
+    $map = @{
+        'improved'                = '更快'
+        'better-class'            = '状态更好'
+        'baseline-failed'         = '基线不可用'
+        'baseline-is-best'        = '基线已最优'
+        'baseline-class-better'   = '基线状态更好'
+        'baseline-no-ttfb'        = '基线无延迟'
+        'below-threshold'         = '未达阈值'
+        'no-working-candidate'    = '无可用候选'
+        'candidate-flaky'         = '候选不稳定'
+        'baseline-failed-on-retest' = '复核时基线失败'
+        'confirmed-class'         = '复核确认（状态）'
+        'not-confirmed'           = '复核未通过'
+        'confirmed'               = '复核确认'
+        'dns'                     = '交还 DNS'
+    }
+    if ($map.ContainsKey($Reason)) { return $map[$Reason] }
+    return $Reason
+}
+
+function Get-ActionText {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Action = '')
+    $map = @{
+        'update'           = '更新'
+        'keep'             = '保留'
+        'release'          = '交还 DNS'
+        'drop'             = '丢弃'
+        'keep-unreachable' = '保留（未验证）'
+        'none'             = '未写入'
+        'dns'              = '沿用 DNS'
+    }
+    if ($map.ContainsKey($Action)) { return $map[$Action] }
+    return $Action
+}
+
 function Get-PreviousAction {
     [CmdletBinding()]
     param(

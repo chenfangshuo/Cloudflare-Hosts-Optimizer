@@ -218,18 +218,21 @@ $script:RepoRoot = $Root
 . (Join-Path $Root 'lib\Endpoint.ps1')
 . (Join-Path $Root 'lib\Doctor.ps1')
 . (Join-Path $Root 'lib\Schedule.ps1')
+. (Join-Path $Root 'lib\Progress.ps1')
 
 $script:Log = [System.Collections.Generic.List[string]]::new()
 $script:FailCode = 0
 
 function Say {
     param([string]$Text = '', [string]$Color = 'Gray')
-    Write-Host $Text -ForegroundColor $Color
+    Write-StatusLine -Text $Text -Color $Color
     $script:Log.Add($Text)
 }
 
 function Fail {
     param([string]$Message, [int]$Code = 1)
+    # 先收掉动画行，错误信息才不会被转轮压住
+    Stop-TaskSpinner
     $script:FailCode = $Code
     throw $Message
 }
@@ -266,19 +269,22 @@ function Show-ProxyCheck {
     param([string[]]$TargetDomains)
     $p = Get-ProxyState
     if (-not $p.Enabled) {
-        Say '代理：未启用 WinINET 系统代理（这不排除 PAC/TUN/应用级代理）。' 'Yellow'
+        Say '代理：未启用 WinINET 系统代理' 'Gray'
+        Say '不排除 PAC / TUN / 应用级代理。' 'DarkGray'
         return
     }
-    Say "代理：WinINET 系统代理已开启 -> $($p.Server)" 'Yellow'
-    Say '  说明：本工具的 curl 带 --noproxy *、CFST 启动前会清空代理环境变量，所以探测和测速不走这个 HTTP 代理。' 'DarkGray'
-    Say '  但 TUN / WFP / PAC 这类透明转发无法这样绕过，是否直连要看下面的网卡检查。' 'DarkGray'
+    Say "代理：已开启（WinINET $($p.Server)）" 'Gray'
+    Say '浏览器等 WinINET 程序走它；本工具的探测和测速带 --noproxy，不走它。' 'DarkGray'
+    Say 'TUN / WFP / PAC 这类透明转发不受 --noproxy 影响，见下面的网卡检查。' 'DarkGray'
+
     $missing = @($TargetDomains | Where-Object { -not (Test-BypassStrict -Domain $_ -Bypass $p.Bypass) })
     if ($missing.Count -eq 0) {
-        Say '旁路：目标域名均在 ProxyOverride 中（只代表浏览器等 WinINET 程序直连，与测速无关）。' 'Green'
+        Say '旁路：目标域名都在 ProxyOverride 中' 'Gray'
+        Say '浏览器开着代理时也会直连，hosts 映射可以生效。' 'DarkGray'
     } else {
-        Say '旁路：以下域名不在 ProxyOverride 中：浏览器等 WinINET 程序可能走代理、出口 IP 可能变化。' 'Red'
-        Say '  本工具的探测和测速不受这一项影响（不走 HTTP 代理）；但开着代理时，这些程序可能不用 hosts 里的映射。' 'DarkGray'
-        foreach ($m in $missing) { Say "  - $m" 'Red' }
+        Say ("旁路：{0} 个域名不在 ProxyOverride" -f $missing.Count) 'Yellow'
+        Say '浏览器开着代理时，这些域名可能不走 hosts；本工具的测速不受影响。' 'DarkGray'
+        foreach ($m in $missing) { Say "- $m" 'Yellow' }
     }
 }
 
@@ -294,15 +300,17 @@ function Get-TunAdapters {
 function Test-TunAdapter {
     $tun = Get-TunAdapters
     if ($null -eq $tun) {
-        Say '网卡：当前环境缺少 NetAdapter 模块，跳过 TUN 检测。' 'Yellow'
+        Say '网卡：缺少 NetAdapter 模块，跳过 TUN 检测' 'Yellow'
         return $false
     }
     if ($tun.Count -gt 0) {
-        Say '警告：检测到可能处于 TUN 模式的网卡，流量可能被它接管（--noproxy 绕不过 TUN）：' 'Red'
-        foreach ($t in $tun) { Say "  - $($t.Name) / $($t.InterfaceDescription)" 'Red' }
+        Say '网卡：检测到可能的 TUN 虚拟网卡' 'Red'
+        Say 'TUN 会接管流量，--noproxy 绕不过；正式运行会中止，确认风险后加 -Force 继续。' 'DarkGray'
+        foreach ($t in $tun) { Say "- $($t.Name) / $($t.InterfaceDescription)" 'Red' }
         return $true
     }
-    Say '网卡：未发现已知 TUN 虚拟网卡（这只说明没有已知 TUN，不排除 WFP/透明代理）。' 'Green'
+    Say '网卡：未发现已知 TUN 虚拟网卡' 'Gray'
+    Say '只说明没有已知 TUN，不排除 WFP / 透明代理。' 'DarkGray'
     return $false
 }
 
@@ -527,7 +535,7 @@ function Invoke-Doctor {
     }
 
     Say ''
-    Say '==== Cloudflare-Hosts-Optimizer Doctor ====' 'Cyan'
+    Say "Cloudflare-Hosts-Optimizer $ScriptVersion · Doctor" 'Cyan'
     foreach ($line in (Format-DoctorReport -Checks $checks)) {
         $color = if ($line.StartsWith('[FAIL]')) { 'Red' }
                  elseif ($line.StartsWith('[WARN]')) { 'Yellow' }
@@ -566,11 +574,11 @@ function Invoke-TaskInstall {
     catch { Fail $_.Exception.Message 1 }
 
     Say "已注册计划任务：$($spec.TaskName)" 'Green'
-    Say "  频率：每 $($spec.IntervalDays) 天，$($spec.At)（从注册后的下一个该时间开始）" 'Gray'
-    Say "  模式：$(if ($spec.Mode -eq 'DryRun') { 'DryRun —— 只写报告，不修改 hosts' } else { 'AutoApply —— 自动写入 hosts（需要管理员）' })" 'Gray'
-    Say "  程序：$($spec.Execute)" 'DarkGray'
-    Say "  报告：$($spec.ReportPath)" 'DarkGray'
-    Say "  删除：.\Cloudflare-Hosts-Optimizer.ps1 -UninstallTask -TaskName '$($spec.TaskName)'" 'DarkGray'
+    Say "频率：每 $($spec.IntervalDays) 天，$($spec.At)（从注册后的下一个该时间开始）" 'Gray'
+    Say "模式：$(if ($spec.Mode -eq 'DryRun') { 'DryRun —— 只写报告，不修改 hosts' } else { 'AutoApply —— 自动写入 hosts（需要管理员）' })" 'Gray'
+    Say "程序：$($spec.Execute)" 'DarkGray'
+    Say "报告：$($spec.ReportPath)" 'DarkGray'
+    Say "删除：.\Cloudflare-Hosts-Optimizer.ps1 -UninstallTask -TaskName '$($spec.TaskName)'" 'DarkGray'
     return 0
 }
 
@@ -620,6 +628,7 @@ function Invoke-Main {
     if ($InstallTask) { return (Invoke-TaskInstall) }
     if ($UninstallTask) { return (Invoke-TaskUninstall) }
 
+    $script:RunWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
@@ -668,12 +677,12 @@ function Invoke-Main {
     if (-not $DryRun -and -not $planMode) { Assert-AdminForPath $hostsPathResolved }
     $curlExe = Get-CurlExe
 
+    $modeText = if ($planMode) { 'Plan' } elseif ($DryRun) { 'DryRun' } else { '写入 hosts' }
     Say ''
-    Say '==== Cloudflare 优选 IP -> hosts ====' 'Cyan'
+    Say "Cloudflare-Hosts-Optimizer $ScriptVersion · $modeText · $($domainList.Count) 个域名" 'Cyan'
     Say "hosts: $hostsPathResolved" 'DarkGray'
-    Say "域名数: $($domainList.Count)" 'DarkGray'
-    Say ''
 
+    Start-Step '检查环境与端点' '约 5 秒' -Total 6
     Show-ProxyCheck -TargetDomains $domainList
     $tun = Test-TunAdapter
     if ($tun -and -not $DryRun -and -not $planMode -and -not $Force) {
@@ -712,9 +721,15 @@ function Invoke-Main {
     if (-not $probe.Ok) {
         Fail ("探测端点不可用：$($probe.Url)（$($probe.Detail)）。请检查网络；也可以用 -ProbeUrl 换一个 Cloudflare 托管的 trace 地址。") 3
     }
-    Say "探测端点：$($probe.Host)" 'DarkGray'
+    Say "探测端点：$($probe.Host)" 'Gray'
+    Say '延迟扫描和机房判断用的 trace 地址。' 'DarkGray'
 
     $speedCheck = Test-SpeedEndpoint -CurlExe $curlExe -UrlTemplate $SpeedTestUrl
+    # 瞬时超时很常见，失败后重试一次再判定
+    if (-not $speedCheck.Ok -and -not $speedCheck.Skipped) {
+        Start-Sleep -Milliseconds 400
+        $speedCheck = Test-SpeedEndpoint -CurlExe $curlExe -UrlTemplate $SpeedTestUrl
+    }
     $speedHost = (Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl).Host
     if (-not $speedCheck.Ok) {
         Fail ("测速端点不可用：$speedHost（$($speedCheck.Detail)）。可以换 -SpeedTestUrl，或检查网络/代理。") 3
@@ -722,10 +737,15 @@ function Invoke-Main {
     if ($speedCheck.Skipped) {
         Say "测速端点：$speedHost（$($speedCheck.Detail)）" 'Yellow'
     } else {
-        Say "测速端点：$speedHost，$($speedCheck.Detail)" 'DarkGray'
+        Say "测速端点：$speedHost，$($speedCheck.Detail)" 'Gray'
+        Say '只确认端点可用，不参与排名。' 'DarkGray'
     }
+    Complete-Step
 
     # ---- 延迟筛选 ----
+    Start-Step '延迟筛选' '约 1–3 分钟'
+    # 从这里开始是长时间的网络阶段，装一个 Ctrl+C 提示，免得按了没反应
+    Install-CancelNotice
     $ranges = Get-CfRanges -Experimental:$ExperimentalRanges
     $latency = @()
     $cfst = $null
@@ -734,16 +754,21 @@ function Invoke-Main {
         catch { Fail $_.Exception.Message 2 }
     }
 
-    if ($cfst) {
-        Say "使用 CFST 做全量延迟扫描（可能需要 1–3 分钟）：$cfst" 'Cyan'
-        try { $latency = @(Invoke-CfstLatencyScan -Exe $cfst -Ranges $ranges) }
-        catch { Say "CFST 运行失败：$($_.Exception.Message)" 'Yellow'; $latency = @() }
-        if ($latency.Count -eq 0) { Say 'CFST 没有产出结果，改用内置扫描。' 'Yellow' }
-    }
-    if ($latency.Count -eq 0) {
-        if ($NoCfst) { Say '已指定 -NoCfst，使用内置扫描。' 'Yellow' }
-        elseif (-not $cfst) { Say '未找到 cfst.exe，使用内置扫描。' 'Yellow' }
-        $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples -Ranges $ranges -ProbeUrl $probe.Url)
+    Start-TaskSpinner
+    try {
+        if ($cfst) {
+            Say "使用 CFST 做全量延迟扫描（可能需要 1–3 分钟）：$cfst" 'Gray'
+            try { $latency = @(Invoke-CfstLatencyScan -Exe $cfst -Ranges $ranges) }
+            catch { Say "CFST 运行失败：$($_.Exception.Message)" 'Yellow'; $latency = @() }
+            if ($latency.Count -eq 0) { Say 'CFST 没有产出结果，改用内置扫描。' 'Yellow' }
+        }
+        if ($latency.Count -eq 0) {
+            if ($NoCfst) { Say '已指定 -NoCfst，使用内置扫描。' 'Yellow' }
+            elseif (-not $cfst) { Say '未找到 cfst.exe，使用内置扫描。' 'Yellow' }
+            $latency = @(Invoke-BuiltinLatencyScan -CurlExe $curlExe -Candidates $MaxCandidates -Samples $ScanSamples -Ranges $ranges -ProbeUrl $probe.Url)
+        }
+    } finally {
+        Stop-TaskSpinner
     }
     if ($latency.Count -eq 0) { Fail '没有扫到任何可用 IP。请检查网络后重试。' 3 }
 
@@ -754,8 +779,10 @@ function Invoke-Main {
     if ($avgTtfb -lt 0.005) {
         Say '警告：平均延迟异常低（<5ms），测速可能经过了代理。结果仅供参考。' 'Yellow'
     }
+    Complete-Step
 
     # ---- 机房分层 ----
+    Start-Step '探测机房' '约 2–6 分钟'
     $pool = @($latency | Select-Object -First ([int][math]::Min(256, $latency.Count)))
     $probeTarget = $pool.Count
 
@@ -775,17 +802,21 @@ function Invoke-Main {
         }
     }
 
-    Say "探测候选落地区域（$($pool.Count) 个，可能需要几分钟，每 32 个打印一次进度）..." 'Cyan'
+    Say "探测候选落地区域（$($pool.Count) 个，可能需要几分钟）..." 'Gray'
+    Start-TaskSpinner
     try {
         $pool = @(Resolve-Colo -CurlExe $curlExe -Candidates $pool -EarlyStopColos $cachedColos `
                 -EarlyStopMinProbe ([int][math]::Max(64, $ThroughputCandidates * 2)) -ProbeUrl $probe.Url -OnProgress {
                 param($Done, $Total, $ElapsedSec)
-                $pct = if ($Total -gt 0) { [int](100 * $Done / $Total) } else { 100 }
-                Write-Progress -Activity '探测候选落地区域' -Status "$Done/$Total" -PercentComplete $pct
-                Say ("  已探测 {0}/{1}（{2:N0}s）" -f $Done, $Total, $ElapsedSec) 'DarkGray'
+                if (Test-TaskSpinnerActive) {
+                    Update-TaskSpinner -Detail ("{0}/{1} · {2:N0}s" -f $Done, $Total, $ElapsedSec)
+                } else {
+                    # 计划任务/管道：没有动画，按批打印，报告里能看到进度
+                    Say ("已探测 {0}/{1}（{2:N0}s）" -f $Done, $Total, $ElapsedSec) 'DarkGray'
+                }
             })
     } finally {
-        Write-Progress -Activity '探测候选落地区域' -Completed
+        Stop-TaskSpinner
     }
 
     if ($useCache -and $pool.Count -lt $probeTarget) {
@@ -809,9 +840,17 @@ function Invoke-Main {
             Say "警告：机房缓存写入失败（$cacheFile），不影响本次结果。" 'Yellow'
         }
     }
+    Complete-Step
 
     # ---- 吞吐初测 ----
-    $quick = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $candidates -Samples $ThroughputSamples -Bytes $ThroughputBytes -UrlTemplate $SpeedTestUrl -ThrottleLimit 6)
+    Start-Step '吞吐测速' '约 1–3 分钟'
+    Start-TaskSpinner
+    Update-TaskSpinner -Detail '初测'
+    try {
+        $quick = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $candidates -Samples $ThroughputSamples -Bytes $ThroughputBytes -UrlTemplate $SpeedTestUrl -ThrottleLimit 6 -Phase '初测')
+    } finally {
+        Stop-TaskSpinner
+    }
     $quickMap = @{}
     foreach ($q in $quick) { if ($q) { $quickMap[$q.IP] = $q } }
 
@@ -831,7 +870,13 @@ function Invoke-Main {
     $reserveCandidates = @()
     if ($promoted.Count -gt 0) {
         # 决赛：3 x 2MB，串行，避免互相抢带宽
-        $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1 -MaxTime 15)
+        Start-TaskSpinner
+        Update-TaskSpinner -Detail '决赛'
+        try {
+            $final = @(Invoke-ThroughputTest -CurlExe $curlExe -Candidates $promoted -Samples 3 -Bytes 2097152 -UrlTemplate $SpeedTestUrl -ThrottleLimit 1 -MaxTime 15 -Phase '决赛')
+        } finally {
+            Stop-TaskSpinner
+        }
         $finalMap = @{}
         foreach ($f in $final) { if ($f) { $finalMap[$f.IP] = $f } }
 
@@ -846,9 +891,9 @@ function Invoke-Main {
         }
 
         Say ''
-        Say '决赛结果（只使用决赛成绩）：' 'Cyan'
+        Say '决赛结果（只使用决赛成绩）：' 'White'
         $finalRows | Select-Object IP, Colo, Loss, Ttfb, SpeedMBps, Valid |
-            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.Trim() }
 
         $rankedFinal = @($finalRows | Where-Object { $_.Valid -ge 2 -and $_.SpeedMBps -gt 0 } |
             Sort-Object @{ Expression = 'SpeedMBps'; Descending = $true }, @{ Expression = 'Ttfb'; Descending = $false })
@@ -859,27 +904,33 @@ function Invoke-Main {
     }
 
     Say ''
-    Say '全局候选（逐域名只从这里取前几个，按基线决定是否切换）：' 'Cyan'
+    Say '全局候选（逐域名只从这里取前几个，按基线决定是否切换）：' 'White'
     if ($globalCandidates.Count -gt 0) {
         $globalCandidates | Select-Object IP, Colo, Ttfb, SpeedMBps |
-            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.Trim() }
     } else {
-        Say '  （无）' 'Yellow'
+        Say '（无）' 'Yellow'
     }
     if ($reserveCandidates.Count -gt 0) {
-        Say '补位候选（前几个都不可用时才测）：' 'Cyan'
+        Say ''
+        Say '补位候选（前几个都不可用时才测）：' 'White'
         $reserveCandidates | Select-Object IP, Colo, Ttfb, SpeedMBps |
-            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.TrimEnd() }
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Say $_.Trim() }
     }
-    Say ''
+    Complete-Step
 
     # ---- 逐域名选择：基线 = 当前 hosts/DNS 路径 ----
+    Start-Step '逐站验证' '约 1–3 分钟'
     $map = @{}
     $decisions = @()
     $dropPrevious = @()
 
-    Say '逐域名验证与选择（基线 = 当前 hosts/DNS 路径）...' 'Cyan'
+    Say '逐域名验证与选择（基线 = 当前 hosts/DNS 路径）...' 'Gray'
+    $verifyIndex = 0
+    Start-TaskSpinner
     foreach ($d in $domainList) {
+        $verifyIndex++
+        Update-TaskSpinner -Detail ("{0}/{1} {2}" -f $verifyIndex, $domainList.Count, $d)
         # 1) 基线：不指定 IP，走系统当前路径
         $baseResult = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
         $baseline = [pscustomobject]@{
@@ -1047,23 +1098,27 @@ function Invoke-Main {
             Action     = $action
         }
 
+        $reasonText = Get-ReasonText -Reason $decision.Reason
         if ($action -eq 'update') {
-            Say ("  {0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $decision.Reason) 'Green'
+            Say ("{0,-24} 切换 {1} -> {2}  [{3}]" -f $d, $baseline.IP, $decision.IP, $reasonText) 'Green'
         } elseif ($action -in @('keep', 'dns')) {
-            Say ("  {0,-24} 保留 {1}  [{2}]" -f $d, $displayIp, $decision.Reason) 'DarkGray'
+            Say ("{0,-24} 保留 {1}  [{2}]" -f $d, $displayIp, $reasonText) 'DarkGray'
         } elseif ($action -eq 'release') {
-            Say ("  {0,-24} 该 zone 只服务自己的 IP，删除托管条目并交还 DNS  [{1}]" -f $d, $decision.Reason) 'DarkGray'
+            Say ("{0,-24} 该 zone 只服务自己的 IP，删除托管条目并交还 DNS  [{1}]" -f $d, $reasonText) 'DarkGray'
         } elseif ($action -eq 'keep-unreachable') {
-            Say ("  {0,-24} 未验证通过，保留旧映射（-DropUnreachable 可删除）" -f $d) 'Yellow'
+            Say ("{0,-24} 未验证通过，保留旧映射（-DropUnreachable 可删除）" -f $d) 'Yellow'
         } elseif ($action -eq 'drop') {
-            Say ("  {0,-24} 旧映射为 1034 受限，已丢弃" -f $d) 'Yellow'
+            Say ("{0,-24} 旧映射为 1034 受限，已丢弃" -f $d) 'Yellow'
         } else {
-            Say ("  {0,-24} 无可用候选" -f $d) 'Yellow'
+            Say ("{0,-24} 无可用候选" -f $d) 'Yellow'
         }
     }
-    Say ''
+    Stop-TaskSpinner
+    Complete-Step
 
     # ---- 更新 hosts ----
+    $updateStepName = if ($DryRun -or $planMode) { '生成计划' } else { '写入 hosts' }
+    Start-Step $updateStepName '几秒'
     try {
         $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -DropPreviousDomains $dropPrevious
     } catch {
@@ -1076,22 +1131,22 @@ function Invoke-Main {
         Say '警告：以下域名的托管条目已移除（DryRun 下为“将移除”），但 hosts 区块外仍有条目，仍会生效：' 'Yellow'
         foreach ($w in $update.Warnings) {
             $kind = if ($w.Kind -eq 'restored') { '已恢复的旧条目' } else { '手工条目' }
-            Say ("  - {0} 第 {1} 行：{2}（{3}）" -f $w.Domain, $w.Line, $w.Ip, $kind) 'Yellow'
+            Say ("- {0} 第 {1} 行：{2}（{3}）" -f $w.Domain, $w.Line, $w.Ip, $kind) 'Yellow'
         }
-        Say '  如需真正交还 DNS，请手动删除或注释这些行。' 'DarkGray'
+        Say '如需真正交还 DNS，请手动删除或注释这些行。' 'DarkGray'
     }
 
     if ($DryRun -or $planMode) {
         if ($planMode) {
-            Say 'Plan：不修改 hosts，输出 JSON 计划。计划写入：' 'Cyan'
+            Say 'Plan：不修改 hosts，输出 JSON 计划。计划写入：' 'Gray'
         } else {
-            Say 'DryRun：不修改 hosts。计划写入：' 'Cyan'
+            Say 'DryRun：不修改 hosts。计划写入：' 'Gray'
         }
         if ($update.FinalMap.Count -eq 0) {
-            Say '  （无变更）' 'Yellow'
+            Say '（无变更）' 'Yellow'
         } else {
             foreach ($d in $update.FinalMap.Keys) {
-                foreach ($ip in @($update.FinalMap[$d])) { Say ("  {0,-16} {1}" -f $ip, $d) 'White' }
+                foreach ($ip in @($update.FinalMap[$d])) { Say ("{0,-16} {1}" -f $ip, $d) 'White' }
             }
         }
         Say ''
@@ -1126,27 +1181,45 @@ function Invoke-Main {
         $flush = Clear-DnsCache
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
     }
+    Complete-Step
 
     # ---- 解析核对 ----
     if ($CheckResolved) {
         Say ''
-        Say '解析核对（系统实际返回的地址）：' 'Cyan'
+        Say '解析核对（系统实际返回的地址）：' 'White'
         foreach ($d in $domainList) {
             try {
                 $addrs = @([System.Net.Dns]::GetHostAddresses($d) | ForEach-Object { $_.IPAddressToString })
-                Say ("  {0,-24} {1}" -f $d, ($addrs -join ', ')) 'Gray'
+                Say ("{0,-24} {1}" -f $d, ($addrs -join ', ')) 'Gray'
             } catch {
-                Say ("  {0,-24} 解析失败" -f $d) 'Yellow'
+                Say ("{0,-24} 解析失败" -f $d) 'Yellow'
             }
         }
     }
 
     # ---- 报告 ----
+    if ($script:RunWatch) { $script:RunWatch.Stop() }
     if ($decisions.Count -gt 0) {
+        $byAction = @{}
+        foreach ($d in $decisions) { $byAction[$d.Action] = 1 + [int]$byAction[$d.Action] }
+        $parts = @()
+        foreach ($pair in @(
+                @('update', '更新'), @('keep', '保留'), @('dns', '沿用 DNS'), @('release', '交还 DNS'),
+                @('drop', '丢弃'), @('keep-unreachable', '保留（未验证）'), @('none', '未写入')
+            )) {
+            $n = [int]$byAction[$pair[0]]
+            if ($n -gt 0) { $parts += "$($pair[1]) $n" }
+        }
+        if ($parts.Count -eq 0) { $parts += '无变更' }
+        $elapsed = if ($script:RunWatch) { Format-Duration -Duration $script:RunWatch.Elapsed } else { '' }
+        Say ("结果：{0} · 用时 {1}" -f ($parts -join ' · '), $elapsed) 'White'
+
         Say ''
         Say '==== 逐域名决策 ====' 'Cyan'
-        $decisions | Select-Object Domain, BaselineIP, BaseState, BaseTTFB, ChosenIP, ChosenTTFB, BestTTFB, ImprovePct, Reason, Action |
-            Format-Table -AutoSize | Out-String -Width 260 | ForEach-Object { Say $_.TrimEnd() }
+        $decisions | Select-Object Domain, BaselineIP, BaseState, BaseTTFB, ChosenIP, ChosenTTFB, BestTTFB, ImprovePct,
+            @{ Name = 'Reason'; Expression = { Get-ReasonText -Reason $_.Reason } },
+            @{ Name = 'Action'; Expression = { Get-ActionText -Action $_.Action } } |
+            Format-Table -AutoSize | Out-String -Width 260 | ForEach-Object { Say $_.Trim() }
     }
 
     Say ''
@@ -1154,12 +1227,12 @@ function Invoke-Main {
     $unreachable = @($decisions | Where-Object { $_.Action -eq 'keep-unreachable' } | ForEach-Object { $_.Domain })
     if ($unreachable.Count -gt 0) {
         Say '以下域名本次未验证通过，已保留旧映射（-DropUnreachable 可删除）：' 'Yellow'
-        foreach ($f in $unreachable) { Say "  - $f" 'DarkGray' }
+        foreach ($f in $unreachable) { Say "- $f" 'DarkGray' }
     }
     $failed = @($decisions | Where-Object { $_.Action -in @('drop', 'none') } | ForEach-Object { $_.Domain })
     if ($failed.Count -gt 0) {
         Say '以下域名没有可用候选（可能非 CF、不可用或边缘受限），未写入：' 'Yellow'
-        foreach ($f in $failed) { Say "  - $f" 'DarkGray' }
+        foreach ($f in $failed) { Say "- $f" 'DarkGray' }
     }
     Say 'hosts 只影响这些域名的网页/tracker；P2P 和 IPv6 对等连接不受影响。' 'DarkGray'
     Say '写入 A 记录后，Windows 通常不再使用 DNS 的 AAAA；应用自带解析器可能不同。' 'DarkGray'
@@ -1181,6 +1254,7 @@ $script:ExitCode = 0
 try {
     Invoke-Main | Out-Null
 } catch {
+    Stop-TaskSpinner
     $msg = $_.Exception.Message
     Write-Host "错误：$msg" -ForegroundColor Red
     $script:Log.Add("ERROR: $msg")
