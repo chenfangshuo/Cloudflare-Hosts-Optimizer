@@ -54,6 +54,12 @@ function Test-TuiSupported {
     }
 }
 
+# 清屏并清掉回滚记录（Windows Terminal 支持 ESC[3J）
+function Clear-MenuScreen {
+    if (-not $script:Tui) { return }
+    try { [Console]::Write("`e[2J`e[3J`e[H") } catch { }
+}
+
 $script:Pwsh = Get-PwshPath
 $script:IsAdmin = Test-IsAdmin
 $script:Tui = if ($Action) { $false } else { Test-TuiSupported }
@@ -199,6 +205,7 @@ function Show-TuiMenu {
 
 function Read-MenuChoice {
     param([string]$Menu, [string[]]$ExtraHeader = @())
+    Clear-MenuScreen
     $header = @(Get-MenuHeader) + @($ExtraHeader)
     if ($script:Tui) {
         return Show-TuiMenu -Menu $Menu -Header $header

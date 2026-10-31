@@ -323,6 +323,8 @@ function Invoke-Doctor {
     }
 
     # ---- 环境 ----
+    # 检查要跑几秒（端点、CFST -h），期间显示计时转轮；报告统一在最后分组打印
+    Start-TaskSpinner
     $bits = if ([Environment]::Is64BitProcess) { '64 位' } else { '32 位' }
     & $add '环境' 'PowerShell' 'OK' ("{0}（{1}）" -f $PSVersionTable.PSVersion, $bits)
 
@@ -534,6 +536,7 @@ function Invoke-Doctor {
         }
     }
 
+    Stop-TaskSpinner
     Say ''
     Say "Cloudflare-Hosts-Optimizer $ScriptVersion · Doctor" 'Cyan'
     foreach ($line in (Format-DoctorReport -Checks $checks)) {
