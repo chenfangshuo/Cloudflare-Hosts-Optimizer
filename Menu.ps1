@@ -78,10 +78,23 @@ function Confirm-Action {
     return ($ans -match '^[Yy]')
 }
 
+function ConvertTo-ArgumentString {
+    param([string[]]$Arguments = @())
+    $parts = foreach ($a in $Arguments) {
+        if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
+    }
+    return ($parts -join ' ')
+}
+
 function Invoke-Child {
     param([string]$FilePath, [string[]]$Arguments = @())
-    & $script:Pwsh -NoProfile -ExecutionPolicy Bypass -File $FilePath @Arguments
-    return $LASTEXITCODE
+    # 用 Start-Process -NoNewWindow 让子进程直接使用当前控制台：
+    # 1) 输出实时、保留颜色和它自己的进度动画；2) 不会被函数返回值捕获成一整块。
+    $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $FilePath
+    $extra = ConvertTo-ArgumentString -Arguments $Arguments
+    if ($extra) { $argLine += ' ' + $extra }
+    $p = Start-Process -FilePath $script:Pwsh -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argLine
+    return $p.ExitCode
 }
 
 function Invoke-Elevated {
