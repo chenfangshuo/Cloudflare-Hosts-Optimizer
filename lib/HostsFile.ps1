@@ -592,6 +592,8 @@ function Initialize-HostsBackupDirectory {
             }
         } else {
             New-Item -ItemType Directory -Force -Path $Plan.AppRoot -ErrorAction Stop | Out-Null
+            # 新建目录的 owner 取决于提权令牌；显式交给 Administrators，避免 owner 是个人账户时被判不可信
+            & takeown.exe /F $Plan.AppRoot /A 2>$null | Out-Null
             & icacls $Plan.AppRoot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "无法加固备份根目录：$($Plan.AppRoot)" }
             if (-not (Test-BackupPathTrusted -Path $Plan.AppRoot)) {
@@ -600,10 +602,13 @@ function Initialize-HostsBackupDirectory {
         }
     }
 
+    $created = $false
     if (-not (Test-Path -LiteralPath $entry.Dir)) {
         New-Item -ItemType Directory -Force -Path $entry.Dir -ErrorAction Stop | Out-Null
+        $created = $true
     }
     if ($isProgramData) {
+        if ($created) { & takeown.exe /F $entry.Dir /A 2>$null | Out-Null }
         & icacls $entry.Dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "无法加固备份目录：$($entry.Dir)" }
     }
