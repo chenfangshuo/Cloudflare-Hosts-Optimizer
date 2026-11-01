@@ -93,21 +93,19 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
-# 生成一屏文字；选中的那一行用 "❯ " 标记。Menu.ps1 再给它上色。
+# 生成一屏文字；每项前面显示序号（1-9 可直达）。选中样式由 Menu.ps1 负责。
 function Format-MenuFrame {
     [CmdletBinding()]
     param(
         [AllowEmptyCollection()][string[]]$Header = @(),
         [Parameter(Mandatory)]$Items,
-        [int]$SelectedIndex = 0,
         [AllowEmptyString()][string]$Footer = ''
     )
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($h in $Header) { $lines.Add($h) }
     $lines.Add('')
-    for ($i = 0; $i -lt @($Items).Count; $i++) {
-        $marker = if ($i -eq $SelectedIndex) { '❯' } else { ' ' }
-        $lines.Add(('{0} {1}' -f $marker, @($Items)[$i].Label))
+    foreach ($item in @($Items)) {
+        $lines.Add(('{0,2}) {1}' -f $item.Key, $item.Label))
     }
     if ($Footer) {
         $lines.Add('')

@@ -186,7 +186,7 @@ function Show-TuiMenu {
     try {
         while ($true) {
             $footer = '↑↓ 选择 · 1-9 直达 · Enter 确认 · Esc 返回'
-            $lines = @(Format-MenuFrame -Header $Header -Items $items -SelectedIndex $selected -Footer $footer)
+            $lines = @(Format-MenuFrame -Header $Header -Items $items -Footer $footer)
             $selLine = $Header.Count + 1 + $selected
             $footerLine = $lines.Count - 1
             # 回到菜单块顶部重画；窗口缩放等导致位置失效时退回“从当前位置画”
@@ -199,9 +199,8 @@ function Show-TuiMenu {
             }
             for ($i = 0; $i -lt $lines.Count; $i++) {
                 if ($i -eq $selLine) {
-                    $text = $lines[$i]
-                    $label = if ($text.StartsWith('❯ ')) { $text.Substring(2) } else { $text }
-                    [Console]::Write("`e[96m❯`e[0m `e[1;97m" + $label + "`e[0m`e[K`r`n")
+                    # 青色背景黑字，ESC[K 会把这一行剩余部分也填上背景色
+                    [Console]::Write("`e[30;46m" + $lines[$i] + "`e[K`e[0m`r`n")
                 } elseif ($i -eq $footerLine) {
                     [Console]::Write("`e[90m" + $lines[$i] + "`e[0m`e[K`r`n")
                 } else {

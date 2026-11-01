@@ -160,22 +160,34 @@ Describe 'Get-MenuStatus' {
 }
 
 Describe 'Format-MenuFrame' {
-    It '标记选中项并保留头部和页脚' {
+    It '每项带序号并保留头部和页脚' {
         $items = @(
             (New-MenuSpec '1' '第一项' 'Script'),
             (New-MenuSpec '2' '第二项' 'Script')
         )
-        $lines = @(Format-MenuFrame -Header @('标题', '状态') -Items $items -SelectedIndex 1 -Footer '↑↓ 选择')
+        $lines = @(Format-MenuFrame -Header @('标题', '状态') -Items $items -Footer '↑↓ 选择')
         $lines[0] | Should -Be '标题'
         $lines[1] | Should -Be '状态'
         $lines[2] | Should -Be ''
-        $lines[3] | Should -Be '  第一项'
-        $lines[4] | Should -Be '❯ 第二项'
+        $lines[3] | Should -Be ' 1) 第一项'
+        $lines[4] | Should -Be ' 2) 第二项'
         $lines[-1] | Should -Be '↑↓ 选择'
+    }
+
+    It '两位序号也保持对齐' {
+        $items = @(
+            (New-MenuSpec '9' '九' 'Script'),
+            (New-MenuSpec '10' '十' 'Script'),
+            (New-MenuSpec '0' '零' 'Script')
+        )
+        $lines = @(Format-MenuFrame -Header @() -Items $items -Footer '')
+        $lines[1] | Should -Be ' 9) 九'
+        $lines[2] | Should -Be '10) 十'
+        $lines[3] | Should -Be ' 0) 零'
     }
 
     It '没有页脚时不额外加空行' {
         $items = @((New-MenuSpec '1' 'A' 'Script'))
-        @(Format-MenuFrame -Header @() -Items $items -SelectedIndex 0).Count | Should -Be 2
+        @(Format-MenuFrame -Header @() -Items $items -Footer '').Count | Should -Be 2
     }
 }
