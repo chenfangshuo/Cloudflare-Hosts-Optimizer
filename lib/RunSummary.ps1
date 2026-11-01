@@ -187,11 +187,9 @@ function Format-RunSummaryLine {
         $time = Format-SummaryLocalTime -Value $r.finishedAt
         $sandbox = ''
         if ($SystemHostsPath -and $r.hostsPath) {
-            try {
-                if ([IO.Path]::GetFullPath([string]$r.hostsPath) -ine [IO.Path]::GetFullPath($SystemHostsPath)) {
-                    $sandbox = '（临时 hosts）'
-                }
-            } catch { }
+            if (-not (Test-SamePath -Left $r.hostsPath -Right $SystemHostsPath)) {
+                $sandbox = '（临时 hosts）'
+            }
         }
         $lastRunText = "上次运行：$time · $mode · 退出码 $($r.exitCode)$sandbox"
     } elseif ($ReportPath -and (Test-Path -LiteralPath $ReportPath)) {

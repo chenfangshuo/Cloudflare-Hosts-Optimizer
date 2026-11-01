@@ -38,6 +38,33 @@ function Get-NormalizedPath {
     return $full.ToLowerInvariant()
 }
 
+function Get-SystemHostsPath {
+    [CmdletBinding()]
+    param()
+    return (Join-Path $env:SystemRoot 'System32\drivers\etc\hosts')
+}
+
+# 只做规范化词法比较（大小写、相对路径、末尾分隔符）；用于 manifest 目标等非安全判定。
+# 安全判定（输出碰撞、系统 hosts 识别）必须用 Test-PathCollision。
+function Test-SamePath {
+    [CmdletBinding()]
+    param([string]$Left, [string]$Right)
+    if (-not $Left -or -not $Right) { return $false }
+    try { return ((Get-NormalizedPath -Path $Left) -ceq (Get-NormalizedPath -Path $Right)) } catch { return $false }
+}
+
+# 系统 hosts 判定：路径存在时先比文件身份，识别指向系统 hosts 的符号链接/硬链接；
+# 查不到身份时保守按系统 hosts 处理。
+function Test-SystemHostsPath {
+    [CmdletBinding()]
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $system = Get-SystemHostsPath
+    $r = Test-PathCollision -Left $Path -Right $system
+    if ($r.Collision -or $r.Uncertain) { return $true }
+    return (Test-SamePath -Left $Path -Right $system)
+}
+
 # 返回 "卷序列号:FileIndexHighFileIndexLow"，失败返回 $null。
 # 打开失败的常见原因：路径不存在、被独占、ACL 拒绝。
 function Get-Win32FileIdentity {
@@ -157,7 +184,7 @@ function Get-ProtectedInputPaths {
         [string]$DomainsFile,
         [string]$RollbackFrom
     )
-    $list = @((Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'))
+    $list = @((Get-SystemHostsPath))
     if ($HostsPath) { $list += $HostsPath }
     if ($DomainsFile) { $list += $DomainsFile }
     if ($RollbackFrom) { $list += $RollbackFrom }
@@ -197,6 +224,28 @@ function Assert-OutputPathSafe {
         }
     }
     return $null
+}
+
+# 一组输出之间、输出与输入之间都不能指向同一个文件。
+# 按槽位排除自己，不能按“值相等”过滤（两个输出相同时会被全部滤掉）。
+function Get-OutputPathConflicts {
+    [CmdletBinding()]
+    param(
+        [string[]]$Outputs = @(),
+        [string[]]$InputPaths = @()
+    )
+    $list = @($Outputs)
+    $conflicts = @()
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        if (-not $list[$i]) { continue }
+        $others = @()
+        for ($j = 0; $j -lt $list.Count; $j++) {
+            if ($j -ne $i -and $list[$j]) { $others += $list[$j] }
+        }
+        $c = Assert-OutputPathSafe -Path $list[$i] -InputPaths $InputPaths -OtherOutputs $others
+        if ($c) { $conflicts += $c }
+    }
+    return @($conflicts)
 }
 
 # ---------------------------------------------------------------------------

@@ -256,8 +256,7 @@ function Assert-Admin {
 # 只有目标是系统 hosts 时才需要管理员；-HostsPath 指向临时文件时不需要
 function Assert-AdminForPath {
     param([string]$Path)
-    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    if ([IO.Path]::GetFullPath($Path) -ieq [IO.Path]::GetFullPath($systemHosts)) {
+    if (Test-SystemHostsPath -Path $Path) {
         Assert-Admin
     }
 }
@@ -685,16 +684,8 @@ function Invoke-Main {
     $script:SafeInputPaths = @(Get-ProtectedInputPaths -HostsPath $hostsPathResolved -DomainsFile $domainsFileResolved -RollbackFrom $RollbackFrom)
     $coloCacheResolved = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
     $mainOutputs = @($script:ReportPathResolved, $planFile, $coloCacheResolved, (Join-Path $Root 'last-run.json'))
-    for ($i = 0; $i -lt $mainOutputs.Count; $i++) {
-        $out = $mainOutputs[$i]
-        if (-not $out) { continue }
-        $others = @()
-        for ($j = 0; $j -lt $mainOutputs.Count; $j++) {
-            if ($j -ne $i -and $mainOutputs[$j]) { $others += $mainOutputs[$j] }
-        }
-        $conflict = Assert-OutputPathSafe -Path $out -InputPaths $script:SafeInputPaths -OtherOutputs $others
-        if ($conflict) { Fail $conflict 2 }
-    }
+    $mainConflicts = @(Get-OutputPathConflicts -Outputs $mainOutputs -InputPaths $script:SafeInputPaths)
+    if ($mainConflicts.Count -gt 0) { Fail $mainConflicts[0] 2 }
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
@@ -1383,18 +1374,7 @@ $entryPlan = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
 $entryColo = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
 $entryInputs = @(Get-ProtectedInputPaths -HostsPath $HostsPath -DomainsFile $entryDomains -RollbackFrom $RollbackFrom)
 $entryOutputs = @($script:ReportPathResolved, $entryPlan, $entryColo, (Join-Path $Root 'last-run.json'))
-$entryErrors = @()
-for ($i = 0; $i -lt $entryOutputs.Count; $i++) {
-    $out = $entryOutputs[$i]
-    if (-not $out) { continue }
-    # 按槽位排除自己；不能按“值相等”过滤，否则 PlanPath 与 ReportPath 相同时两条都会被滤掉
-    $others = @()
-    for ($j = 0; $j -lt $entryOutputs.Count; $j++) {
-        if ($j -ne $i -and $entryOutputs[$j]) { $others += $entryOutputs[$j] }
-    }
-    $conflict = Assert-OutputPathSafe -Path $out -InputPaths $entryInputs -OtherOutputs $others
-    if ($conflict) { $entryErrors += $conflict }
-}
+$entryErrors = @(Get-OutputPathConflicts -Outputs $entryOutputs -InputPaths $entryInputs)
 if ($entryErrors.Count -gt 0) {
     foreach ($e in @($entryErrors | Select-Object -Unique)) { [Console]::Error.WriteLine("错误：$e") }
     exit 2

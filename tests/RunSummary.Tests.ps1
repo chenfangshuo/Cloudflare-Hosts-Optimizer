@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\RunSummary.ps1')
     $script:SystemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $script:SandboxHosts = 'C:\temp\x.hosts'

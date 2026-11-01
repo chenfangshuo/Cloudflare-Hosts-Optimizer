@@ -580,11 +580,8 @@ function Get-HostsBackupDir {
         [string[]]$BaseCandidates
     )
 
-    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $isSystem = $true
-    if ($HostsPath) {
-        try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
-    }
+    if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
 
     # 非系统 hosts 使用按目标路径哈希隔离的子目录，避免沙箱备份被系统 hosts 回滚选中
     $targetId = $null
@@ -634,11 +631,8 @@ function Get-HostsBackupDirs {
         # 仅供测试注入候选目录；正常调用不要传
         [string[]]$BaseCandidates
     )
-    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $isSystem = $true
-    if ($HostsPath) {
-        try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
-    }
+    if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
     $targetId = $null
     if ($HostsPath -and -not $isSystem) {
         try {
@@ -664,6 +658,18 @@ function Get-HostsBackupDirs {
         if (Test-Path -LiteralPath $dir) { $dirs += $dir }
     }
     return @($dirs)
+}
+
+# 读 JSON；文件不存在或解析失败返回 $null，由调用方决定是跳过还是报错。
+function Read-JsonFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return (Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
 }
 
 # 原子写 JSON：先写同目录临时文件，再 Replace/Move，避免就地截断留下半个文件
@@ -742,6 +748,28 @@ function Backup-HostsDocument {
     return [pscustomobject]@{ Path = $path; ManifestPath = $manifestPath; Name = $name }
 }
 
+# 写入和回滚共用同一把全局互斥锁；返回一个状态对象交给 Exit-GlobalMutex。
+function Enter-GlobalMutex {
+    [CmdletBinding()]
+    param()
+    $m = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
+    $acquired = $false
+    try { $acquired = $m.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
+    if (-not $acquired) {
+        $m.Dispose()
+        throw '另一个 Cloudflare-Hosts-Optimizer 实例正在运行，已中止。'
+    }
+    return [pscustomobject]@{ Mutex = $m; Acquired = $true }
+}
+
+function Exit-GlobalMutex {
+    [CmdletBinding()]
+    param($State)
+    if (-not $State) { return }
+    try { if ($State.Acquired) { $State.Mutex.ReleaseMutex() } } catch { }
+    try { $State.Mutex.Dispose() } catch { }
+}
+
 function Write-HostsDocument {
     [CmdletBinding()]
     param(
@@ -755,12 +783,8 @@ function Write-HostsDocument {
         return [pscustomobject]@{ Changed = $false; Backup = $null; CommittedAt = $null }
     }
 
-    $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
-    $acquired = $false
+    $mutexState = Enter-GlobalMutex
     try {
-        try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { throw '另一个 Cloudflare-Hosts-Optimizer 实例正在运行，已中止。' }
-
         # 提交前确认文件没有被其他程序改动
         $currentHash = (Get-FileHash -LiteralPath $Document.Path -Algorithm SHA256).Hash
         if ($currentHash -ne $Document.OriginalHash) {
@@ -802,7 +826,7 @@ function Write-HostsDocument {
             if (-not $replaced) {
                 # 替换没有发生：把这次备份标成 aborted（尽力而为），不要让回滚把它当成候选
                 try {
-                    $m0 = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                    $m0 = Read-JsonFile -Path $backup.ManifestPath
                     $m0.state = 'aborted'
                     $m0.intendedHash = $null
                     Write-JsonFileAtomic -Path $backup.ManifestPath -Object $m0
@@ -828,7 +852,7 @@ function Write-HostsDocument {
             # 内容不一致：自动还原，并把这次备份标成 aborted
             Copy-Item -LiteralPath $backup.Path -Destination $Document.Path -Force
             try {
-                $m1 = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                $m1 = Read-JsonFile -Path $backup.ManifestPath
                 $m1.state = 'aborted'
                 $m1.postHash = $null
                 $m1.intendedHash = $null
@@ -840,7 +864,8 @@ function Write-HostsDocument {
         # 完成标记写失败不影响“已经提交”这个事实：manifest 仍是 pending，
         # 回滚会按“当前内容 == intendedHash”把它恢复成已完成。
         try {
-            $manifest = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+            $manifest = Read-JsonFile -Path $backup.ManifestPath
+            if (-not $manifest) { throw '备份清单无法读取。' }
             $manifest.state = 'committed'
             $manifest.postHash = if ($newHash) { $newHash } else { $null }
             $manifest.committedAt = (Get-Date).ToString('o')
@@ -856,8 +881,7 @@ function Write-HostsDocument {
             CommittedAt = (Get-Date); Verified = $verified; Warning = $warning
         }
     } finally {
-        if ($acquired) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
+        Exit-GlobalMutex -State $mutexState
     }
 }
 
@@ -892,7 +916,7 @@ function ConvertTo-BackupTimestampFromName {
     } catch { return $null }
 }
 
-function Invoke-HostsRollbackLocked {
+function Invoke-HostsRollback {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$HostsPath,
@@ -907,14 +931,14 @@ function Invoke-HostsRollbackLocked {
         [switch]$AssumeSystemHosts
     )
 
+    $mutexState = Enter-GlobalMutex
+    try {
     # 这个开关只授权“用户点名的那一份”，不能变成“在所有不可信目录里自动挑最新”
     if ($AllowUntrustedBackup -and -not $BackupPath) {
         throw '-AllowUntrustedBackup 必须同时指定 -RollbackFrom <备份文件>，不能用于自动挑选备份。'
     }
 
-    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    $isSystem = $true
-    try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
+    $isSystem = Test-SystemHostsPath -Path $HostsPath
     if ($AssumeSystemHosts) { $isSystem = $true }
 
     $rawDirs = @($BackupDir)
@@ -947,10 +971,10 @@ function Invoke-HostsRollbackLocked {
         }
         if (Test-Path -LiteralPath $manifestPath) {
             try {
-                $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                $m = Read-JsonFile -Path $manifestPath
                 if (-not $m.hostsPath -or -not $m.preHash) { continue }
                 $same = $false
-                try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
+                $same = Test-SamePath -Left $m.hostsPath -Right $HostsPath
                 if (-not $same) { continue }
                 # 缺 createdAt 的旧 manifest：退回文件名里的时间，而不是 MinValue，
                 # 否则它会排到所有带时间的备份后面（R6）。
@@ -969,7 +993,7 @@ function Invoke-HostsRollbackLocked {
             } catch { continue }
         } else {
             $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
-                ([IO.Path]::GetFullPath($bak.DirectoryName) -ieq [IO.Path]::GetFullPath($LegacyBackupDir))
+                (Test-SamePath -Left $bak.DirectoryName -Right $LegacyBackupDir)
             if (-not ($isLegacy -and $isSystem)) { continue }
             $candidates += [pscustomobject]@{
                 File = $bak; Manifest = $null; Committed = $false; Legacy = $true
@@ -1032,10 +1056,11 @@ function Invoke-HostsRollbackLocked {
         if (-not (Test-Path -LiteralPath $manifestPath)) {
             throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($file.FullName)"
         }
-        $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $m = Read-JsonFile -Path $manifestPath
+        if (-not $m) { throw "该备份的 manifest 无法读取，已拒绝：$manifestPath" }
         $sameTarget = $false
         if ($m.hostsPath) {
-            try { $sameTarget = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
+            $sameTarget = Test-SamePath -Left $m.hostsPath -Right $HostsPath
         }
         if (-not $sameTarget) {
             throw "该备份的目标是 '$($m.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
@@ -1125,28 +1150,8 @@ function Invoke-HostsRollbackLocked {
         Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime
         Unchanged = $false; CommittedAt = (Get-Date)
     }
-}
-
-# 回滚与写入共用同一个全局互斥锁，避免“检查后又被另一个实例提交”的窗口
-function Invoke-HostsRollback {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$HostsPath,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$BackupDir,
-        [string]$LegacyBackupDir,
-        [string]$BackupPath,
-        [switch]$Force,
-        [switch]$AllowUntrustedBackup,
-        [switch]$AssumeSystemHosts
-    )
-    $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
-    $acquired = $false
-    try {
-        try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { throw '另一个 Cloudflare-Hosts-Optimizer 实例正在运行，已中止。' }
-        return Invoke-HostsRollbackLocked @PSBoundParameters
     } finally {
-        if ($acquired) { $mutex.ReleaseMutex() }
+        Exit-GlobalMutex -State $mutexState
     }
 }
 

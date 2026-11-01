@@ -21,6 +21,61 @@ Describe 'Get-NormalizedPath' {
     }
 }
 
+Describe 'Test-SamePath / Test-SystemHostsPath' {
+    It '相对路径、大小写、末尾分隔符视为同一路径' {
+        Push-Location $TestDrive
+        try {
+            (Test-SamePath -Left '.\sub\' -Right (Join-Path $TestDrive 'SUB')) | Should -BeTrue
+        } finally { Pop-Location }
+    }
+
+    It '不同的文件不是同一路径' {
+        Test-SamePath -Left (Join-Path $TestDrive 'a') -Right (Join-Path $TestDrive 'b') | Should -BeFalse
+    }
+
+    It '系统 hosts 路径识别为系统目标' {
+        Test-SystemHostsPath -Path (Get-SystemHostsPath) | Should -BeTrue
+    }
+
+    It '沙箱临时文件不是系统 hosts' {
+        $p = Join-Path $TestDrive 'sandbox-hosts'
+        Set-Content -LiteralPath $p -Value 'x'
+        Test-SystemHostsPath -Path $p | Should -BeFalse
+    }
+
+    It '指向系统 hosts 的硬链接仍按系统目标处理' {
+        $system = Get-SystemHostsPath
+        if (-not (Test-Path -LiteralPath $system)) { Set-ItResult -Skipped -Because '本机没有系统 hosts'; return }
+        $link = Join-Path $TestDrive 'system-hosts-link'
+        try {
+            New-Item -ItemType HardLink -Path $link -Target $system -ErrorAction Stop | Out-Null
+        } catch {
+            Set-ItResult -Skipped -Because '无法创建硬链接（权限或文件系统限制）'; return
+        }
+        Test-SystemHostsPath -Path $link | Should -BeTrue
+    }
+}
+
+Describe 'Get-OutputPathConflicts' {
+    It '两个输出相同时返回冲突' {
+        $p = Join-Path $TestDrive 'same-report.txt'
+        @(Get-OutputPathConflicts -Outputs @($p, $p)).Count | Should -BeGreaterThan 0
+    }
+
+    It '输出与输入相同时返回冲突' {
+        $p = Join-Path $TestDrive 'hosts-input'
+        Set-Content -LiteralPath $p -Value 'x'
+        @(Get-OutputPathConflicts -Outputs @($p) -InputPaths @($p)).Count | Should -BeGreaterThan 0
+    }
+
+    It '互不相同的输出和输入没有冲突' {
+        $out = Join-Path $TestDrive 'report.txt'
+        $in = Join-Path $TestDrive 'hosts'
+        Set-Content -LiteralPath $in -Value 'x'
+        @(Get-OutputPathConflicts -Outputs @($out) -InputPaths @($in)).Count | Should -Be 0
+    }
+}
+
 Describe 'Test-PathCollision' {
     It '同一个文件不同大小写视为碰撞' {
         $p = Join-Path $TestDrive 'Hosts'
