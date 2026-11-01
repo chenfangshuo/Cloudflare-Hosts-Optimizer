@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\Schedule.ps1')
     $script:RepoRoot = $repoRoot
 }
@@ -335,5 +336,73 @@ Describe 'V060-03 目标 token 边界' {
     It '闭引号后直接拼接后缀不算本工具' {
         $t = New-TaskObj4 -Arguments '-NoProfile -ExecutionPolicy Bypass -File "C:\tmp\Cloudflare-Hosts-Optimizer.ps1".other.ps1'
         Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript4 | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-TaskInstall 路径解析' {
+    BeforeAll {
+        function Get-MainFunctionSource {
+            param([string]$Name)
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'), [ref]$tokens, [ref]$errors)
+            $fn = $ast.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name
+                }, $true) | Select-Object -First 1
+            if (-not $fn) { throw "找不到函数 $Name" }
+            return $fn.Extent.Text
+        }
+        function Fail { param($Message, [int]$Code = 1) throw $Message }
+        function Say { param($Text = '', $Color = 'Gray') }
+        function Assert-Admin { }
+        function Read-DomainsFile {
+            param($Path)
+            return [pscustomobject]@{ Invalid = @(); InvalidItems = @(); Domains = @('example.com') }
+        }
+        Invoke-Expression (Get-MainFunctionSource -Name 'Invoke-TaskInstall')
+    }
+
+    It '任务参数按 PowerShell 位置解析，而不是进程 CWD' {
+        $a = Join-Path $TestDrive 'task-a'
+        $b = Join-Path $TestDrive 'task-b'
+        New-Item -ItemType Directory -Force -Path (Join-Path $a 'sub'), (Join-Path $b 'sub') | Out-Null
+        Set-Content -LiteralPath (Join-Path $a 'sub\domains.txt') -Value 'example.net' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $b 'sub\domains.txt') -Value 'example.com' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $a 'sub\notes.txt') -Value 'KEEP_A' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $b 'sub\notes.txt') -Value 'KEEP_B' -Encoding utf8
+        Set-Content -LiteralPath (Join-Path $TestDrive 'Cloudflare-Hosts-Optimizer.ps1') -Value '# dummy' -Encoding utf8
+
+        $driveRelDomains = (Split-Path -Qualifier $TestDrive) + 'sub\domains.txt'
+        $driveRelReport = (Split-Path -Qualifier $TestDrive) + 'sub\notes.txt'
+        $script:Root = $TestDrive
+        $script:TaskMode = 'DryRun'
+        $script:TaskIntervalDays = 14
+        $script:TaskAt = '10:00'
+        $script:TaskName = ''
+        $script:TaskForce = $false
+        $script:DomainsFile = $driveRelDomains
+        $script:ReportPath = $driveRelReport
+        $script:ScriptBoundParameters = @{ DomainsFile = $driveRelDomains; ReportPath = $driveRelReport }
+        $script:capturedSpec = $null
+        Mock Install-OptimizerTask {
+            param($Spec, [switch]$TaskForce)
+            $script:capturedSpec = $Spec
+        }
+
+        $oldCwd = [Environment]::CurrentDirectory
+        Push-Location $b
+        try {
+            [Environment]::CurrentDirectory = $a
+            Invoke-TaskInstall
+        } finally {
+            [Environment]::CurrentDirectory = $oldCwd
+            Pop-Location
+        }
+
+        $script:capturedSpec.ReportPath | Should -Be (Join-Path $b 'sub\notes.txt')
+        $script:capturedSpec.Arguments | Should -Match ([regex]::Escape((Join-Path $b 'sub\domains.txt')))
+        $script:capturedSpec.Arguments | Should -Not -Match ([regex]::Escape((Join-Path $a 'sub\domains.txt')))
     }
 }

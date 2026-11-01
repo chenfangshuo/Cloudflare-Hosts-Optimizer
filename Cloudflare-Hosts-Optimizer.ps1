@@ -574,15 +574,12 @@ function Invoke-TaskInstall {
     if ($script:ScriptBoundParameters.ContainsKey('Domains')) {
         Fail '-InstallTask 不支持 -Domains：域名数组没法安全写进任务命令行，也会把站点清单暴露在任务参数里。请用 domains.txt 或 -DomainsFile。' 2
     }
-    # 任务的工作目录固定为仓库根；相对路径必须在这里按“调用者当前目录”定死成绝对路径，
+    # 任务的工作目录固定为仓库根；相对路径必须按与主入口相同的规则定死成绝对路径，
     # 否则安装时校验的和运行时打开的可能不是同一个文件。
     $makeAbsolute = {
         param([string]$p)
         if (-not $p) { return $p }
-        try {
-            if ([IO.Path]::IsPathRooted($p)) { return [IO.Path]::GetFullPath($p) }
-            return [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $p))
-        } catch { return $p }
+        try { return (Resolve-InputPath -Path $p) } catch { return $p }
     }
 
     $df = & $makeAbsolute ($(if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }))
