@@ -227,10 +227,12 @@ Describe '写入与回滚' {
         $new = Join-Path $backupDir 'hosts-20260201-000000-bbbbbbbb.bak'
         [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
+        $post = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
         foreach ($f in @($old, $new)) {
             $mf = @{
                 hostsPath = $tmp
                 preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($f))
+                postHash  = if ($f -eq $new) { $post } else { Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes('old-post')) }
             }
             [IO.File]::WriteAllText("$f.json", ($mf | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         }
@@ -255,10 +257,12 @@ Describe '写入与回滚' {
         [IO.File]::WriteAllText("$bakA.json", (@{
                     hostsPath = $hostsA
                     preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bakA))
+                    postHash  = Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes('a-post'))
                 } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         [IO.File]::WriteAllText("$bakB.json", (@{
                     hostsPath = $hostsB
                     preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bakB))
+                    postHash  = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($hostsB))
                 } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
         Invoke-HostsRollback -HostsPath $hostsB -BackupDir $dir | Out-Null
@@ -275,10 +279,12 @@ Describe '写入与回滚' {
         $new = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
         [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
+        $post = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
         foreach ($f in @($old, $new)) {
             $mf = @{
                 hostsPath = $tmp
                 preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($f))
+                postHash  = if ($f -eq $new) { $post } else { Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes('old-post')) }
             }
             [IO.File]::WriteAllText("$f.json", ($mf | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         }
@@ -397,5 +403,119 @@ Describe '事务与回滚校验（评审修复）' {
         [IO.File]::WriteAllText($bak, "x`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText("$bak.json", (@{ hostsPath = $tmp } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $bak } | Should -Throw '*preHash*'
+    }
+}
+
+Describe '回滚异常组合（v0.5.4）' {
+    It '较新未完成事务不会挡住较早已完成事务' {
+        $tmp = Join-Path $TestDrive 'rb-pref.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-pref'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $older = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        $newer = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($older, "older`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($newer, "newer`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$older.json", (@{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($older))
+                    postHash  = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$newer.json", (@{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($newer))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir
+        $r.Restored | Should -Be $older
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'older'
+    }
+
+    It '未完成事务且当前文件被改 → 拒绝，-Force 才恢复' {
+        $tmp = Join-Path $TestDrive 'rb-uncommitted.txt'
+        [IO.File]::WriteAllText($tmp, "changed`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-uncommitted'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-dddddddd.bak'
+        [IO.File]::WriteAllText($bak, "restore`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir } | Should -Throw '*无法确认*'
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'changed'
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -Force | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'restore'
+    }
+
+    It '当前内容等于备份时是无变化成功' {
+        $tmp = Join-Path $TestDrive 'rb-same.txt'
+        [IO.File]::WriteAllText($tmp, "same`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-same'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-eeeeeeee.bak'
+        [IO.File]::WriteAllText($bak, "same`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+                    postHash  = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir
+        $r.Unchanged | Should -BeTrue
+    }
+
+    It '-Force 不能绕过损坏的备份' {
+        $tmp = Join-Path $TestDrive 'rb-force-corrupt.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-force-corrupt'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-ffffffff.bak'
+        [IO.File]::WriteAllText($bak, "good`r`n", [Text.ASCIIEncoding]::new())
+        $pre = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+        [IO.File]::WriteAllText($bak, "corrupted`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{
+                    hostsPath = $tmp
+                    preHash   = $pre
+                    postHash  = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -Force } | Should -Throw '*不一致*'
+    }
+
+    It '另一实例持锁时回滚被拒绝，释放后可重试' {
+        $tmp = Join-Path $TestDrive 'rb-lock.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-lock'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-abababab.bak'
+        [IO.File]::WriteAllText($bak, "restore`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+                    postHash  = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        $state = [hashtable]::Synchronized(@{ Ready = $false; Release = $false })
+        $job = Start-ThreadJob -ArgumentList $state -ScriptBlock {
+            param($s)
+            $m = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
+            [void]$m.WaitOne()
+            $s.Ready = $true
+            while (-not $s.Release) { Start-Sleep -Milliseconds 50 }
+            $m.ReleaseMutex()
+        }
+        $deadline = (Get-Date).AddSeconds(5)
+        while (-not $state.Ready -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 20 }
+        $state.Ready | Should -BeTrue
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir } | Should -Throw '*另一个*'
+        $state.Release = $true
+        $null = Wait-Job $job -Timeout 5
+        Remove-Job $job -Force
+
+        $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir
+        $r.Unchanged | Should -BeFalse
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'restore'
     }
 }

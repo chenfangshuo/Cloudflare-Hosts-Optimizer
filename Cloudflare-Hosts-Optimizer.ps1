@@ -196,7 +196,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.3'
+$ScriptVersion = '0.5.4'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -219,6 +219,7 @@ $script:RepoRoot = $Root
 . (Join-Path $Root 'lib\Doctor.ps1')
 . (Join-Path $Root 'lib\Schedule.ps1')
 . (Join-Path $Root 'lib\Progress.ps1')
+. (Join-Path $Root 'lib\RunSummary.ps1')
 
 $script:Log = [System.Collections.Generic.List[string]]::new()
 $script:FailCode = 0
@@ -642,13 +643,21 @@ function Invoke-Main {
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
+        $script:RunMode = 'rollback'
+        $script:RunHostsPath = $hostsPathResolved
         $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
         $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -BackupPath $RollbackFrom -Force:$Force
         $flush = Clear-DnsCache
-        Say "已恢复 hosts：$($r.Restored)" 'Green'
+        if ($r.Unchanged) { Say "hosts 已经是该备份的内容，无需恢复：$($r.Restored)" 'Green' }
+        else { Say "已恢复 hosts：$($r.Restored)" 'Green' }
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        $script:RunChanged = -not $r.Unchanged
+        $script:RunSummaryLine = if ($r.Unchanged) { '无变化（hosts 已是该备份内容）' } else { '已恢复 hosts' }
         return 0
     }
+
+    $script:RunHostsPath = $hostsPathResolved
+    $script:RunMode = if ($planMode) { 'plan' } elseif ($DryRun) { 'dryrun' } else { 'write' }
 
     # ---- 域名 ----
     $domainList = @()
@@ -689,7 +698,7 @@ function Invoke-Main {
     Show-ProxyCheck -TargetDomains $domainList
     $tun = Test-TunAdapter
     if ($tun -and -not $DryRun -and -not $planMode -and -not $Force) {
-        Fail '检测到 TUN 网卡。--noproxy 只能绕过 HTTP 代理，绕不过 TUN；为避免测速和访问走代理，已中止。确认风险后加 -Force 继续。' 3
+        Fail '检测到 TUN 网卡。--noproxy 只能绕过 HTTP 代理，绕不过 TUN；为避免测速和访问走代理，已中止。关闭 TUN/透明代理后重试，或确认风险后加 -Force 继续。' 3
     }
     Say ''
 
@@ -708,7 +717,7 @@ function Invoke-Main {
             $details = ($preflight.Conflicts | ForEach-Object {
                     "第 $($_.Line) 行 [$($_.Reason)]：$($_.Hosts)"
                 }) -join '; '
-            Fail "hosts 中存在需要人工处理的映射，已中止且未修改：$details" 4
+            Fail "hosts 中存在需要人工处理的映射，已中止且未修改：$details。请按行号处理后重试。" 4
         }
     } catch {
         if ($script:FailCode) { throw }
@@ -722,7 +731,7 @@ function Invoke-Main {
     $probe = Resolve-ProbeEndpoint @probeArgs
     if ($probe.UsedFallback) { Say "警告：$($probe.Detail)" 'Yellow' }
     if (-not $probe.Ok) {
-        Fail ("探测端点不可用：$($probe.Url)（$($probe.Detail)）。请检查网络；也可以用 -ProbeUrl 换一个 Cloudflare 托管的 trace 地址。") 3
+        Fail ("探测端点不可用：$($probe.Url)（$($probe.Detail)）。请检查网络；也可以用 -ProbeUrl 换一个 Cloudflare 托管的 trace 地址。可以先运行 -Doctor 检查环境。") 3
     }
     Say "探测端点：$($probe.Host)" 'Gray'
     Say '延迟扫描和机房判断用的 trace 地址。' 'DarkGray'
@@ -735,7 +744,7 @@ function Invoke-Main {
     }
     $speedHost = (Split-SpeedTestUrl -UrlTemplate $SpeedTestUrl).Host
     if (-not $speedCheck.Ok) {
-        Fail ("测速端点不可用：$speedHost（$($speedCheck.Detail)）。可以换 -SpeedTestUrl，或检查网络/代理。") 3
+        Fail ("测速端点不可用：$speedHost（$($speedCheck.Detail)）。可以换 -SpeedTestUrl，或检查网络/代理。可以先运行 -Doctor 检查环境。") 3
     }
     if ($speedCheck.Skipped) {
         Say "测速端点：$speedHost（$($speedCheck.Detail)）" 'Yellow'
@@ -1182,6 +1191,7 @@ function Invoke-Main {
         } else {
             Say 'hosts 内容无变化，未写入。' 'Green'
         }
+        $script:RunChanged = [bool]$write.Changed
         $flush = Clear-DnsCache
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
     }
@@ -1216,7 +1226,14 @@ function Invoke-Main {
         }
         if ($parts.Count -eq 0) { $parts += '无变更' }
         $elapsed = if ($script:RunWatch) { Format-Duration -Duration $script:RunWatch.Elapsed } else { '' }
-        Say ("结果：{0} · 用时 {1}" -f ($parts -join ' · '), $elapsed) 'White'
+        $summaryText = "{0} · 用时 {1}" -f ($parts -join ' · '), $elapsed
+        Say "结果：$summaryText" 'White'
+        $script:RunSummaryLine = $summaryText
+        $script:RunCounts = @{
+            updated    = [int]$byAction['update']
+            kept       = [int]$byAction['keep'] + [int]$byAction['dns']
+            unverified = [int]$byAction['keep-unreachable'] + [int]$byAction['none'] + [int]$byAction['drop']
+        }
 
         Say ''
         Say '==== 逐域名决策 ====' 'Cyan'
@@ -1254,6 +1271,14 @@ if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not 
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
 
+$script:RunId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$script:RunStarted = Get-Date
+$script:RunMode = ''
+$script:RunHostsPath = ''
+$script:RunChanged = $false
+$script:RunCounts = @{ updated = 0; kept = 0; unverified = 0 }
+$script:RunSummaryLine = ''
+
 $script:ExitCode = 0
 try {
     Invoke-Main | Out-Null
@@ -1263,14 +1288,40 @@ try {
     Write-Host "错误：$msg" -ForegroundColor Red
     $script:Log.Add("ERROR: $msg")
     $script:ExitCode = if ($script:FailCode) { $script:FailCode } else { 1 }
+    if (-not $script:RunSummaryLine) { $script:RunSummaryLine = "失败：$msg" }
 }
 
 if ($script:ReportPathResolved) {
     try {
-        $script:Log | Out-File -LiteralPath $script:ReportPathResolved -Encoding utf8
+        $runModeText = switch ($script:RunMode) {
+            'write' { '写入 hosts' } 'dryrun' { 'DryRun' } 'plan' { 'Plan' } 'rollback' { '回滚' } default { '' }
+        }
+        $header = @(
+            "# Cloudflare-Hosts-Optimizer $ScriptVersion"
+            "runId: $($script:RunId)"
+            "模式: $runModeText"
+            "退出码: $($script:ExitCode)"
+            "结果: $($script:RunSummaryLine)"
+            "生成时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            '=== 详细日志 ==='
+        )
+        ($header + $script:Log) | Out-File -LiteralPath $script:ReportPathResolved -Encoding utf8
     } catch {
         Write-Host "警告：报告写入失败：$($_.Exception.Message)" -ForegroundColor Yellow
     }
+}
+
+# 运行摘要只用于菜单展示；失败不影响退出码
+if ($script:RunMode) {
+    try {
+        $run = New-RunSummaryRecord -Mode $script:RunMode -HostsPath $script:RunHostsPath `
+            -StartedAt $script:RunStarted -FinishedAt (Get-Date) -ExitCode $script:ExitCode `
+            -Changed ([bool]$script:RunChanged) -Updated ([int]$script:RunCounts.updated) `
+            -Kept ([int]$script:RunCounts.kept) -Unverified ([int]$script:RunCounts.unverified) `
+            -RunId $script:RunId
+        $null = Write-RunSummary -Path (Join-Path $Root 'last-run.json') -Run $run `
+            -Committed:([bool]$script:RunChanged) -CommitMode $script:RunMode
+    } catch { }
 }
 
 exit $script:ExitCode

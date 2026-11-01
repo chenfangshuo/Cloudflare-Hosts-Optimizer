@@ -93,6 +93,64 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
+# 菜单初始焦点：没有域名时停在“导入”，已有域名时停在“DryRun”（不是正式写入）。
+function Get-MenuInitialIndex {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Main', 'Import', 'Cfst', 'Task')][string]$Menu = 'Main',
+        [int]$DomainCount = 0
+    )
+    $items = @(Get-MenuItems -Menu $Menu)
+    if ($Menu -eq 'Main') {
+        $key = if ($DomainCount -gt 0) { '8' } else { '1' }
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            if ($items[$i].Key -eq $key) { return $i }
+        }
+    }
+    return 0
+}
+
+# 计划任务状态/安装参数/UAC 结果的纯展示逻辑（Menu.ps1 调用，便于测试）
+function Get-TaskStatusLines {
+    [CmdletBinding()]
+    param($Info)
+    if (-not $Info -or -not $Info.Available) { return @('任务状态：未知（缺少 ScheduledTasks 模块）') }
+    if (@($Info.Tasks).Count -eq 0) { return @('已注册任务：无') }
+    return @($Info.Tasks | ForEach-Object {
+            $detail = "$($_.TaskName)：$($_.State)"
+            if ($_.NextRun) { $detail += "，下次 $($_.NextRun)" }
+            if ($_.LastRun) { $detail += "，上次 $($_.LastRun)（结果 $($_.LastResult)）" }
+            $detail
+        })
+}
+
+# 安装任务前决定参数：任务已存在但用户取消 → 返回 $null（不执行）；
+# 确认覆盖 → 追加 -TaskForce。
+function Get-TaskInstallPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [bool]$TaskExists = $false,
+        [bool]$Confirmed = $false
+    )
+    if ($TaskExists -and -not $Confirmed) { return $null }
+    $args = @($Arguments)
+    if ($TaskExists) { $args += '-TaskForce' }
+    return [pscustomobject]@{ Arguments = $args }
+}
+
+function Format-ElevatedResult {
+    [CmdletBinding()]
+    param(
+        [System.Nullable[int]]$ExitCode,
+        [bool]$Cancelled = $false
+    )
+    if ($Cancelled) { return '已取消提权，可重新选择 9/10 再试。' }
+    if ($null -eq $ExitCode) { return '' }
+    if ($ExitCode -eq 0) { return '管理员窗口已结束（退出码 0）。' }
+    return "管理员窗口已结束（退出码 $ExitCode），请查看报告或重试。"
+}
+
 # 提权子窗口的命令行。用显式 -Elevated 开关：正式写入没有参数，不能靠
 # "-ElevatedArgs 非空" 来判断。
 function New-ElevatedArgumentLine {

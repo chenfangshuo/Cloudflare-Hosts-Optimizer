@@ -205,3 +205,55 @@ Describe 'New-ElevatedArgumentLine' {
         $line | Should -Match '-ElevatedArgs "-InstallTask -TaskMode AutoApply"'
     }
 }
+
+Describe 'Get-MenuInitialIndex' {
+    It '没有域名时停在导入' {
+        Get-MenuInitialIndex -Menu Main -DomainCount 0 | Should -Be 0
+    }
+
+    It '已有域名时停在 DryRun' {
+        $items = @(Get-MenuItems -Menu Main)
+        $expected = 0
+        for ($i = 0; $i -lt $items.Count; $i++) { if ($items[$i].Key -eq '8') { $expected = $i } }
+        Get-MenuInitialIndex -Menu Main -DomainCount 5 | Should -Be $expected
+    }
+
+    It '子菜单默认第一项' {
+        Get-MenuInitialIndex -Menu Import -DomainCount 9 | Should -Be 0
+    }
+}
+
+Describe '任务菜单纯逻辑' {
+    It '查询失败显示未知，不显示无任务' {
+        (@(Get-TaskStatusLines -Info ([pscustomobject]@{ Available = $false; Tasks = @() })))[0] | Should -Match '未知'
+    }
+
+    It '没有任务和无任务状态' {
+        (@(Get-TaskStatusLines -Info ([pscustomobject]@{ Available = $true; Tasks = @() })))[0] | Should -Match '无'
+    }
+
+    It '有任务时列出名称、状态和下次运行' {
+        $info = [pscustomobject]@{
+            Available = $true
+            Tasks     = @([pscustomobject]@{ TaskName = 'Cloudflare-Hosts-Optimizer DryRun'; State = 'Ready'; NextRun = '2026-11-15 10:00'; LastRun = ''; LastResult = $null })
+        }
+        $line = (@(Get-TaskStatusLines -Info $info))[0]
+        $line | Should -Match 'DryRun'
+        $line | Should -Match 'Ready'
+        $line | Should -Match '2026-11-15'
+    }
+
+    It '覆盖确认取消时不执行，确认后才带 -TaskForce' {
+        Get-TaskInstallPlan -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $true -Confirmed $false | Should -BeNullOrEmpty
+        $plan = Get-TaskInstallPlan -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $true -Confirmed $true
+        $plan.Arguments | Should -Contain '-TaskForce'
+        $plain = Get-TaskInstallPlan -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $false
+        $plain.Arguments | Should -Not -Contain '-TaskForce'
+    }
+
+    It 'UAC 结果文案' {
+        Format-ElevatedResult -ExitCode 0 | Should -Match '退出码 0'
+        Format-ElevatedResult -ExitCode 3 | Should -Match '退出码 3'
+        Format-ElevatedResult -ExitCode $null -Cancelled $true | Should -Match '取消'
+    }
+}

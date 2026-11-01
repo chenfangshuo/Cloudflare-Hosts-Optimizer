@@ -559,79 +559,94 @@ function Invoke-HostsRollbackLocked {
                 Where-Object { $_.Name -notlike 'hosts-initial-*' }
         })
 
-    # 按 manifest 的 hostsPath 过滤，确保沙箱备份不会被恢复到另一个目标
-    $valid = @()
+    # 候选：manifest 必须同时有 hostsPath（匹配当前目标）和 preHash；
+    # 无 manifest 的旧备份只允许“legacy 目录 + 系统 hosts”。
+    $candidates = @()
     foreach ($bak in $all) {
         $manifestPath = "$($bak.FullName).json"
         if (Test-Path -LiteralPath $manifestPath) {
             try {
                 $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-                if (-not $m.hostsPath) { continue }
+                if (-not $m.hostsPath -or -not $m.preHash) { continue }
                 $same = $false
                 try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
                 if (-not $same) { continue }
-                $valid += $bak
+                $candidates += [pscustomobject]@{
+                    File = $bak; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false
+                }
             } catch { continue }
         } else {
-            # 无 manifest 的旧版备份：只允许系统 hosts 从 legacy 目录使用
             $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
                 ([IO.Path]::GetFullPath($bak.DirectoryName) -ieq [IO.Path]::GetFullPath($LegacyBackupDir))
             if (-not ($isLegacy -and $isSystem)) { continue }
-            $valid += $bak
+            $candidates += [pscustomobject]@{ File = $bak; Manifest = $null; Committed = $false; Legacy = $true }
         }
     }
 
-    $baks = @($valid | Sort-Object Name -Descending)
+    $byName = @($candidates | Sort-Object { $_.File.Name } -Descending)
+    $committed = @($candidates | Where-Object { $_.Committed } | Sort-Object { $_.File.Name } -Descending)
 
     if ($BackupPath) {
         if (Test-Path -LiteralPath $BackupPath -PathType Container) {
-            $names = if ($baks.Count -gt 0) { ($baks | ForEach-Object { "  $($_.FullName)" }) -join "`n" } else { '（该目标的备份目录里没有可用备份）' }
+            $names = if ($byName.Count -gt 0) { ($byName | ForEach-Object { "  $($_.File.FullName)" }) -join "`n" } else { '（该目标的备份目录里没有可用备份）' }
             throw "指定的路径是目录，需要用具体的 .bak 文件。可用备份：`n$names"
         }
         if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
             throw "指定的备份不存在：$BackupPath"
         }
-        $latest = Get-Item -LiteralPath $BackupPath
-        $manifestPath = "$($latest.FullName).json"
+        $file = Get-Item -LiteralPath $BackupPath
+        $manifestPath = "$($file.FullName).json"
         if (-not (Test-Path -LiteralPath $manifestPath)) {
-            throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($latest.FullName)"
+            throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($file.FullName)"
         }
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
         $sameTarget = $false
-        if ($manifest.hostsPath) {
-            try { $sameTarget = ([IO.Path]::GetFullPath($manifest.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
+        if ($m.hostsPath) {
+            try { $sameTarget = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
         }
         if (-not $sameTarget) {
-            throw "该备份的目标是 '$($manifest.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
+            throw "该备份的目标是 '$($m.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
         }
+        if (-not $m.preHash) {
+            throw "该备份的 manifest 缺少 preHash，无法确认内容完整，已拒绝：$($file.FullName)"
+        }
+        $selected = [pscustomobject]@{ File = $file; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false }
     } else {
-        if ($baks.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
-        $latest = $baks[0]
-        $manifestPath = "$($latest.FullName).json"
-        $manifest = $null
-        if (Test-Path -LiteralPath $manifestPath) {
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-        }
+        if ($byName.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
+        # 优先最新的已完成事务；没有已完成事务时才退回最新的未完成备份
+        $selected = if ($committed.Count -gt 0) { $committed[0] } else { $byName[0] }
     }
 
-    # 备份内容必须与 manifest 的 preHash 一致；损坏/被替换的备份不能用来覆盖 hosts
-    $backupBytes = [IO.File]::ReadAllBytes($latest.FullName)
+    # 备份内容必须与 preHash 一致：损坏/被替换的备份永远不能用来覆盖 hosts（-Force 也不行）
+    $backupBytes = [IO.File]::ReadAllBytes($selected.File.FullName)
     $backupHash = Get-Sha256Hex -Bytes $backupBytes
-    if ($manifest) {
-        if (-not $manifest.preHash) {
-            throw "备份 manifest 缺少 preHash，无法确认内容完整，已拒绝：$($latest.FullName)"
-        }
-        if ($backupHash -ne [string]$manifest.preHash) {
-            throw "备份内容与 manifest 不一致（可能已损坏或被替换），已拒绝：$($latest.FullName)"
+    if ($selected.Manifest -and $backupHash -ne [string]$selected.Manifest.preHash) {
+        throw "备份内容与 manifest 不一致（可能已损坏或被替换），已拒绝：$($selected.File.FullName)"
+    }
+
+    $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
+
+    # 当前内容已经等于备份内容：无变化成功，不重复替换
+    if ($currentHash -eq $backupHash) {
+        return [pscustomobject]@{
+            Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime; Unchanged = $true
         }
     }
 
-    # 当前 hosts 在最后一次写入后被其他程序改过时，默认不覆盖
-    if ($manifest -and $manifest.postHash -and -not $Force) {
-        $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
-        if ($currentHash -ne [string]$manifest.postHash) {
-            throw 'hosts 在最后一次写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
+    # 覆盖保护：用“最新已完成事务的 postHash”比对当前文件，而不是所选备份自己的
+    # postHash。-Force 只绕过这一步；目标归属和备份完整性已经在上面检查过。
+    $guard = $null
+    if ($committed.Count -gt 0) { $guard = [string]$committed[0].Manifest.postHash }
+    elseif ($selected.Manifest -and $selected.Manifest.postHash) { $guard = [string]$selected.Manifest.postHash }
+
+    $allowed = [bool]$Force
+    if (-not $allowed -and $guard -and $currentHash -eq $guard) { $allowed = $true }
+    # 回滚过一次之后再回滚同一份备份会命中上面的“无变化”分支，不需要额外判断 preHash
+    if (-not $allowed) {
+        if ($selected.Legacy -or -not $guard) {
+            throw '无法确认当前 hosts 是否被改过（没有可参考的已完成事务）。确认要覆盖请加 -Force。'
         }
+        throw 'hosts 在最后一次成功写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
     }
 
     $dir = Split-Path -Parent $HostsPath
@@ -650,7 +665,9 @@ function Invoke-HostsRollbackLocked {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
 
-    return [pscustomobject]@{ Restored = $latest.FullName; RestoredAt = $latest.CreationTime }
+    return [pscustomobject]@{
+        Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime; Unchanged = $false
+    }
 }
 
 # 回滚与写入共用同一个全局互斥锁，避免“检查后又被另一个实例提交”的窗口

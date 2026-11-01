@@ -237,9 +237,18 @@ Describe 'Resolve-SwitchConfirmation' {
         $r.Reason | Should -Be 'baseline-failed-on-retest'
     }
     It '类别更好时只要求候选不失败' {
-        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.60 -Reason better-class
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.60 -BaselineClass 'waf' -CandidateClass 'ok' -Reason better-class
         $r.Switch | Should -BeTrue
         $r.Reason | Should -Be 'confirmed-class'
+    }
+    It '类别打平后不再沿用首次的 better-class' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.30 -BestTtfb 0.80 -BaselineClass 'ok' -CandidateClass 'ok' -Reason better-class
+        $r.Switch | Should -BeFalse
+    }
+    It 'baseline-no-ttfb 复测恢复正常后按门槛判断' {
+        # 首次基线没有 TTFB，复测基线 300ms、候选 800ms：不应切换
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0 -BaseSamples @(0.30) -BestTtfb 0.80 -CandidateSamples @(0.80) -Reason baseline-no-ttfb
+        $r.Switch | Should -BeFalse
     }
     It '绝对毫秒门槛拦下快基线的小改善' {
         # 基线 80ms、候选 66ms：17.5% 达到百分比门槛，但只差 14ms
@@ -249,7 +258,7 @@ Describe 'Resolve-SwitchConfirmation' {
     It '接受 baseline-failed，不因参数校验中止' {
         $r = Resolve-SwitchConfirmation -BaseTtfb 0.50 -BestTtfb 0.20 -Reason baseline-failed
         $r.Switch | Should -BeTrue
-        $r.Reason | Should -Be 'confirmed-class'
+        $r.Reason | Should -Be 'confirmed'
     }
 }
 

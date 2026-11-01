@@ -27,6 +27,8 @@ $CfstDir = Join-Path $Root 'cfst'
 . (Join-Path $Root 'lib\Probe.ps1')
 . (Join-Path $Root 'lib\CfstInstaller.ps1')
 . (Join-Path $Root 'lib\Menu.ps1')
+. (Join-Path $Root 'lib\RunSummary.ps1')
+. (Join-Path $Root 'lib\Doctor.ps1')
 
 function Get-PwshPath {
     $p = [Environment]::ProcessPath
@@ -109,27 +111,48 @@ function Invoke-Elevated {
     $argLine = New-ElevatedArgumentLine -MenuScript $menuScript -Arguments $Arguments
     Write-Host '会先弹出 UAC；请在管理员窗口中查看进度，结束后按 Enter 关闭该窗口。' -ForegroundColor Yellow
     try {
-        Start-Process -FilePath $script:Pwsh -Verb RunAs -Wait -WorkingDirectory $Root -ArgumentList $argLine
-        return $true
+        $p = Start-Process -FilePath $script:Pwsh -Verb RunAs -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argLine
+        if ($p) {
+            $text = Format-ElevatedResult -ExitCode $p.ExitCode
+            Write-Host $text -ForegroundColor $(if ($p.ExitCode -eq 0) { 'Green' } else { 'Yellow' })
+        }
+        return $p
     } catch {
         $code = $null
         try { $code = $_.Exception.NativeErrorCode } catch { }
         if ($code -eq 1223 -or $_.Exception.Message -match '1223|cancel|取消') {
-            Write-Host '已取消提权。' -ForegroundColor Yellow
+            Write-Host (Format-ElevatedResult -ExitCode $null -Cancelled $true) -ForegroundColor Yellow
         } else {
             Write-Host "提权失败：$($_.Exception.Message)" -ForegroundColor Red
         }
-        return $false
+        return $null
     }
 }
 
 function Get-MenuHeader {
-    param([switch]$Color)
-    $st = Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
+    param($Status, [switch]$Color)
+    $st = if ($Status) { $Status } else {
+        Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
+    }
     $dot = [string][char]0x00B7
     $title = if ($script:Version) { "Cloudflare-Hosts-Optimizer $($script:Version)" } else { 'Cloudflare-Hosts-Optimizer' }
+
+    $summary = Read-RunSummary -Path (Join-Path $Root 'last-run.json')
+    $runLines = Format-RunSummaryLine -Summary $summary -SystemHostsPath $HostsPath -ReportPath $ReportPath
+
+    $hint = ''
+    $hintKind = ''
+    if ($st.Listed -eq 0) {
+        $hint = '下一步：按 1 导入或编辑网页域名（只填网页域名，不填独立 tracker）'
+        $hintKind = 'warn'
+    } elseif ($st.Cfst -eq '未安装') {
+        $hint = '可直接按 8 试跑；装 CFST 可改善候选覆盖（按 3）'
+        $hintKind = 'dim'
+    }
+
     if ($Color) {
         $green = "`e[32m"; $yellow = "`e[33m"; $red = "`e[31m"; $reset = "`e[0m"
+        $dim = "`e[90m"
         $sep = "`e[90m$dot`e[0m"
         $titleLine = "`e[1;36m$title`e[0m"
         $listedValue = if ($st.Listed -gt 0) { "$green$($st.Listed) 个$reset" } else { "$yellow0 个$reset" }
@@ -141,28 +164,31 @@ function Get-MenuHeader {
             $hostsText = "hosts 已写入 $managedValue"
         }
         $cfstValue = if ($st.Cfst -eq '已安装') { "$green$($st.Cfst)$reset" } else { "$yellow$($st.Cfst)$reset" }
-        $lastText = if ($st.LastRun) { " $sep 上次运行 $($st.LastRun)" } else { '' }
-        $lines = @(
-            $titleLine
-            "域名 $listedValue$invalidText$sep $hostsText$sep CFST $cfstValue$lastText"
-        )
-        if (-not $script:IsAdmin) {
-            $lines += "`e[90m当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。`e[0m"
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add($titleLine)
+        $lines.Add("域名 $listedValue$invalidText$sep $hostsText$sep CFST $cfstValue")
+        if ($runLines.LastRun) { $lines.Add("$dim$($runLines.LastRun)$reset") }
+        if ($runLines.LastCommit) { $lines.Add("$dim$($runLines.LastCommit)$reset") }
+        if ($hint) {
+            $hintColor = if ($hintKind -eq 'warn') { $yellow } else { $dim }
+            $lines.Add("$hintColor$hint$reset")
         }
-        return $lines
+        if (-not $script:IsAdmin) {
+            $lines.Add("$dim当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。$reset")
+        }
+        return @($lines)
     }
 
     $hostsText = if ($st.HostsError) { 'hosts 结构异常' } else { "hosts 已写入 $($st.Managed) 个" }
     $invalidText = if ($st.Invalid -gt 0) { "（$($st.Invalid) 个非法）" } else { '' }
-    $lastText = if ($st.LastRun) { "$dot 上次运行 $($st.LastRun)" } else { '' }
-    $lines = @(
-        $title
-        "域名 $($st.Listed) 个$invalidText $dot $hostsText $dot CFST $($st.Cfst) $lastText"
-    )
-    if (-not $script:IsAdmin) {
-        $lines += '当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。'
-    }
-    return $lines
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add($title)
+    $lines.Add("域名 $($st.Listed) 个$invalidText $dot $hostsText $dot CFST $($st.Cfst)")
+    if ($runLines.LastRun) { $lines.Add($runLines.LastRun) }
+    if ($runLines.LastCommit) { $lines.Add($runLines.LastCommit) }
+    if ($hint) { $lines.Add($hint) }
+    if (-not $script:IsAdmin) { $lines.Add('当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。') }
+    return @($lines)
 }
 
 function Show-Menu {
@@ -176,10 +202,10 @@ function Show-Menu {
 # 原地重绘（不使用备用屏幕）：菜单画在当前位置，选中行反显；
 # 选定后先擦掉整块菜单，动作输出从菜单原来的位置开始，不会被菜单内容覆盖。
 function Show-TuiMenu {
-    param([string]$Menu, [string[]]$Header = @())
+    param([string]$Menu, [string[]]$Header = @(), [int]$InitialIndex = 0)
     $items = @(Get-MenuItems -Menu $Menu)
     if ($items.Count -eq 0) { return $null }
-    $selected = 0
+    $selected = if ($InitialIndex -ge 0 -and $InitialIndex -lt $items.Count) { $InitialIndex } else { 0 }
     $top = -1
     $frameCount = 0
     try {
@@ -248,9 +274,11 @@ function Show-TuiMenu {
 function Read-MenuChoice {
     param([string]$Menu, [string[]]$ExtraHeader = @())
     Clear-MenuScreen
-    $header = @(Get-MenuHeader -Color:$script:Tui) + @($ExtraHeader)
+    $st = Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
+    $header = @(Get-MenuHeader -Status $st -Color:$script:Tui) + @($ExtraHeader)
     if ($script:Tui) {
-        return Show-TuiMenu -Menu $Menu -Header $header
+        $initial = if ($Menu -eq 'Main') { Get-MenuInitialIndex -Menu $Menu -DomainCount $st.Listed } else { 0 }
+        return Show-TuiMenu -Menu $Menu -Header $header -InitialIndex $initial
     }
     Write-Host ''
     if ($header.Count -gt 0) { Write-Host $header[0] -ForegroundColor Cyan }
@@ -268,7 +296,10 @@ function Invoke-ScriptAction {
     param($Spec)
     if ($Spec.Confirm -and -not (Confirm-Action $Spec.Label)) { return }
     if ($Spec.RequiresAdmin -and -not $script:IsAdmin) {
-        [void](Invoke-Elevated -Arguments @($Spec.Arguments))
+        $p = Invoke-Elevated -Arguments @($Spec.Arguments)
+        if ($p -and $p.ExitCode -ne 0) {
+            Write-Host '管理员窗口返回非 0，请查看报告或重试。' -ForegroundColor Yellow
+        }
         return
     }
     # 菜单里的 DryRun 也写报告，方便「查看上次报告」；命令行 DryRun 默认仍然不写
@@ -372,9 +403,29 @@ function Show-Report {
         Write-Host '还没有报告：先跑一次 DryRun 或正式写入。' -ForegroundColor Yellow
         return
     }
+    $lines = @(Get-Content -LiteralPath $ReportPath)
+    $marker = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -eq '=== 详细日志 ===') { $marker = $i; break }
+    }
+    $head = if ($marker -ge 0) { @($lines[0..$marker]) } else { @() }
+
+    $summary = Read-RunSummary -Path (Join-Path $Root 'last-run.json')
+    $reportRun = ($head | Where-Object { $_ -like 'runId:*' } | Select-Object -First 1)
+    if ($reportRun) { $reportRun = ($reportRun -replace '^runId:\s*', '').Trim() }
+    if ($summary -and $summary.lastRun -and $reportRun -and $reportRun -ne [string]$summary.lastRun.runId) {
+        Write-Host '提示：以下为较早报告；最近一次运行（或回滚）没有覆盖它。' -ForegroundColor Yellow
+    }
+
     $time = (Get-Item -LiteralPath $ReportPath).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
     Write-Host "报告：$ReportPath（$time）" -ForegroundColor DarkGray
-    Get-Content -LiteralPath $ReportPath -Tail 80 | ForEach-Object { Write-Host $_ }
+    if ($lines.Count -le 80) {
+        foreach ($l in $lines) { Write-Host $l }
+        return
+    }
+    foreach ($l in $head) { Write-Host $l }
+    Write-Host '...' -ForegroundColor DarkGray
+    foreach ($l in @($lines | Select-Object -Last 40)) { Write-Host $l }
 }
 
 function Show-CfstMenu {
@@ -416,8 +467,47 @@ function Show-CfstMenu {
 
 function Show-TaskMenu {
     while ($true) {
-        $spec = Read-MenuChoice -Menu Task
+        $info = Get-ScheduledTaskDoctorInfo
+        $status = @(Get-TaskStatusLines -Info $info)
+        $spec = Read-MenuChoice -Menu Task -ExtraHeader $status
         if (-not $spec -or $spec.Kind -eq 'Back') { return }
+
+        # 安装：同名任务已存在时确认，确认后加 -TaskForce
+        if ($spec.Arguments -contains '-InstallTask') {
+            $mode = if ($spec.Arguments -contains 'DryRun') { 'DryRun' } else { 'AutoApply' }
+            $name = "Cloudflare-Hosts-Optimizer $mode"
+            $exists = [bool]($info.Available -and @($info.Tasks | Where-Object { $_.TaskName -eq $name }).Count -gt 0)
+            $confirmed = $false
+            if ($exists) {
+                $confirmed = Confirm-Action "覆盖已存在的任务「$name」"
+            }
+            $plan = Get-TaskInstallPlan -Arguments @($spec.Arguments) -TaskExists $exists -Confirmed $confirmed
+            if (-not $plan) { continue }
+            if ($spec.RequiresAdmin -and -not $script:IsAdmin) {
+                $p = Invoke-Elevated -Arguments $plan.Arguments
+                if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
+            } else {
+                $exit = Invoke-Child -FilePath $MainScript -Arguments $plan.Arguments
+                Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+            }
+            Pause-Action
+            continue
+        }
+
+        # 卸载：存在 AutoApply 任务且不是管理员时，走提权
+        if ($spec.Arguments -contains '-UninstallTask') {
+            $hasAuto = [bool]($info.Available -and @($info.Tasks | Where-Object { $_.TaskName -like '*AutoApply' }).Count -gt 0)
+            if ($hasAuto -and -not $script:IsAdmin) {
+                $p = Invoke-Elevated -Arguments @('-UninstallTask')
+                if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
+            } else {
+                $exit = Invoke-Child -FilePath $MainScript -Arguments @('-UninstallTask')
+                Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+            }
+            Pause-Action
+            continue
+        }
+
         [void](Invoke-Choice -Spec $spec)
     }
 }

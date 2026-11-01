@@ -37,9 +37,16 @@
 ## 写入与回滚
 
 - 写入：全局互斥锁 → 提交前哈希检查 → 临时文件 → 原子替换 → 读回校验 → 刷新 DNS。
-- 如果 hosts 在最后一次写入后被其他程序改过，`-Rollback` 默认拒绝覆盖，`-Force` 才允许。
+- 回滚也使用同一把全局互斥锁。
+- 自动回滚优先选择最近的**已完成事务**（manifest 有 `postHash`）；没有已完成事务时才
+  退回最新的未完成备份。缺 `hostsPath`/`preHash` 的备份不参与自动选择。
+- 覆盖保护与“选哪份备份”分开：用**最新已完成事务的 `postHash`** 判断当前 hosts 是否
+  在最后一次成功写入后被改过；被改过时默认拒绝，`-Force` 才允许。`-Force` 只绕过这一项，
+  备份内容损坏或目标路径不一致仍然直接拒绝。
+- 当前 hosts 已经等于所选备份内容时，视为无变化成功，不重复替换。
+- 无 manifest 的旧备份只允许“legacy 目录 + 系统 hosts”；当前内容与备份不同时同样需要
+  `-Force`。
+- `-Rollback -RollbackFrom <hosts-*.bak>` 恢复到指定的更早备份：仍校验 manifest 的
+  `hostsPath` 和 `preHash`，但覆盖检查仍基于最新成功提交（而不是所选备份自己的
+  `postHash`），所以正常的历史恢复不需要 `-Force`。
 - `-Rollback` 不依赖 `domains.txt`，域名清单丢失时仍可恢复。
-- `-Rollback -RollbackFrom <hosts-*.bak>` 恢复到指定的更早备份。它仍然校验 manifest：
-  缺少 manifest、或 manifest 里的 `hostsPath` 与当前目标不一致时直接拒绝；传目录会报错
-  并列出该目标的可用备份。指定备份时不再做 postHash 校验（那个校验只对“最近一次”有意义），
-  因为你是明确要退回某个历史状态。

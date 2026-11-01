@@ -842,18 +842,27 @@ function Resolve-SwitchConfirmation {
     if ($BaselineRetestFailed) {
         return [pscustomobject]@{ Switch = $true; Reason = 'baseline-failed-on-retest'; Pct = $null; BaseMs = $null; BestMs = $null }
     }
-    # 复核时候选类别比基线差（例如 ok -> waf）：不切换
-    if ($BaselineClass -and $CandidateClass -and
-        (Get-CfClassRank -Class $CandidateClass) -gt (Get-CfClassRank -Class $BaselineClass)) {
-        return [pscustomobject]@{ Switch = $false; Reason = 'candidate-degraded'; Pct = $null; BaseMs = $null; BestMs = $null }
-    }
-    if ($Reason -ne 'improved') {
-        return [pscustomobject]@{ Switch = $true; Reason = 'confirmed-class'; Pct = $null; BaseMs = $null; BestMs = $null }
+
+    # 复核时重新比较类别：候选更差拒绝，更好直接确认，打平回到时间门槛。
+    # 不能沿用首次的 Reason（例如首次 better-class，复核时基线已恢复正常）。
+    $baseRank = if ($BaselineClass) { Get-CfClassRank -Class $BaselineClass } else { $null }
+    $candRank = if ($CandidateClass) { Get-CfClassRank -Class $CandidateClass } else { $null }
+    if ($null -ne $baseRank -and $null -ne $candRank) {
+        if ($candRank -gt $baseRank) {
+            return [pscustomobject]@{ Switch = $false; Reason = 'candidate-degraded'; Pct = $null; BaseMs = $null; BestMs = $null }
+        }
+        if ($candRank -lt $baseRank) {
+            return [pscustomobject]@{ Switch = $true; Reason = 'confirmed-class'; Pct = $null; BaseMs = $null; BestMs = $null }
+        }
     }
 
     $baseMedian = Get-Median -Values (@($BaseTtfb) + @($BaseSamples))
     $bestMedian = Get-Median -Values (@($BestTtfb) + @($CandidateSamples))
     if ($null -eq $baseMedian -or $null -eq $bestMedian -or $baseMedian -le 0) {
+        # 确实没有可比的基线时间：只有原本就是 baseline-no-ttfb 才允许确认
+        if ($Reason -eq 'baseline-no-ttfb') {
+            return [pscustomobject]@{ Switch = $true; Reason = 'confirmed-class'; Pct = $null; BaseMs = $null; BestMs = $null }
+        }
         return [pscustomobject]@{ Switch = $false; Reason = 'not-confirmed'; Pct = $null; BaseMs = $null; BestMs = $null }
     }
 
