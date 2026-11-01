@@ -524,18 +524,11 @@ function Test-BackupSourcePathTrusted {
     $fileDir = Split-Path -Parent $Path
     if (-not $fileDir) { return $false }
 
-    $inside = Test-SamePath -Left $fileDir -Right $backupRoot
-    if (-not $inside) {
-        try {
-            $inside = [IO.Path]::GetFullPath($fileDir).StartsWith(
-                [IO.Path]::GetFullPath($backupRoot).TrimEnd('\') + '\',
-                [StringComparison]::OrdinalIgnoreCase)
-        } catch { $inside = $false }
-    }
-    if (-not $inside) { return $false }
-
+    # 系统 hosts 的写入只在 backup 根生成备份，因此显式恢复也只接受“直属 backup 根”
+    # 的文件；嵌套目录（例如旧沙箱的 targets\<hash>）需要 -AllowUntrustedBackup。
+    # 这样不需要检查 backup 与末级之间每一层中间目录的 ACL。
+    if (-not (Test-SamePath -Left $fileDir -Right $backupRoot)) { return $false }
     if (-not (Test-BackupPathTrusted -Path $backupRoot -AppRoot $app)) { return $false }
-    if (-not (Test-BackupPathTrusted -Path $fileDir -AppRoot $app)) { return $false }
     return $true
 }
 
@@ -605,6 +598,15 @@ function Get-HostsBackupPlan {
     }
 }
 
+function Assert-NotReparsePoint {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "路径是重解析点，已中止：$Path"
+    }
+}
+
 # 只对“本次新建”的目录调用；已有目录绝不走这里。
 function Set-BackupDirectoryAcl {
     [CmdletBinding()]
@@ -629,7 +631,10 @@ function Initialize-HostsBackupDirectory {
                 throw "备份根目录不可信：$($Plan.AppRoot)。请删除或修复该目录（owner 必须是 Administrators/SYSTEM），或改用沙箱 -HostsPath。"
             }
         } else {
-            New-Item -ItemType Directory -Force -Path $Plan.AppRoot -ErrorAction Stop | Out-Null
+            # 不用 -Force：Test-Path 说“不存在”之后仍可能有其他进程抢先建目录/junction；
+            # 创建冲突直接中止，绝不复用别人建的路径。
+            New-Item -ItemType Directory -Path $Plan.AppRoot -ErrorAction Stop | Out-Null
+            Assert-NotReparsePoint -Path $Plan.AppRoot
             # 新建目录的 owner 取决于提权令牌；显式交给 Administrators，避免 owner 是个人账户时被判不可信
             Set-BackupDirectoryAcl -Path $Plan.AppRoot
             if (-not (Test-BackupPathTrusted -Path $Plan.AppRoot)) {
@@ -646,7 +651,9 @@ function Initialize-HostsBackupDirectory {
             throw "备份目录不可信：$($entry.Dir)。请删除或修复该目录（owner 必须是 Administrators/SYSTEM），或改用沙箱 -HostsPath。"
         }
     } else {
-        New-Item -ItemType Directory -Force -Path $entry.Dir -ErrorAction Stop | Out-Null
+        # 同样不用 -Force：创建冲突（别人抢先建了目录/junction）直接中止
+        New-Item -ItemType Directory -Path $entry.Dir -ErrorAction Stop | Out-Null
+        Assert-NotReparsePoint -Path $entry.Dir
         if ($isProgramData) {
             # 只加固本次新建的目录；已存在的目录不走这条分支
             Set-BackupDirectoryAcl -Path $entry.Dir

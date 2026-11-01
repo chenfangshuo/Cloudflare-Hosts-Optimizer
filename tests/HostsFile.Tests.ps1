@@ -1121,6 +1121,45 @@ Describe 'R1-01 已有备份目录先检查再加固' {
         { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw '*不可信*'
         Should -Invoke Set-BackupDirectoryAcl -Times 0
     }
+
+    It 'R2-01 新建冲突时中止，不进入加固' {
+        $app = Join-Path $TestDrive 'r201-race-app'
+        $backup = Join-Path $app 'backup'
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-Path { $false }
+        Mock New-Item { throw '另一个进程抢先创建了路径' }
+        Mock Set-BackupDirectoryAcl { }
+
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+    }
+
+    It 'R2-01 新建后被换成 junction 时在加固前拒绝' {
+        $app = Join-Path $TestDrive 'r201-j-app'
+        $target = Join-Path $TestDrive 'r201-j-target'
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+        New-Item -ItemType Junction -Path $app -Target $target | Out-Null
+        $backup = Join-Path $app 'backup'
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-Path { $false }
+        Mock New-Item { }
+        Mock Set-BackupDirectoryAcl { }
+
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw '*重解析点*'
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+    }
+
+    It 'R2-01 正常新建仍会创建并加固' {
+        $app = Join-Path $TestDrive 'r201-new-app'
+        $backup = Join-Path $app 'backup'
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-BackupPathTrusted { $true }
+        Mock Set-BackupDirectoryAcl { }
+
+        Initialize-HostsBackupDirectory -Plan $plan | Should -Be $backup
+        Should -Invoke Set-BackupDirectoryAcl -Times 2
+        Test-Path -LiteralPath $backup | Should -BeTrue
+    }
 }
 
 Describe 'R1-02 显式恢复的来源目录' {
@@ -1150,6 +1189,17 @@ Describe 'R1-02 显式恢复的来源目录' {
         New-Item -ItemType Directory -Force -Path $backup, $outside | Out-Null
         $f = Join-Path $outside 'hosts-20260101-000000-aaaaaaaa.bak'
         Set-Content -LiteralPath $f -Value 'x'
+
+        Test-BackupSourcePathTrusted -Path $f -AppRoot $app | Should -BeFalse
+    }
+
+    It 'R2-02 来源在 backup 的嵌套子目录时拒绝' {
+        $app = Join-Path $TestDrive 'r202-app'
+        $nested = Join-Path $app 'backup\targets\abc123'
+        New-Item -ItemType Directory -Force -Path $nested | Out-Null
+        $f = Join-Path $nested 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $f -Value 'x'
+        Mock Test-BackupPathTrusted { $true }
 
         Test-BackupSourcePathTrusted -Path $f -AppRoot $app | Should -BeFalse
     }
