@@ -219,3 +219,18 @@ Describe 'Get-TaskScriptPath' {
         Get-TaskScriptPath -Arguments '-NoProfile -Command "x"' | Should -Be ''
     }
 }
+
+Describe 'Get-DoctorBackupDir' {
+    It '沙箱目标使用仓库 targets 目录' {
+        $h = Join-Path $TestDrive 'sandbox-hosts'
+        $r = Get-DoctorBackupDir -HostsPath $h -FallbackRoot $TestDrive
+        $r.Error | Should -BeNullOrEmpty
+        $r.Dir | Should -Match ([regex]::Escape((Join-Path $TestDrive 'backup\targets\')))
+    }
+
+    It '系统目标使用 ProgramData backup' {
+        $r = Get-DoctorBackupDir -HostsPath (Get-SystemHostsPath)
+        $r.Error | Should -BeNullOrEmpty
+        $r.Dir | Should -Be (Join-Path (Get-BackupRoot) 'backup')
+    }
+}

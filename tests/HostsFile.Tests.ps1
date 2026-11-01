@@ -1068,3 +1068,122 @@ Describe 'D02 不可信例外只限用户点名的那一份' {
         $m.state | Should -Be 'pending'
     }
 }
+
+Describe 'R1-01 已有备份目录先检查再加固' {
+    BeforeAll {
+        function New-R101Plan {
+            param([string]$App, [string]$Backup)
+            return [pscustomobject]@{
+                IsSystem        = $true
+                AppRoot         = $App
+                ProgramDataBase = $Backup
+                Dirs            = @([pscustomobject]@{ Base = $Backup; Dir = $Backup })
+            }
+        }
+    }
+
+    It '已有不可信目录：不加固、不写探针' {
+        $app = Join-Path $TestDrive 'r101-app'
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-BackupPathTrusted { param($Path, $AppRoot) return ($Path -ieq $app) }
+        Mock Set-BackupDirectoryAcl { }
+
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw '*不可信*'
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+        @(Get-ChildItem -LiteralPath $backup -Filter '.cfo-write-test-*').Count | Should -Be 0
+    }
+
+    It '已有可信目录：只复查，不再加固' {
+        $app = Join-Path $TestDrive 'r101-app-ok'
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-BackupPathTrusted { $true }
+        Mock Set-BackupDirectoryAcl { }
+
+        Initialize-HostsBackupDirectory -Plan $plan | Should -Be $backup
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+        @(Get-ChildItem -LiteralPath $backup -Filter '.cfo-write-test-*').Count | Should -Be 0
+    }
+
+    It '已有 junction 在加固和探针之前拒绝' {
+        $app = Join-Path $TestDrive 'r101-app-j'
+        $target = Join-Path $TestDrive 'r101-target'
+        New-Item -ItemType Directory -Force -Path $app, $target | Out-Null
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Junction -Path $backup -Target $target | Out-Null
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-BackupPathTrusted { param($Path, $AppRoot) return ($Path -ieq $app) }
+        Mock Set-BackupDirectoryAcl { }
+
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw '*不可信*'
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+    }
+}
+
+Describe 'R1-02 显式恢复的来源目录' {
+    BeforeAll {
+        function New-R102Backup {
+            param([string]$Dir, [string]$Hosts, [string]$Content)
+            New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+            $bak = Join-Path $Dir 'hosts-20260101-000000-aaaaaaaa.bak'
+            [IO.File]::WriteAllText($bak, $Content)
+            $hash = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($Content))
+            @{
+                createdAt    = '2026-01-01T00:00:00.0000000+08:00'
+                hostsPath    = $Hosts
+                preHash      = $hash
+                intendedHash = $null
+                postHash     = $null
+                state        = 'committed'
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+            return $bak
+        }
+    }
+
+    It '来源在 ProgramData backup 目录之外时拒绝' {
+        $app = Join-Path $TestDrive 'r102-app'
+        $backup = Join-Path $app 'backup'
+        $outside = Join-Path $TestDrive 'r102-outside'
+        New-Item -ItemType Directory -Force -Path $backup, $outside | Out-Null
+        $f = Join-Path $outside 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $f -Value 'x'
+
+        Test-BackupSourcePathTrusted -Path $f -AppRoot $app | Should -BeFalse
+    }
+
+    It '来源在 backup 目录内但目录不可信时拒绝' {
+        $app = Join-Path $TestDrive 'r102-app-2'
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $f = Join-Path $backup 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $f -Value 'x'
+        Mock Test-BackupPathTrusted { $false }
+
+        Test-BackupSourcePathTrusted -Path $f -AppRoot $app | Should -BeFalse
+    }
+
+    It '来源在 backup 目录内且目录可信时通过' {
+        $app = Join-Path $TestDrive 'r102-app-3'
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $f = Join-Path $backup 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $f -Value 'x'
+        Mock Test-BackupPathTrusted { $true }
+
+        Test-BackupSourcePathTrusted -Path $f -AppRoot $app | Should -BeTrue
+    }
+
+    It '回滚拒绝不可信来源且 hosts 不变' {
+        $h = Join-Path $TestDrive 'r102-hosts'
+        [IO.File]::WriteAllText($h, 'CURRENT')
+        $bak = New-R102Backup -Dir (Join-Path $TestDrive 'r102-other') -Hosts $h -Content 'PREVIOUS'
+        Mock Test-SystemHostsPath { $true }
+        Mock Test-BackupSourcePathTrusted { $false }
+
+        { Invoke-HostsRollback -HostsPath $h -BackupDir @() -BackupPath $bak } | Should -Throw '*ProgramData*'
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'CURRENT'
+    }
+}

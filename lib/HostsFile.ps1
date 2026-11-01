@@ -510,6 +510,35 @@ function Test-BackupFileTrusted {
     }
 }
 
+# 显式恢复的来源：文件必须在 ProgramData backup 之下，且该目录可信。
+# -AppRoot 可注入，方便测试；正常调用使用真实的 ProgramData 应用根。
+function Test-BackupSourcePathTrusted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$AppRoot
+    )
+    $app = if ($AppRoot) { $AppRoot } else { Get-BackupRoot }
+    if (-not $app) { return $false }
+    $backupRoot = Join-Path $app 'backup'
+    $fileDir = Split-Path -Parent $Path
+    if (-not $fileDir) { return $false }
+
+    $inside = Test-SamePath -Left $fileDir -Right $backupRoot
+    if (-not $inside) {
+        try {
+            $inside = [IO.Path]::GetFullPath($fileDir).StartsWith(
+                [IO.Path]::GetFullPath($backupRoot).TrimEnd('\') + '\',
+                [StringComparison]::OrdinalIgnoreCase)
+        } catch { $inside = $false }
+    }
+    if (-not $inside) { return $false }
+
+    if (-not (Test-BackupPathTrusted -Path $backupRoot -AppRoot $app)) { return $false }
+    if (-not (Test-BackupPathTrusted -Path $fileDir -AppRoot $app)) { return $false }
+    return $true
+}
+
 # 系统 hosts 的自动挑选只保留可信目录；沙箱不做限制。
 function Select-TrustedBackupDirs {
     [CmdletBinding()]
@@ -576,6 +605,15 @@ function Get-HostsBackupPlan {
     }
 }
 
+# 只对“本次新建”的目录调用；已有目录绝不走这里。
+function Set-BackupDirectoryAcl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    & takeown.exe /F $Path /A 2>$null | Out-Null
+    & icacls $Path /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "无法加固目录权限：$Path" }
+}
+
 # 准备唯一一个备份目录：新目录创建并加固；已存在目录只复查，不可信直接失败。
 function Initialize-HostsBackupDirectory {
     [CmdletBinding()]
@@ -593,24 +631,29 @@ function Initialize-HostsBackupDirectory {
         } else {
             New-Item -ItemType Directory -Force -Path $Plan.AppRoot -ErrorAction Stop | Out-Null
             # 新建目录的 owner 取决于提权令牌；显式交给 Administrators，避免 owner 是个人账户时被判不可信
-            & takeown.exe /F $Plan.AppRoot /A 2>$null | Out-Null
-            & icacls $Plan.AppRoot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "无法加固备份根目录：$($Plan.AppRoot)" }
+            Set-BackupDirectoryAcl -Path $Plan.AppRoot
             if (-not (Test-BackupPathTrusted -Path $Plan.AppRoot)) {
                 throw "备份根目录加固后仍不可信：$($Plan.AppRoot)"
             }
         }
     }
 
-    $created = $false
-    if (-not (Test-Path -LiteralPath $entry.Dir)) {
+    $exists = Test-Path -LiteralPath $entry.Dir
+    if ($exists) {
+        # 已有目录：先查身份/路径/ReparsePoint/信任，再做任何写操作。
+        # 绝不通过 icacls/takeown 把旧历史“加固后升级”为可信。
+        if ($Plan.IsSystem -and -not (Test-BackupPathTrusted -Path $entry.Dir)) {
+            throw "备份目录不可信：$($entry.Dir)。请删除或修复该目录（owner 必须是 Administrators/SYSTEM），或改用沙箱 -HostsPath。"
+        }
+    } else {
         New-Item -ItemType Directory -Force -Path $entry.Dir -ErrorAction Stop | Out-Null
-        $created = $true
-    }
-    if ($isProgramData) {
-        if ($created) { & takeown.exe /F $entry.Dir /A 2>$null | Out-Null }
-        & icacls $entry.Dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "无法加固备份目录：$($entry.Dir)" }
+        if ($isProgramData) {
+            # 只加固本次新建的目录；已存在的目录不走这条分支
+            Set-BackupDirectoryAcl -Path $entry.Dir
+        }
+        if ($Plan.IsSystem -and -not (Test-BackupPathTrusted -Path $entry.Dir)) {
+            throw "备份目录加固后仍不可信：$($entry.Dir)"
+        }
     }
 
     $probe = Join-Path $entry.Dir ('.cfo-write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -622,9 +665,6 @@ function Initialize-HostsBackupDirectory {
         if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
     }
 
-    if ($Plan.IsSystem -and -not (Test-BackupPathTrusted -Path $entry.Dir)) {
-        throw "备份目录加固后仍不可信：$($entry.Dir)"
-    }
     return $entry.Dir
 }
 
@@ -1027,8 +1067,13 @@ function Invoke-HostsRollback {
         if (-not (Test-Path -LiteralPath $manifestPath)) {
             throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($file.FullName)"
         }
-        # 显式恢复也要先确认点名文件的来源；-AllowUntrustedBackup 才放宽这一份
+        # 显式恢复也要先确认点名文件的来源；-AllowUntrustedBackup 才放宽这一份。
+        # 文件检查只查自身，必须先确认它所在的目录就是规定的 ProgramData backup，
+        # 且目录本身可信；否则“文件 ACL 可信、父目录可替换”仍能绕过来源边界。
         if ($isSystem -and -not $AllowUntrustedBackup) {
+            if (-not (Test-BackupSourcePathTrusted -Path $file.FullName)) {
+                throw "该备份不在可信的 ProgramData 备份目录，已拒绝：$($file.FullName)。确认内容可信后可用 -AllowUntrustedBackup 显式恢复。"
+            }
             if (-not (Test-BackupFileTrusted -Path $file.FullName)) {
                 throw "该备份可被普通用户改写，无法确认来源，已拒绝：$($file.FullName)。确认内容可信后可用 -AllowUntrustedBackup 显式恢复。"
             }

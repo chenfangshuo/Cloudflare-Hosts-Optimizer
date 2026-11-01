@@ -478,17 +478,21 @@ function Invoke-Doctor {
     }
 
     # ---- 存储 ----
-    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    $backupDir = if ($programData) { Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup' } else { Join-Path $Root 'backup' }
-    $bk = Get-BackupDoctorInfo -BackupDir $backupDir -TestWritable:$isAdmin
-    if (-not $bk.Exists) {
-        & $add '存储' '备份目录' 'WARN' "尚未创建：$backupDir（第一次正式运行会创建）"
-    } elseif ($isAdmin -and $bk.Writable -eq $false) {
-        & $add '存储' '备份目录' 'WARN' "不可写：$backupDir（系统 hosts 写入会因此中止；沙箱请检查仓库 backup 权限）"
+    $backupInfo = Get-DoctorBackupDir -HostsPath $doctorHostsPath -FallbackRoot $Root
+    $backupDir = $backupInfo.Dir
+    if ($backupInfo.Error) {
+        & $add '存储' '备份目录' 'WARN' "无法确定备份目录：$($backupInfo.Error)"
     } else {
-        $newest = if ($bk.Newest) { $bk.Newest } else { '暂无备份' }
-        $note = if (-not $isAdmin) { '；非管理员，未测试写入' } else { '' }
-        & $add '存储' '备份目录' 'OK' ("{0}；{1} 个备份，最近 {2}{3}" -f $backupDir, $bk.Count, $newest, $note)
+        $bk = Get-BackupDoctorInfo -BackupDir $backupDir -TestWritable:$isAdmin
+        if (-not $bk.Exists) {
+            & $add '存储' '备份目录' 'WARN' "尚未创建：$backupDir（第一次正式运行会创建）"
+        } elseif ($isAdmin -and $bk.Writable -eq $false) {
+            & $add '存储' '备份目录' 'WARN' "不可写：$backupDir（系统 hosts 写入会因此中止；沙箱请检查仓库 backup 权限）"
+        } else {
+            $newest = if ($bk.Newest) { $bk.Newest } else { '暂无备份' }
+            $note = if (-not $isAdmin) { '；非管理员，未测试写入' } else { '' }
+            & $add '存储' '备份目录' 'OK' ("{0}；{1} 个备份，最近 {2}{3}" -f $backupDir, $bk.Count, $newest, $note)
+        }
     }
 
     $cacheFile = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }

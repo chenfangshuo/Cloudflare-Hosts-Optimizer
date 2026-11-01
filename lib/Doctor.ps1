@@ -276,3 +276,19 @@ function Get-ScheduledTaskDoctorInfo {
     }
     return [pscustomobject]@{ Available = $true; QueryFailed = $false; Error = ''; Tasks = @($rows) }
 }
+
+# Doctor 的备份目录要按实际 hosts 目标计算：系统 hosts 用 ProgramData，
+# 沙箱用仓库 backup\targets\<hash>；没有可用位置时返回原因，不回退旧目录。
+function Get-DoctorBackupDir {
+    [CmdletBinding()]
+    param(
+        [string]$HostsPath,
+        [string]$FallbackRoot
+    )
+    $plan = Get-HostsBackupPlan -HostsPath $HostsPath -FallbackRoot $FallbackRoot
+    $entries = @($plan.Dirs)
+    if ($entries.Count -eq 0) {
+        return [pscustomobject]@{ Dir = ''; Error = '%ProgramData%\Cloudflare-Hosts-Optimizer 不可用。' }
+    }
+    return [pscustomobject]@{ Dir = $entries[0].Dir; Error = '' }
+}
