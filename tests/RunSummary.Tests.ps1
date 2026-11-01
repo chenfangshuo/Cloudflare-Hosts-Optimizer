@@ -116,23 +116,6 @@ Describe 'RunSummary 读写' {
         $record.hostsPath | Should -Match 'hosts\.tmp$'
     }
 
-    It '旧格式 lastCommit 迁移到对应目标' {
-        $path = Join-Path $TestDrive 'legacy.json'
-        $legacy = [ordered]@{
-            lastRun    = @{ runId = 'old-run'; mode = 'write'; hostsPath = $script:SystemHosts; finishedAt = '2026-11-01T09:00:00' }
-            lastCommit = @{ runId = 'old-commit'; mode = 'write'; hostsPath = $script:SystemHosts; at = '2026-11-01T09:00:00' }
-        }
-        ($legacy | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $path -Encoding utf8
-
-        $run = New-RunSummaryRecord -Mode 'dryrun' -HostsPath $script:SystemHosts `
-            -StartedAt ([datetime]'2026-11-01T10:00:00') -FinishedAt ([datetime]'2026-11-01T10:01:00') -RunId 'new-run'
-        $null = Write-RunSummary -Path $path -Run $run -Committed $false
-        $s = Read-RunSummary -Path $path
-        $key = ConvertTo-SummaryPathKey -Path $script:SystemHosts
-        $s.commits.$key.runId | Should -Be 'old-commit'
-        $s.lastCommit | Should -BeNullOrEmpty
-    }
-
     It '损坏的 JSON 返回 null' {
         $path = Join-Path $TestDrive 'bad.json'
         Set-Content -LiteralPath $path -Value '{not json' -Encoding utf8

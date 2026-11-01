@@ -625,27 +625,27 @@ Describe 'F10 机房缓存的时间类型' {
 Describe 'C02 切换前复核的下一步' {
     It '复核解析到别的 IP（成功）→ ip-changed' {
         $b2 = [pscustomobject]@{ RemoteIp = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.5 }
-        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'ip-changed'
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 | Should -Be 'ip-changed'
     }
 
     It '复核解析到别的 IP 但响应受限/失败 → 仍是 ip-changed' {
         $b2 = [pscustomobject]@{ RemoteIp = '2.2.2.2'; Ok = $false; Class = 'restricted'; Ttfb = 0 }
-        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'ip-changed'
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 | Should -Be 'ip-changed'
     }
 
     It '复核仍是原 IP 但失败 → 仍要复核候选' {
         $b2 = [pscustomobject]@{ RemoteIp = '1.1.1.1'; Ok = $false; Class = 'bad'; Ttfb = 0 }
-        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'need-candidate'
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 | Should -Be 'need-candidate'
     }
 
     It '复核没有 RemoteIp → 仍要复核候选' {
         $b2 = [pscustomobject]@{ RemoteIp = ''; Ok = $false; Class = ''; Ttfb = 0 }
-        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'need-candidate'
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 | Should -Be 'need-candidate'
     }
 
     It '候选预算已满且 IP 未变 → budget-blocked' {
         $b2 = [pscustomobject]@{ RemoteIp = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 1 }
-        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' -CandidateBudgetAllows $false |
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -CandidateBudgetAllows $false |
             Should -Be 'budget-blocked'
     }
 }

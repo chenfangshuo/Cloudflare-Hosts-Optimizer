@@ -671,8 +671,9 @@ function Invoke-Main {
     $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
     $planMode = [bool]$Plan -or [bool]$PlanPath
+    $readOnly = [bool]$DryRun -or $planMode
     $planFile = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
-    if ($Rollback -and ($DryRun -or $planMode)) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
+    if ($Rollback -and $readOnly) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
     if ($RollbackFrom -and -not $Rollback) { Fail '-RollbackFrom 只能与 -Rollback 一起使用。' 2 }
     if ($AllowUntrustedBackup -and -not $Rollback) { Fail '-AllowUntrustedBackup 只能与 -Rollback 一起使用。' 2 }
     # 这个开关只授权“用户指定的那一份”备份；不能用来在所有不可信目录里自动挑最新
@@ -746,7 +747,7 @@ function Invoke-Main {
         try { $null = Split-ProbeUrl -Url $ProbeUrl } catch { Fail $_.Exception.Message 2 }
     }
 
-    if (-not $DryRun -and -not $planMode) { Assert-AdminForPath $hostsPathResolved }
+    if (-not $readOnly) { Assert-AdminForPath $hostsPathResolved }
     $curlExe = Get-CurlExe
 
     $modeText = if ($planMode) { 'Plan' } elseif ($DryRun) { 'DryRun' } else { '写入 hosts' }
@@ -1109,7 +1110,7 @@ function Invoke-Main {
                 # 系统解析在两次探测之间换了 IP（可能是候选、第三个地址或 IPv6）：
                 # 两个不同 IP 的样本不能合并成同一条基线，本次不切换。
                 # 注意：失败/受限但带着新 RemoteIp 的响应同样算“换了 IP”。
-                $recheckPlan = Get-RecheckPlan -BaselineIp $baseline.IP -B2 $b2 -BestIp $best[0].IP `
+                $recheckPlan = Get-RecheckPlan -BaselineIp $baseline.IP -B2 $b2 `
                     -CandidateBudgetAllows (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $best[0].IP)
                 if ($recheckPlan -eq 'ip-changed') {
                     $decision = [pscustomobject]@{
@@ -1229,7 +1230,7 @@ function Invoke-Main {
     Complete-Step
 
     # ---- 更新 hosts ----
-    $updateStepName = if ($DryRun -or $planMode) { '生成计划' } else { '写入 hosts' }
+    $updateStepName = if ($readOnly) { '生成计划' } else { '写入 hosts' }
     Start-Step $updateStepName '几秒'
     try {
         $update = Update-HostsDocument -Document $doc -VerifiedMap $map -ManagedDomains $domainList -Prune:$Prune -DropPreviousDomains $dropPrevious
@@ -1248,7 +1249,7 @@ function Invoke-Main {
         Say '如需真正交还 DNS，请手动删除或注释这些行。' 'DarkGray'
     }
 
-    if ($DryRun -or $planMode) {
+    if ($readOnly) {
         if ($planMode) {
             Say 'Plan：不修改 hosts，输出 JSON 计划。计划写入：' 'Gray'
         } else {

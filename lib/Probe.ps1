@@ -157,12 +157,11 @@ function Invoke-CurlProbe {
         [switch]$Head,
         [int]$MaxTime = 10,
         [string]$Output = 'NUL',
-        [string]$Proto = '=https',
         [string]$Range,
         [int]$MaxFileSize = 0
     )
 
-    $curlArgs = @('-q', '-sS', '--noproxy', '*', '--max-redirs', '0', '--proto', $Proto, '--max-time', [string]$MaxTime)
+    $curlArgs = @('-q', '-sS', '--noproxy', '*', '--max-redirs', '0', '--proto', '=https', '--max-time', [string]$MaxTime)
     if ($Head) { $curlArgs += '-I' }
     if ($Resolve) { $curlArgs += @('--resolve', $Resolve) }
     if ($Range) { $curlArgs += @('--range', $Range) }
@@ -413,11 +412,11 @@ function Test-ProbeBudgetAllows {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][hashtable]$Budget,
-        [string]$Ip,
-        [int]$Max = 2
+        [string]$Ip
     )
     if (-not $Ip) { return $true }
-    return ([int]$Budget[$Ip] -lt $Max)
+    # 每个域名、每个物理 IP 最多 2 次 HEAD（初测 + 切换前复核）
+    return ([int]$Budget[$Ip] -lt 2)
 }
 
 function Add-ProbeUse {
@@ -523,7 +522,6 @@ function Get-RecheckPlan {
     param(
         [AllowEmptyString()][string]$BaselineIp,
         $B2,
-        [AllowEmptyString()][string]$BestIp,
         [bool]$CandidateBudgetAllows = $true
     )
     if ($B2 -and $B2.RemoteIp -and $BaselineIp -and ($B2.RemoteIp -ne $BaselineIp)) {
@@ -837,7 +835,6 @@ function Get-ReasonText {
         'not-confirmed'           = '复核未通过'
         'candidate-degraded'      = '复核时候选变差'
         'confirmed'               = '复核确认'
-        'dns'                     = '交还 DNS'
     }
     if ($map.ContainsKey($Reason)) { return $map[$Reason] }
     return $Reason

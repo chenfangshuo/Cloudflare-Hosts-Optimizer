@@ -341,7 +341,7 @@ Describe 'Show-TaskMenu 行为（直接调用）' {
             $script:Observed.Elevated.Add(@($Arguments))
             return [pscustomobject]@{ ExitCode = 0 }
         }
-        function Pause-Action { }
+        function Pause-Menu { }
     }
 
     BeforeEach {

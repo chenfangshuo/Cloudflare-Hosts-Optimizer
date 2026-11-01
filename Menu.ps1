@@ -30,27 +30,7 @@ $CfstDir = Join-Path $Root 'cfst'
 . (Join-Path $Root 'lib\Menu.ps1')
 . (Join-Path $Root 'lib\RunSummary.ps1')
 . (Join-Path $Root 'lib\Doctor.ps1')
-
-function Get-PwshPath {
-    # [Environment]::ProcessPath 从 .NET 6 才有；PowerShell 7.0（.NET Core 3.1）上访问会抛错，
-    # 所以必须先 try/catch，再退回命令查找和常见安装位置。
-    $p = ''
-    try { $p = [Environment]::ProcessPath } catch { $p = '' }
-    if ($p -and (Test-Path -LiteralPath $p) -and ([IO.Path]::GetFileName($p) -match '^pwsh(-preview)?\.exe$')) { return $p }
-    $c = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    $candidates = @()
-    try { $candidates += Join-Path $PSHOME 'pwsh.exe' } catch { }
-    if ($env:ProgramFiles) {
-        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
-        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe'
-    }
-    if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe' }
-    foreach ($candidate in $candidates) {
-        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
-    }
-    throw '找不到 pwsh.exe。'
-}
+. (Join-Path $Root 'lib\Schedule.ps1')
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -76,7 +56,7 @@ function Clear-MenuScreen {
     try { [Console]::Write("`e[2J`e[3J`e[H") } catch { }
 }
 
-$script:Pwsh = Get-PwshPath
+$script:Pwsh = Get-OptimizerPwshPath
 $script:IsAdmin = Test-IsAdmin
 $script:Tui = if ($Action) { $false } else { Test-TuiSupported }
 $script:Version = ''
@@ -89,23 +69,10 @@ function Pause-Menu {
     [void](Read-Host '按回车返回菜单')
 }
 
-function Pause-Action {
-    if ($script:Tui) { [void](Read-Host '按回车返回菜单') }
-    else { Pause-Menu }
-}
-
 function Confirm-Action {
     param([string]$Label)
     $ans = Read-Host "确认执行「$Label」？[y/N]"
     return ($ans -match '^[Yy]')
-}
-
-function ConvertTo-ArgumentString {
-    param([string[]]$Arguments = @())
-    $parts = foreach ($a in $Arguments) {
-        if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
-    }
-    return ($parts -join ' ')
 }
 
 function Invoke-Child {
@@ -113,7 +80,7 @@ function Invoke-Child {
     # 用 Start-Process -NoNewWindow 让子进程直接使用当前控制台：
     # 1) 输出实时、保留颜色和它自己的进度动画；2) 不会被函数返回值捕获成一整块。
     $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $FilePath
-    $extra = ConvertTo-ArgumentString -Arguments $Arguments
+    $extra = (@($Arguments | ForEach-Object { ConvertTo-NativeArgument -Value $_ }) -join ' ')
     if ($extra) { $argLine += ' ' + $extra }
     $p = Start-Process -FilePath $script:Pwsh -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argLine
     return $p.ExitCode
@@ -473,7 +440,7 @@ function Show-CfstMenu {
         if ($spec.Kind -eq 'OpenUrl') {
             Start-Process $spec.Target
             Write-Host '已在浏览器打开下载页；下载后选「从本地 zip 安装」。' -ForegroundColor DarkGray
-            Pause-Action
+            Pause-Menu
             continue
         }
         if ($spec.Kind -eq 'InstallCfst') {
@@ -491,7 +458,7 @@ function Show-CfstMenu {
             }
             $exit = Invoke-Child -FilePath $CfstScript -Arguments $cfstArgs
             Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
-            Pause-Action
+            Pause-Menu
         }
     }
 }
@@ -530,7 +497,7 @@ function Show-TaskMenu {
             } catch {
                 Write-Host "安装任务失败：$($_.Exception.Message)" -ForegroundColor Red
             }
-            Pause-Action
+            Pause-Menu
             continue
         }
 
@@ -552,7 +519,7 @@ function Show-TaskMenu {
             } catch {
                 Write-Host "卸载任务失败：$($_.Exception.Message)" -ForegroundColor Red
             }
-            Pause-Action
+            Pause-Menu
             continue
         }
 
@@ -587,7 +554,7 @@ function Invoke-Choice {
         'ViewReport' { Show-Report }
         'OpenReadme' { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f (Join-Path $Root 'README.md')) }
     }
-    Pause-Action
+    Pause-Menu
     return $true
 }
 
@@ -600,7 +567,7 @@ if ($Action -and $Elevated) {
 if ($Elevated) {
     $runArgs = @($ElevatedArgs -split '\s+' | Where-Object { $_ })
     $argsLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $MainScript
-    $extra = ConvertTo-ArgumentString -Arguments $runArgs
+    $extra = (@($runArgs | ForEach-Object { ConvertTo-NativeArgument -Value $_ }) -join ' ')
     if ($extra) { $argsLine += ' ' + $extra }
     # 统一用启动时解析好的 pwsh；[Environment]::ProcessPath 在 PowerShell 7.0 上不存在
     $p = Start-Process -FilePath $script:Pwsh -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argsLine

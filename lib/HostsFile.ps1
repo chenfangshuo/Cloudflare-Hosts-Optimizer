@@ -697,9 +697,7 @@ function Backup-HostsDocument {
         [string]$Version = '0.0.0',
         [int]$Keep = 10,
         # 这次事务准备写入的内容哈希；Replace 成功后才会把 state 改成 committed
-        [string]$IntendedHash,
-        [string[]]$Domains = @(),
-        [string]$TxnId
+        [string]$IntendedHash
     )
 
     # 带毫秒：同一秒内发生两次提交时，文件名排序仍能反映先后
@@ -721,10 +719,7 @@ function Backup-HostsDocument {
         intendedHash = $IntendedHash
         postHash     = $null
         state        = 'pending'
-        txnId        = $TxnId
         committedAt  = ''
-        verified     = $false
-        domains      = @($Domains)
     }
     $manifestPath = "$path.json"
     Write-JsonFileAtomic -Path $manifestPath -Object $manifest
@@ -735,11 +730,14 @@ function Backup-HostsDocument {
         Copy-Item -LiteralPath $path -Destination (Join-Path $BackupDir "hosts-initial-$stamp.bak") -Force
     }
 
-    # 只保留最近 N 份普通备份
+    # 只保留最近 N 份普通备份；清单跟着备份一起删，避免 .json 无限堆积
     Get-ChildItem -LiteralPath $BackupDir -Filter 'hosts-2*.bak' -ErrorAction SilentlyContinue |
         Sort-Object Name -Descending |
         Select-Object -Skip $Keep |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath "$($_.FullName).json" -Force -ErrorAction SilentlyContinue
+        }
 
     return [pscustomobject]@{ Path = $path; ManifestPath = $manifestPath; Name = $name }
 }
@@ -784,9 +782,8 @@ function Write-HostsDocument {
         # 两阶段提交：备份 + pending 记录先落盘，Replace 成功后才升级成 committed。
         # intendedHash 只描述“准备写入什么”，不能提前当成已完成。
         $expectedHash = Get-Sha256Hex -Bytes $bytes
-        $txnId = [guid]::NewGuid().ToString('N').Substring(0, 8)
         $backup = Backup-HostsDocument -Document $Document -BackupDir $BackupDir -Version $Version `
-            -IntendedHash $expectedHash -Domains @($Update.FinalMap.Keys) -TxnId $txnId
+            -IntendedHash $expectedHash
 
         $dir = Split-Path -Parent $Document.Path
         $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer.' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -846,9 +843,7 @@ function Write-HostsDocument {
             $manifest = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
             $manifest.state = 'committed'
             $manifest.postHash = if ($newHash) { $newHash } else { $null }
-            $manifest.verified = [bool]$verified
             $manifest.committedAt = (Get-Date).ToString('o')
-            $manifest.domains = @($Update.FinalMap.Keys)
             Write-JsonFileAtomic -Path $backup.ManifestPath -Object $manifest
         } catch {
             $note = "hosts 已写入，但提交标记未能落盘（$(Protect-ErrorMessage -Text $_.Exception.Message)）；回滚时会按当前内容识别这次提交。"

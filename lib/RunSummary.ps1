@@ -4,8 +4,8 @@
 
     边界：
       * 只用于菜单展示，绝不参与回滚授权或完整性校验。
-      * 并发写入用独立短时命名互斥锁 + 唯一临时文件 + 原子替换；
-        拿不到锁或写入失败时返回 $false，不影响主流程和退出码。
+      * 直接写 JSON；写入失败时返回 $false，不影响主流程和退出码。
+        并发时可能丢失整个摘要，下一次有提交的运行会重新生成。
       * lastRun 取 finishedAt 较新者。
       * 提交记录按规范化后的目标路径分别保存（commits），临时 hosts 的提交
         不会覆盖系统 hosts 的“最近提交”。
@@ -13,8 +13,6 @@
         旧记录不能覆盖新提交。
       * 只有实际发生替换（Changed=true 且成功）才更新提交记录。
 #>
-
-$script:RunSummaryMutexName = 'Global\Cloudflare-Hosts-Optimizer-Summary'
 
 # 提交记录按目标路径分组：同一个目标只保留最新一次提交。
 function ConvertTo-SummaryHostsPath {
@@ -78,27 +76,28 @@ function Read-RunSummary {
 # 同秒内的提交会因此排错顺序，缓存也会按错误时区算寿命。这里接受对象：
 # DateTime/DateTimeOffset 原样使用，只有字符串才按 RoundtripKind 解析。
 function ConvertTo-SummaryDate {
-    param($Value)
-    if ($null -eq $Value) { return $null }
-    if ($Value -is [datetime]) { return $Value }
-    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
-    $text = [string]$Value
-    if (-not $text) { return $null }
-    try {
-        return [datetime]::Parse($text, [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind)
-    } catch { return $null }
+    param($Value, [switch]$AsUtc)
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    if ($Value -is [datetime]) {
+        $t = $Value
+    } elseif ($Value -is [datetimeoffset]) {
+        $t = $Value.UtcDateTime
+    } else {
+        try {
+            $t = [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind)
+        } catch { return $null }
+    }
+    if (-not $AsUtc) { return $t }
+    return ConvertTo-UtcTime -Time $t
 }
 
-# 内部比较统一 UTC；显示时转回本地时间，避免 UTC+8 用户看到早 8 小时的时间。
-function ConvertTo-SummaryUtc {
-    param($Value)
-    $t = ConvertTo-SummaryDate -Value $Value
-    if (-not $t) { return $null }
-    if ($t.Kind -eq [DateTimeKind]::Utc) { return $t }
-    if ($t.Kind -eq [DateTimeKind]::Local) { return $t.ToUniversalTime() }
-    # Unspecified（旧格式没有偏移）：按本地时间解释，和以前的行为一致
-    return [datetime]::SpecifyKind($t, [DateTimeKind]::Local).ToUniversalTime()
+# 内部比较统一 UTC；Unspecified（旧格式没有偏移）按本地时间解释。
+function ConvertTo-UtcTime {
+    param([datetime]$Time)
+    if ($Time.Kind -eq [DateTimeKind]::Utc) { return $Time }
+    if ($Time.Kind -eq [DateTimeKind]::Local) { return $Time.ToUniversalTime() }
+    return [datetime]::SpecifyKind($Time, [DateTimeKind]::Local).ToUniversalTime()
 }
 
 function Format-SummaryLocalTime {
@@ -123,12 +122,7 @@ function Write-RunSummary {
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     } catch { return $false }
 
-    $mutex = [Threading.Mutex]::new($false, $script:RunSummaryMutexName)
-    $acquired = $false
     try {
-        try { $acquired = $mutex.WaitOne(2000) } catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) { return $false }
-
         $existing = Read-RunSummary -Path $Path
         $commits = [ordered]@{}
         if ($existing) {
@@ -136,16 +130,12 @@ function Write-RunSummary {
                 foreach ($k in $existing.commits.Keys) { $commits[[string]$k] = $existing.commits[$k] }
             } elseif ($existing.commits) {
                 foreach ($prop in $existing.commits.PSObject.Properties) { $commits[$prop.Name] = $prop.Value }
-            } elseif ($existing.lastCommit) {
-                # 旧格式没有按目标分组；缺少有效目标时不能默认当成系统 hosts
-                $legacyKey = ConvertTo-SummaryPathKey -Path ([string]$existing.lastCommit.hostsPath)
-                if ($legacyKey) { $commits[$legacyKey] = $existing.lastCommit }
             }
         }
         $record = [ordered]@{ lastRun = $Run; commits = $commits }
-        if ($existing) {
-            $oldFinished = ConvertTo-SummaryUtc -Value $existing.lastRun.finishedAt
-            $newFinished = ConvertTo-SummaryUtc -Value $Run.finishedAt
+        if ($existing -and $existing.lastRun) {
+            $oldFinished = ConvertTo-SummaryDate -Value $existing.lastRun.finishedAt -AsUtc
+            $newFinished = ConvertTo-SummaryDate -Value $Run.finishedAt -AsUtc
             if ($oldFinished -and $newFinished -and $oldFinished -gt $newFinished) {
                 $record.lastRun = $existing.lastRun
             }
@@ -159,8 +149,8 @@ function Write-RunSummary {
             if ($key -and $newAt) {
                 $oldAt = $null
                 $old = $commits[$key]
-                if ($old) { $oldAt = ConvertTo-SummaryUtc -Value $old.at }
-                $newUtc = ConvertTo-SummaryUtc -Value $newAt
+                if ($old) { $oldAt = ConvertTo-SummaryDate -Value $old.at -AsUtc }
+                $newUtc = ConvertTo-SummaryDate -Value $newAt -AsUtc
                 if (-not $oldAt -or $newUtc -ge $oldAt) {
                     $commits[$key] = [pscustomobject]@{
                         runId     = $Run.runId
@@ -172,20 +162,10 @@ function Write-RunSummary {
             }
         }
 
-        $temp = "$Path." + [guid]::NewGuid().ToString('N') + '.tmp'
-        try {
-            ($record | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $temp -Encoding utf8
-            if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($temp, $Path, [NullString]::Value) }
-            else { Move-Item -LiteralPath $temp -Destination $Path -Force }
-            return $true
-        } finally {
-            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
-        }
+        ($record | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $Path -Encoding utf8
+        return $true
     } catch {
         return $false
-    } finally {
-        if ($acquired) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
     }
 }
 
@@ -228,12 +208,6 @@ function Format-RunSummaryLine {
         } elseif ($Summary.commits) {
             $prop = $Summary.commits.PSObject.Properties[$systemKey]
             if ($prop) { $commit = $prop.Value }
-        }
-        if (-not $commit -and $Summary.lastCommit) {
-            # 兼容旧格式：目标必须确实等于系统 hosts
-            if ((ConvertTo-SummaryPathKey -Path ([string]$Summary.lastCommit.hostsPath)) -eq $systemKey) {
-                $commit = $Summary.lastCommit
-            }
         }
     }
     if ($commit) {

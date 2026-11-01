@@ -104,28 +104,6 @@ function Write-StatusLine {
     }
 }
 
-function Invoke-WithProgressClear {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][scriptblock]$Action)
-    if (-not $script:ProgressState) { & $Action; return }
-    [System.Threading.Monitor]::Enter($script:ProgressLock)
-    try {
-        Write-ClearProgressLine -State $script:ProgressState
-        & $Action
-    } finally {
-        [System.Threading.Monitor]::Exit($script:ProgressLock)
-    }
-}
-
-function Clear-TaskSpinnerLine {
-    [CmdletBinding()]
-    param()
-    if (-not $script:ProgressState) { return }
-    [System.Threading.Monitor]::Enter($script:ProgressLock)
-    try { Write-ClearProgressLine -State $script:ProgressState }
-    finally { [System.Threading.Monitor]::Exit($script:ProgressLock) }
-}
-
 function Start-Step {
     [CmdletBinding()]
     param(

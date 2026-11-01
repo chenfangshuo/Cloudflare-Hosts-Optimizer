@@ -36,7 +36,7 @@ BeforeAll {
         return , [Text.Encoding]::ASCII.GetBytes($Text)
     }
 
-    $script:ValidZipArgs = @{ MinZipBytes = 1; MaxZipBytes = 50MB; MaxExeBytes = 32MB; MaxIpBytes = 1MB; MaxTotalUncompressed = 64MB }
+    $script:ValidZipArgs = @{ MinZipBytes = 1; MaxZipBytes = 50MB; MaxExeBytes = 32MB; MaxIpBytes = 1MB }
 }
 
 Describe 'Get-CfstAssetName' {

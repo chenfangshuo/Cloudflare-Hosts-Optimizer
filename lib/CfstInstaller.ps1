@@ -233,8 +233,7 @@ function Expand-CfstArchive {
         [long]$MinZipBytes = 1MB,
         [long]$MaxZipBytes = 50MB,
         [long]$MaxExeBytes = 32MB,
-        [long]$MaxIpBytes = 1MB,
-        [long]$MaxTotalUncompressed = 64MB
+        [long]$MaxIpBytes = 1MB
     )
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "找不到 zip：$ZipPath" }
     $info = Get-Item -LiteralPath $ZipPath
@@ -267,7 +266,6 @@ function Expand-CfstArchive {
         $ipEntry = $ipEntries[0]
         if ($exeEntry.Length -lt 1 -or $exeEntry.Length -gt $MaxExeBytes) { throw "cfst.exe 大小异常：$($exeEntry.Length) 字节。" }
         if ($ipEntry.Length -lt 1 -or $ipEntry.Length -gt $MaxIpBytes) { throw "ip.txt 大小异常：$($ipEntry.Length) 字节。" }
-        if (($exeEntry.Length + $ipEntry.Length) -gt $MaxTotalUncompressed) { throw '解压后总大小超过限制。' }
         foreach ($e in @($exeEntry, $ipEntry)) {
             if ($e.CompressedLength -gt 0 -and ($e.Length / $e.CompressedLength) -gt 100) {
                 throw "条目 $($e.FullName) 压缩比异常，拒绝解压。"

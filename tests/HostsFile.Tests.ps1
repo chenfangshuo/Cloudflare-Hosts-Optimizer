@@ -400,6 +400,26 @@ Describe '写入与回滚' {
     }
 }
 
+Describe '备份轮换' {
+    It '删除旧 .bak 时同时删除对应的 .json' {
+        $dir = Join-Path $TestDrive 'rotate-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $old = Join-Path $dir 'hosts-20000101-000000000-old.bak'
+        Set-Content -LiteralPath $old -Value 'old' -Encoding ascii
+        Set-Content -LiteralPath "$old.json" -Value '{}' -Encoding utf8
+
+        $tmp = Join-Path $TestDrive 'rotate-hosts.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $null = Backup-HostsDocument -Document $doc -BackupDir $dir -Keep 1 -IntendedHash 'abc'
+
+        Test-Path -LiteralPath $old | Should -BeFalse
+        Test-Path -LiteralPath "$old.json" | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $dir -Filter 'hosts-2*.bak').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $dir -Filter 'hosts-2*.bak.json').Count | Should -Be 1
+    }
+}
+
 Describe '事务与回滚校验（评审修复）' {
     It 'OriginalHash 来自读取时的字节快照' {
         $tmp = Join-Path $TestDrive 'snap.txt'
@@ -795,7 +815,9 @@ Describe 'F05 两阶段提交' {
         $m.state | Should -Be 'committed'
         $m.intendedHash | Should -Not -BeNullOrEmpty
         $m.postHash | Should -Be (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
-        $m.verified | Should -BeTrue
+        $m.PSObject.Properties['verified'] | Should -BeNullOrEmpty
+        $m.PSObject.Properties['txnId'] | Should -BeNullOrEmpty
+        $m.PSObject.Properties['domains'] | Should -BeNullOrEmpty
     }
 }
 
