@@ -180,3 +180,48 @@ Describe 'Format-RunSummaryLine' {
         (Format-RunSummaryLine -Summary $s).LastCommit | Should -BeNullOrEmpty
     }
 }
+
+Describe 'F10 时间类型与精度' {
+    It 'DateTime 输入保留毫秒，不再被字符串化丢掉' {
+        $t = [datetime]::Parse('2026-01-01T12:00:00.900Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        (ConvertTo-SummaryDate -Value $t).ToString('fff') | Should -Be '900'
+        (ConvertTo-SummaryDate -Value $t.ToString('o')).ToString('fff') | Should -Be '900'
+    }
+
+    It 'DateTimeOffset 按 UTC 处理' {
+        $dto = [datetimeoffset]::Parse('2026-01-01T20:00:00+08:00', [Globalization.CultureInfo]::InvariantCulture)
+        $r = ConvertTo-SummaryDate -Value $dto
+        $r.Kind | Should -Be ([DateTimeKind]::Utc)
+        $r.Hour | Should -Be 12
+    }
+
+    It '同一秒内后写较早提交不会顶掉较新的提交' {
+        $path = Join-Path $TestDrive 'last-run-f10.json'
+        $hosts = Join-Path $TestDrive 'f10-hosts'
+        $newT = [datetime]::Parse('2026-01-01T12:00:00.900Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        $oldT = [datetime]::Parse('2026-01-01T12:00:00.100Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+
+        $newRec = New-RunSummaryRecord -Mode 'write' -HostsPath $hosts -StartedAt $newT.AddMinutes(-1) `
+            -FinishedAt $newT -ExitCode 0 -Changed $true -RunId 'new' -CommittedAt $newT
+        $null = Write-RunSummary -Path $path -Run $newRec -Committed $true
+
+        $oldRec = New-RunSummaryRecord -Mode 'write' -HostsPath $hosts -StartedAt $oldT.AddMinutes(-1) `
+            -FinishedAt $oldT.AddMinutes(5) -ExitCode 0 -Changed $true -RunId 'old' -CommittedAt $oldT
+        $null = Write-RunSummary -Path $path -Run $oldRec -Committed $true
+
+        $s = Read-RunSummary -Path $path
+        $key = ConvertTo-SummaryPathKey -Path $hosts
+        $commit = $s.commits.PSObject.Properties[$key].Value
+        $commit.runId | Should -Be 'new'
+    }
+
+    It '显示时转回本地时间' {
+        $utc = [datetime]::Parse('2026-01-01T04:00:00Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        Format-SummaryLocalTime -Value $utc | Should -Be $utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+        Format-SummaryLocalTime -Value '' | Should -Be ''
+    }
+}

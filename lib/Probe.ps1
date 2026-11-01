@@ -407,6 +407,29 @@ function Invoke-BuiltinLatencyScan {
     return @($probe | Where-Object { $_ -and $_.Ttfb -gt 0 -and $_.Loss -le 0.05 } | Sort-Object Ttfb)
 }
 
+# 每 IP 请求预算：默认同一个物理 IP 最多 2 次 HEAD（初测 + 切换前复核）。
+# 失败、没有 RemoteIp 的显式探测也要记一次尝试，避免“失败不计数”绕过上限。
+function Test-ProbeBudgetAllows {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Budget,
+        [string]$Ip,
+        [int]$Max = 2
+    )
+    if (-not $Ip) { return $true }
+    return ([int]$Budget[$Ip] -lt $Max)
+}
+
+function Add-ProbeUse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Budget,
+        [string]$Ip
+    )
+    if (-not $Ip) { return }
+    $Budget[$Ip] = 1 + [int]$Budget[$Ip]
+}
+
 function Get-ColoCacheDefaultPath {
     [CmdletBinding()]
     param([string]$Root)
@@ -431,8 +454,17 @@ function Read-ColoCache {
         if ([int]$doc.version -ne 1) { return $null }
         $cols = @($doc.colos | Where-Object { $_ -match '^[A-Z]{3}$' } | Select-Object -Unique)
         if ($cols.Count -eq 0) { return $null }
-        $updated = [datetime]::Parse([string]$doc.updatedAt, [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind)
+        # 7.5+ 会把 ISO 时间直接反序列化成 DateTime；先转字符串会丢时区，
+        # 在 UTC+8 下把 14 天缓存算成 13 天 16 小时或 14 天 8 小时。
+        $updatedValue = $doc.updatedAt
+        if ($updatedValue -is [datetime]) {
+            $updated = $updatedValue
+        } elseif ($updatedValue -is [datetimeoffset]) {
+            $updated = $updatedValue.UtcDateTime
+        } else {
+            $updated = [datetime]::Parse([string]$updatedValue, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind)
+        }
         if (($Now.ToUniversalTime() - $updated.ToUniversalTime()).TotalDays -gt $MaxAgeDays) { return $null }
         return [pscustomobject]@{ Colos = $cols; UpdatedAt = $updated }
     } catch {
@@ -731,10 +763,13 @@ function Select-DomainIp {
         }
     }
 
-    $improvement = [math]::Round((($Baseline.Ttfb - $best.Ttfb) / $Baseline.Ttfb) * 100, 1)
-    # 百分比和绝对毫秒门槛都在这里先判一次：不满足的组合不再进入复核，省 2 次 HEAD。
+    # 判定用未舍入的值：14.96% 不能因为四舍五入变成 15.0 而被放行，
+    # 恰好 15%/30ms 也不能因为浮点误差（14.999999999999996）被误拒。
+    # 舍入只用于展示。
+    $pctRaw = (($Baseline.Ttfb - $best.Ttfb) / $Baseline.Ttfb) * 100
+    $improvement = [math]::Round($pctRaw, 1)
     $deltaMs = ($Baseline.Ttfb - $best.Ttfb) * 1000
-    if (($improvement -ge $MinImprovementPct) -and ($deltaMs -ge $MinImprovementMs)) {
+    if (($pctRaw -ge ($MinImprovementPct - 1e-9)) -and ($deltaMs -ge ($MinImprovementMs - 1e-6))) {
         return [pscustomobject]@{
             IP = $best.IP; Changed = $true; Reason = 'improved'
             ImprovementPct = $improvement; BestIP = $best.IP; BestTtfb = $best.Ttfb
@@ -762,6 +797,8 @@ function Get-ReasonText {
         'below-threshold'         = '未达阈值'
         'no-working-candidate'    = '无可用候选'
         'candidate-flaky'         = '候选不稳定'
+        'baseline-ip-changed'     = '复核时基线换了 IP'
+        'candidate-budget-exhausted' = '候选请求预算已用尽'
         'baseline-failed-on-retest' = '复核时基线失败'
         'confirmed-class'         = '复核确认（状态）'
         'not-confirmed'           = '复核未通过'
@@ -866,9 +903,11 @@ function Resolve-SwitchConfirmation {
         return [pscustomobject]@{ Switch = $false; Reason = 'not-confirmed'; Pct = $null; BaseMs = $null; BestMs = $null }
     }
 
-    $pct = [math]::Round((($baseMedian - $bestMedian) / $baseMedian) * 100, 1)
+    $pctRaw = (($baseMedian - $bestMedian) / $baseMedian) * 100
+    $pct = [math]::Round($pctRaw, 1)
     $deltaMs = ($baseMedian - $bestMedian) * 1000
-    $ok = ($pct -ge $MinImprovementPct) -and ($deltaMs -ge $MinImprovementMs)
+    # 与初选一致：未舍入值比较 + 极小容差，避免恰好 15%/30ms 被浮点误差挡掉
+    $ok = ($pctRaw -ge ($MinImprovementPct - 1e-9)) -and ($deltaMs -ge ($MinImprovementMs - 1e-6))
     return [pscustomobject]@{
         Switch = $ok
         Reason = if ($ok) { 'confirmed' } else { 'not-confirmed' }

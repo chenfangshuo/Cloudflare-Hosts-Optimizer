@@ -62,8 +62,9 @@ TUN。但它无法完整识别 PAC/WPAD、WinHTTP、应用级代理和 WFP 透�
 不需要。所有 curl 都带 `--noproxy '*'`，CFST 启动前也会清空 `HTTP_PROXY/HTTPS_PROXY`
 环境变量。控制台仍会显示"系统代理已开启"，那只是信息提示，不代表探测或测速走了代理。
 
-唯一要避免的是 **TUN / 虚拟网卡模式**：检测到 TUN 时非 DryRun 会中止，确认风险后可以加
-`-Force`。
+唯一要避免的是 **TUN / 虚拟网卡模式**：检测到 TUN 时，写入、DryRun、Plan 都会中止
+（DryRun/Plan 不写 hosts，但同样会真实请求站点），确认风险后可以加 `-Force`。
+`-Doctor` 只打 Cloudflare 公共端点，不受这条限制。
 
 ## 为什么"探测候选落地区域"要等几分钟？
 
@@ -95,8 +96,9 @@ TUN。但它无法完整识别 PAC/WPAD、WinHTTP、应用级代理和 WFP 透�
 ```
 
 默认输出 `domains.imported.txt`，不会覆盖 `domains.txt`；检查后用 `-Merge` 合并。导入器
-只读取备份里的 `metadata.json`，**绝不读取** `cookies.json` / `userInfo.json`，控制台只打印
-数量。完整说明见 [guide.md 的域名导入](guide.md#域名导入与合并)。
+只读取备份里的 `metadata.json`，**绝不读取** `cookies.json` / `userInfo.json`。
+命令行默认只打印数量；菜单导入会额外列出前 15 个域名供确认。完整说明见
+[guide.md 的域名导入](guide.md#域名导入与合并)。
 
 ## 我用的是 PTPP，不是 PT-Depiler，可以吗？
 
@@ -131,7 +133,9 @@ hosts 不是带优先级的故障转移配置。即使按 TTFB 顺序写多行�
 
 基线 = 该域名当前的 hosts 映射（没有则走系统 DNS）。只有候选比基线快至少
 `-MinImprovementPct`（默认 15%）**且**绝对改善至少 `-MinImprovementMs`（默认 30ms），
-或基线失败/类别更差时才切换。准备切换时，基线与选中的候选各复核一次，候选复测失败就不切换。
+或基线失败/类别更差时才切换（判定用未舍入的数值，恰好 15%/30ms 不会被浮点误差误拒）。
+基线首次可用、准备切换时，基线与选中的候选各复核一次，候选复测失败就不切换；
+基线首次就失败时直接按"基线不可用"处理。复核时如果系统解析换了 IP，本次不切换。
 想强制换值可以 `-MinImprovementPct 0 -MinImprovementMs 0`。机制见
 [design.md](design.md#为什么逐域名选择基线对比)。
 
@@ -197,7 +201,8 @@ hosts 只支持 ASCII / UTF-8（含 BOM）。如果文件是 GBK/ANSI 或 UTF-16
 
 ## 跑不通 / 测不出速度，怎么排查？
 
-先跑 `-Doctor`。它只读、不需要管理员、不访问目标站：
+先跑 `-Doctor`。它不写 hosts、不需要管理员、不访问目标站（管理员模式下会在备份目录创建
+一个临时可写性探针再删掉，这不是"零 IO"）：
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Doctor
@@ -216,8 +221,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -
 `-SpeedTestUrl` 换成自建地址，例如参考
 [cmliu/CF-Workers-SpeedTestURL](https://github.com/cmliu/CF-Workers-SpeedTestURL)。
 
-自定义地址必须：https、由 Cloudflare 托管、返回 HTTP 200、至少返回 `{bytes}` 字节、
-不重定向、不带凭据。否则样本会被判定为无效。
+工具只校验 https、不带凭据，以及样本是否 HTTP 200、够 `{bytes}` 字节、不重定向；
+**它无法证明你的地址真的由 Cloudflare 托管**——那是你选择地址时的责任，选错了测速结果
+就不可比。
 
 ## 会消耗多少流量？
 
@@ -230,7 +236,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -
 都不需要。菜单里点"正式写入"会自己弹 UAC，取消就回到菜单，不会中断。
 
 如果点了没反应，检查 UAC 是不是被取消或被杀毒软件拦截；管理员窗口结束后主窗口会显示
-退出码，结果也会写进 `last-report.txt`。
+退出码。正式写入（以及 DryRun/Plan 在指定 `-ReportPath` 时）会写报告；**回滚默认不覆盖
+`last-report.txt`**，只在 `last-run.json` 里更新运行摘要。
 
 ## 怎么完全卸载？
 
@@ -253,8 +260,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -
 ## 会覆盖 hosts 里的其他内容吗？
 
 不会。只处理域名列表里的域名和一对标记区块；其他行保持不变（在支持的编码下）。写入前
-自动备份，失败自动还原，可以随时 `-Rollback`。细节见
-[design.md 的 hosts 一节](design.md#hosts-写入与安全规则)。
+自动备份；替换前失败不会碰 hosts，替换后读回不一致会自动从备份还原。如果失败发生在
+"已经替换、但提交标记没写成"的极小窗口，工具会如实报告"已写入、标记未完成"，
+回滚仍能识别这次提交。细节见 [design.md 的 hosts 一节](design.md#hosts-写入与安全规则)。
 
 ## 能在 Linux / 路由器 / macOS 上用吗？
 

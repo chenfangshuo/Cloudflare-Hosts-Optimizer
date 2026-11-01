@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\Domains.ps1')
     . (Join-Path $repoRoot 'lib\Import.ps1')
     Add-Type -AssemblyName System.IO.Compression.FileSystem

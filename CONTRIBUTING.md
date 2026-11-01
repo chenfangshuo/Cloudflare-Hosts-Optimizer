@@ -111,8 +111,8 @@ gh run list --workflow release.yml --limit 3
 gh release view v<X.Y.Z>
 ```
 
-发布说明取 `CHANGELOG.md` 中对应版本的小节，并自动附加安装提示；找不到对应小节时用 GitHub
-自动生成的变更列表。
+发布说明取 `CHANGELOG.md` 中对应版本的小节，并自动附加安装提示；找不到对应小节时只用
+`v<X.Y.Z>` 作为标题，不会自动生成变更列表（要变更列表请手动补 CHANGELOG）。
 
 ### 手动发布（workflow 失败时的回退）
 

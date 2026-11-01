@@ -56,6 +56,42 @@ function Test-OptimizerTaskName {
     return ''
 }
 
+# 按 Windows 命令行（CommandLineToArgvW）规则给一个参数加引号：
+# 只有含空白或引号时才加；引号前的反斜杠翻倍；引号内末尾的反斜杠也要翻倍。
+# 计划任务的 Arguments 是一整条字符串，手写 '{0}' 会在 D:\cfst\ 这类路径上
+# 把闭合引号转义掉，任务运行时拿到错误路径。
+function ConvertTo-NativeArgument {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+
+    $sb = [Text.StringBuilder]::new()
+    [void]$sb.Append('"')
+    $i = 0
+    while ($i -lt $Value.Length) {
+        $backslashes = 0
+        while ($i -lt $Value.Length -and $Value[$i] -eq [char]'\') {
+            $backslashes++
+            $i++
+        }
+        if ($i -eq $Value.Length) {
+            # 末尾反斜杠：后面跟着闭合引号，必须翻倍
+            [void]$sb.Append([char]'\', $backslashes * 2)
+        } elseif ($Value[$i] -eq [char]'"') {
+            [void]$sb.Append([char]'\', $backslashes * 2 + 1)
+            [void]$sb.Append([char]'"')
+            $i++
+        } else {
+            [void]$sb.Append([char]'\', $backslashes)
+            [void]$sb.Append($Value[$i])
+            $i++
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 # 纯函数：把参数整理成一条可以交给 Register-ScheduledTask 的任务描述。
 function New-OptimizerTaskSpec {
     [CmdletBinding()]
@@ -87,10 +123,12 @@ function New-OptimizerTaskSpec {
     }
 
     $argList = [System.Collections.Generic.List[string]]::new()
-    foreach ($a in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $script))) { $argList.Add($a) }
+    foreach ($a in @('-NoProfile', '-ExecutionPolicy', 'Bypass')) { $argList.Add($a) }
+    $argList.Add('-File')
+    $argList.Add((ConvertTo-NativeArgument -Value $script))
     if ($Mode -eq 'DryRun') { $argList.Add('-DryRun') }
     $argList.Add('-ReportPath')
-    $argList.Add(('"{0}"' -f $ReportPath))
+    $argList.Add((ConvertTo-NativeArgument -Value $ReportPath))
 
     foreach ($k in @($ExtraParameters.Keys | Sort-Object)) {
         $v = $ExtraParameters[$k]
@@ -107,9 +145,8 @@ function New-OptimizerTaskSpec {
             throw "参数 -$k 是数组，不能写进计划任务；请改用 -DomainsFile。"
         }
         $text = [string]$v
-        if ($text -match '"') { throw "参数 -$k 的值不能包含双引号。" }
         $argList.Add("-$k")
-        $argList.Add(('"{0}"' -f $text))
+        $argList.Add((ConvertTo-NativeArgument -Value $text))
     }
 
     return [pscustomobject]@{
@@ -170,33 +207,87 @@ function Install-OptimizerTask {
     return $Spec
 }
 
+# 判断一个已存在的任务是不是本工具注册的：动作必须是 pwsh + 本脚本。
+# 只按名字删太危险——同名任务可能属于别的工具，而 Get/Unregister-ScheduledTask
+# 的 -TaskName 支持通配符，'*' 会波及根目录下的所有任务。
+function Test-OptimizerTaskOwnership {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Task,
+        [Parameter(Mandatory)][string]$ScriptPath
+    )
+    $actions = @($Task.Actions)
+    if ($actions.Count -eq 0) { return $false }
+    $scriptName = [IO.Path]::GetFileName($ScriptPath)
+    $expectedName = if ($scriptName) { $scriptName } else { 'Cloudflare-Hosts-Optimizer.ps1' }
+    foreach ($a in $actions) {
+        $exe = [string]$a.Execute
+        $argText = [string]$a.Arguments
+        if (-not $exe -or $exe -notmatch '(?i)(^|\\)pwsh(-preview)?\.exe$') { return $false }
+        if (-not $argText) { return $false }
+        # 只要求脚本文件名一致：仓库整体搬目录后，旧任务仍然应该删得掉
+        if ($argText.IndexOf($expectedName, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    }
+    return $true
+}
+
+# 删除单个任务对象。单独一层是为了让测试能替换掉原生命令：
+# Unregister-ScheduledTask 的 -InputObject 参数类型是 CimInstance[]，
+# 伪造对象在 Pester 的 mock 代理里会在绑定阶段就失败。
+function Remove-OptimizerTask {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)]$Task)
+    if ($PSCmdlet.ShouldProcess($Task.TaskName, '删除计划任务')) {
+        Unregister-ScheduledTask -InputObject $Task -Confirm:$false -ErrorAction Stop
+    }
+}
+
 # 返回每一项 { TaskName; Removed; Detail }；不存在视为成功。
 function Uninstall-OptimizerTask {
     [CmdletBinding(SupportsShouldProcess)]
-    param([string[]]$TaskName)
+    param(
+        [string[]]$TaskName,
+        [string]$ScriptPath
+    )
     if (-not $TaskName -or @($TaskName).Count -eq 0) { $TaskName = $script:DefaultTaskNames }
     if (-not (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue)) {
         throw '当前系统缺少 ScheduledTasks 模块，无法删除计划任务。'
     }
+    if (-not $ScriptPath) {
+        $root = if ($script:RepoRoot) { $script:RepoRoot } else { Split-Path -Parent $PSScriptRoot }
+        $ScriptPath = Join-Path $root 'Cloudflare-Hosts-Optimizer.ps1'
+    }
+
+    # 先校验全部名字，再开始删除：不能删掉第一个之后才发现第二个非法
+    foreach ($n in @($TaskName)) {
+        $nameError = Test-OptimizerTaskName -TaskName $n
+        if ($nameError) { throw "任务名无效「$n」：$nameError" }
+    }
+
     $rows = foreach ($n in @($TaskName)) {
-        $exists = @(Get-ScheduledTask -TaskName $n -TaskPath '\' -ErrorAction SilentlyContinue).Count -gt 0
-        if (-not $exists) {
+        # 不用 -TaskName $n 直接查询/删除：原生命令会按通配符解释。
+        $matches = @(Get-ScheduledTask -TaskPath '\' -ErrorAction SilentlyContinue |
+                Where-Object { $_.TaskName -eq $n })
+        if ($matches.Count -eq 0) {
             [pscustomobject]@{ TaskName = $n; Removed = $true; Detail = '不存在（无需删除）' }
+            continue
+        }
+        $ours = @($matches | Where-Object { Test-OptimizerTaskOwnership -Task $_ -ScriptPath $ScriptPath })
+        if ($ours.Count -eq 0) {
+            [pscustomobject]@{
+                TaskName = $n; Removed = $false
+                Detail = '同名任务不是本工具注册的（动作里没有本脚本），已跳过'
+            }
             continue
         }
         $removed = $false
         $detail = ''
-        if ($PSCmdlet.ShouldProcess($n, '删除计划任务')) {
-            try {
-                Unregister-ScheduledTask -TaskName $n -TaskPath '\' -Confirm:$false -ErrorAction Stop
-                $removed = $true
-                $detail = '已删除'
-            } catch {
-                $detail = $_.Exception.Message
-            }
-        } else {
+        try {
+            Remove-OptimizerTask -Task $ours[0]
             $removed = $true
-            $detail = '将删除（-WhatIf）'
+            $detail = if ($WhatIfPreference) { '将删除（-WhatIf）' } else { '已删除' }
+        } catch {
+            $detail = $_.Exception.Message
         }
         [pscustomobject]@{ TaskName = $n; Removed = $removed; Detail = $detail }
     }

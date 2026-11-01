@@ -61,6 +61,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 
+. (Join-Path $Root 'lib\Safety.ps1')
 . (Join-Path $Root 'lib\Domains.ps1')
 . (Join-Path $Root 'lib\Import.ps1')
 

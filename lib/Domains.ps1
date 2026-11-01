@@ -82,13 +82,18 @@ function Read-DomainsFile {
     $result = [pscustomobject]@{
         Domains = @()
         Invalid = @()
+        # 非法项的原始 token 可能夹带 URL 凭据，用户可见的地方只用 InvalidItems
+        InvalidItems = @()
     }
     if (-not (Test-Path -LiteralPath $Path)) { return $result }
 
     $domains = [System.Collections.Generic.List[string]]::new()
     $invalid = [System.Collections.Generic.List[string]]::new()
+    $invalidItems = [System.Collections.Generic.List[object]]::new()
 
+    $lineNo = 0
     foreach ($raw in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        $lineNo++
         $line = $raw.Trim()
         if (-not $line -or $line.StartsWith('#')) { continue }
         $token = ($line -split '\s+')[0]
@@ -97,11 +102,16 @@ function Read-DomainsFile {
             if (-not $domains.Contains($domain)) { $domains.Add($domain) }
         } else {
             $invalid.Add($token)
+            $invalidItems.Add([pscustomobject]@{
+                    Line    = $lineNo
+                    Preview = Get-SafeInputPreview -Value $token
+                })
         }
     }
 
     $result.Domains = @($domains)
     $result.Invalid = @($invalid)
+    $result.InvalidItems = @($invalidItems)
     return $result
 }
 

@@ -2,6 +2,7 @@
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $script:RepoRoot = $repoRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\Domains.ps1')
     . (Join-Path $repoRoot 'lib\HostsFile.ps1')
     . (Join-Path $repoRoot 'lib\Menu.ps1')
@@ -444,7 +445,7 @@ Describe '菜单头部状态栏' {
     BeforeAll {
         . (Join-Path $script:RepoRoot 'lib\RunSummary.ps1')
         Invoke-Expression (Get-MenuFunctionSource -Name 'Get-MenuHeader')
-        $script:Version = '0.5.5'
+        $script:Version = '0.5.6'
         $script:Root = $TestDrive
         $script:HostsPath = Join-Path $TestDrive 'hosts'
         $script:ReportPath = Join-Path $TestDrive 'last-report.txt'
@@ -474,5 +475,41 @@ Describe '菜单头部状态栏' {
         $text | Should -Match '0 个'
         $text | Should -Match '2 个非法'
         $text | Should -Not -Match ([regex]::Escape([string][char]27))
+    }
+}
+
+Describe 'F12 单个菜单动作失败不结束菜单' {
+    It '报告被独占打开时只提示，不抛异常' {
+        $report = Join-Path $TestDrive 'locked-report.txt'
+        Set-Content -LiteralPath $report -Value @('runId: old', '模式: 写入') -Encoding utf8
+        $fs = [IO.File]::Open($report, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        try {
+            $script:ReportPath = $report
+            $script:Root = $TestDrive
+            Invoke-Expression (Get-MenuFunctionSource 'Show-Report')
+            { Show-Report } | Should -Not -Throw
+        } finally {
+            $fs.Dispose()
+        }
+    }
+
+    It '动作抛错后主循环继续读取下一次选择' {
+        Invoke-Expression (Get-MenuFunctionSource 'Invoke-MenuLoop')
+        $script:f12Reads = 0
+        $script:f12Errors = 0
+        $script:f12Spec = [pscustomobject]@{ Kind = 'Action'; Key = '8'; Label = 'DryRun' }
+        $readChoice = {
+            param($first)
+            $script:f12Reads++
+            if ($script:f12Reads -eq 1) { return $script:f12Spec }
+            return [pscustomobject]@{ Kind = 'Exit'; Key = '0'; Label = '退出' }
+        }
+        $invokeAction = { param($spec) throw 'boom' }
+        $onError = { param($err) $script:f12Errors++ }
+
+        Invoke-MenuLoop -ReadChoice $readChoice -InvokeAction $invokeAction -OnError $onError
+
+        $script:f12Reads | Should -Be 2
+        $script:f12Errors | Should -Be 1
     }
 }

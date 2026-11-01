@@ -364,11 +364,187 @@ function Update-HostsDocument {
     }
 }
 
+# ---------------------------------------------------------------------------
+# 备份来源可信度
+#
+# 备份 + manifest 都是普通文件，本工具只能靠哈希判断“自洽”，不能认证“来源”。
+# 只要目录（或文件）能被非管理员改写，攻击者就能伪造一对内容与 metadata 完全匹配的
+# 备份，让自动回滚把任意 hosts 内容以管理员权限写回去。所以：
+#   * 系统 hosts 的自动回滚只信“所有者是 SYSTEM/Administrators/TrustedInstaller，
+#     且非受信主体没有任何写类权限”的目录与文件；
+#   * 查不到 ACL、icacls 失败一律按不可信处理；
+#   * 父目录只额外检查“能否删除/替换子目录”，ProgramData 允许普通用户建自己的目录
+#     是正常的，不能因此把整条链判死。
+# ---------------------------------------------------------------------------
+
+$script:TrustedSids = @(
+    'S-1-5-18',        # NT AUTHORITY\SYSTEM
+    'S-1-5-32-544',    # BUILTIN\Administrators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'  # TrustedInstaller
+)
+
+function Get-AclSidString {
+    [CmdletBinding()]
+    param($Identity)
+    if ($null -eq $Identity) { return '' }
+    if ($Identity -is [Security.Principal.SecurityIdentifier]) { return $Identity.Value }
+    $text = [string]$Identity
+    if ($text -match '^S-\d-\d+(-\d+)+$') { return $text }
+    try {
+        return ([Security.Principal.NTAccount]$text).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return ''
+    }
+}
+
+# 纯函数：只根据“所有者 SID + 访问规则”判断，不碰文件系统。
+# 注意 mask 只能用具体权限位：把 FullControl 放进 mask 会让任何权限都匹配。
+function Test-AclEntries {
+    [CmdletBinding()]
+    param(
+        [string]$OwnerSid,
+        [object[]]$Rules = @(),
+        [switch]$Ancestor
+    )
+    if (-not $OwnerSid -or $OwnerSid -notin $script:TrustedSids) { return $false }
+
+    $mask = if ($Ancestor) {
+        [Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    } else {
+        [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    }
+
+    foreach ($rule in @($Rules)) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if (-not ($rule.FileSystemRights -band $mask)) { continue }
+        $sid = Get-AclSidString -Identity $rule.IdentityReference
+        if (-not $sid -or $sid -notin $script:TrustedSids) { return $false }
+    }
+    return $true
+}
+
+function Test-AclTrusted {
+    [CmdletBinding()]
+    param(
+        $Acl,
+        [switch]$Ancestor
+    )
+    if (-not $Acl) { return $false }
+    try {
+        return (Test-AclEntries -OwnerSid (Get-AclSidString -Identity $Acl.Owner) -Rules @($Acl.Access) -Ancestor:$Ancestor)
+    } catch {
+        return $false
+    }
+}
+
+# 目录/文件本身必须可信；目录还要向上检查到 Root（不含 Root 的父级）。
+function Test-BackupPathTrusted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Root
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $Path -ErrorAction Stop))) { return $false }
+    } catch {
+        return $false
+    }
+    if (-not $item.PSIsContainer) { return $true }
+
+    $current = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $stop = if ($Root) { [IO.Path]::GetFullPath($Root).TrimEnd('\') } else { $null }
+    while ($true) {
+        if ($stop -and $current -ieq $stop) { break }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
+        try {
+            $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
+            if ($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $parent -ErrorAction Stop) -Ancestor)) { return $false }
+        } catch {
+            return $false
+        }
+        $current = $parent
+    }
+    return $true
+}
+
+# 受信链检查的终点：ProgramData 下的应用目录，或仓库根目录。
+# 纯策略：系统 hosts 的自动挑选只保留可信目录；显式 -AllowUntrustedBackup 或
+# 沙箱目标不做限制。不存在的目录直接忽略。
+function Select-TrustedBackupDirs {
+    [CmdletBinding()]
+    param(
+        [string[]]$Dirs,
+        [bool]$IsSystem = $true,
+        [switch]$AllowUntrusted
+    )
+    $trusted = @()
+    $untrusted = @()
+    foreach ($d in @($Dirs)) {
+        if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
+        if (-not $IsSystem -or $AllowUntrusted -or (Test-BackupPathTrusted -Path $d -Root (Get-BackupTrustRoot -Path $d))) {
+            $trusted += $d
+        } else {
+            $untrusted += $d
+        }
+    }
+    return [pscustomobject]@{ Trusted = @($trusted); Untrusted = @($untrusted) }
+}
+
+function Get-BackupTrustRoot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if ($programData) {
+        $appDir = Join-Path $programData 'Cloudflare-Hosts-Optimizer'
+        try {
+            if ([IO.Path]::GetFullPath($Path).StartsWith([IO.Path]::GetFullPath($appDir), [StringComparison]::OrdinalIgnoreCase)) {
+                return $appDir
+            }
+        } catch { }
+    }
+    if ($script:RepoRoot) { return $script:RepoRoot }
+    return (Split-Path -Parent $PSScriptRoot)
+}
+
+# 创建备份目录（必要时加固），并写一个临时文件确认真的可写。
+# “目录存在”不等于“可写”：ProgramData 可能被管理员建好并加固，普通用户随后写不进去。
+function New-BackupDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Harden
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null
+        if ($Harden) {
+            & icacls $Path /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "无法设置备份目录权限（icacls 退出码 $LASTEXITCODE）：$Path"
+            }
+        }
+    }
+    $probe = Join-Path $Path ('.cfo-write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($probe, 'ok')
+    } catch {
+        throw "备份目录不可写：$Path（$($_.Exception.Message)）"
+    } finally {
+        if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Get-HostsBackupDir {
     [CmdletBinding()]
     param(
         [string]$HostsPath,
-        [string]$FallbackRoot
+        [string]$FallbackRoot,
+        # 仅供测试注入候选目录；正常调用不要传
+        [string[]]$BaseCandidates
     )
 
     $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
@@ -385,35 +561,99 @@ function Get-HostsBackupDir {
         $targetId = $hash.Substring(0, 16)
     }
 
-    $base = $null
+    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
     $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    if ($programData) {
-        $candidate = Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup'
-        try {
-            if (-not (Test-Path -LiteralPath $candidate)) {
-                New-Item -ItemType Directory -Force -Path $candidate | Out-Null
-                try {
-                    & icacls $candidate /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
-                } catch { }
-            }
-            $base = $candidate
-        } catch { }
-    }
-    if (-not $base) {
-        $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
-        $base = Join-Path $root 'backup'
+
+    # 候选按优先级排列：ProgramData 下的加固目录，其次脚本目录下的 backup。
+    # 沙箱（非系统 hosts）在普通权限下通常建不了 ProgramData 子目录，必须能落到 fallback。
+    $programDataBase = if ($programData) { Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup' } else { '' }
+    $bases = @()
+    if ($BaseCandidates) {
+        $bases = @($BaseCandidates)
+    } else {
+        if ($programDataBase) { $bases += $programDataBase }
+        $bases += (Join-Path $root 'backup')
     }
 
-    $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        if ($targetId) {
-            try {
-                & icacls $dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
-            } catch { }
+    $lastError = ''
+    foreach ($base in $bases) {
+        $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
+        # 只加固 ProgramData 下的目录；仓库里的 fallback 必须保持当前用户可写，
+        # 否则普通用户第一次写完就再也写不进去。
+        $harden = ($programDataBase -and $base -ieq $programDataBase)
+        try {
+            if ($harden) { New-BackupDirectory -Path $dir -Harden }
+            else { New-BackupDirectory -Path $dir }
+            return $dir
+        } catch {
+            $lastError = $_.Exception.Message
         }
     }
-    return $dir
+    throw "无法准备备份目录：$lastError"
+}
+
+# 只计算候选目录，不创建、不写探针 —— 回滚查找备份时用。
+function Get-HostsBackupDirs {
+    [CmdletBinding()]
+    param(
+        [string]$HostsPath,
+        [string]$FallbackRoot,
+        # 仅供测试注入候选目录；正常调用不要传
+        [string[]]$BaseCandidates
+    )
+    $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $isSystem = $true
+    if ($HostsPath) {
+        try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
+    }
+    $targetId = $null
+    if ($HostsPath -and -not $isSystem) {
+        try {
+            $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
+            $hash = (Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
+            $targetId = $hash.Substring(0, 16)
+        } catch { $targetId = $null }
+    }
+
+    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    $bases = @()
+    if ($BaseCandidates) {
+        $bases = @($BaseCandidates)
+    } else {
+        if ($programData) { $bases += (Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup') }
+        $bases += (Join-Path $root 'backup')
+    }
+
+    $dirs = @()
+    foreach ($base in $bases) {
+        $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
+        if (Test-Path -LiteralPath $dir) { $dirs += $dir }
+    }
+    return @($dirs)
+}
+
+# 原子写 JSON：先写同目录临时文件，再 Replace/Move，避免就地截断留下半个文件
+function Write-JsonFileAtomic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Object,
+        [int]$Depth = 5
+    )
+    $dir = Split-Path -Parent $Path
+    if (-not $dir) { $dir = '.' }
+    $temp = Join-Path $dir ('.' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $Object | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $temp -Encoding utf8
+        if (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($temp, $Path, [NullString]::Value)
+        } else {
+            Move-Item -LiteralPath $temp -Destination $Path -Force
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Backup-HostsDocument {
@@ -422,7 +662,11 @@ function Backup-HostsDocument {
         [Parameter(Mandatory)]$Document,
         [Parameter(Mandatory)][string]$BackupDir,
         [string]$Version = '0.0.0',
-        [int]$Keep = 10
+        [int]$Keep = 10,
+        # 这次事务准备写入的内容哈希；Replace 成功后才会把 state 改成 committed
+        [string]$IntendedHash,
+        [string[]]$Domains = @(),
+        [string]$TxnId
     )
 
     # 带毫秒：同一秒内发生两次提交时，文件名排序仍能反映先后
@@ -434,16 +678,23 @@ function Backup-HostsDocument {
     # 原样保存字节，不做任何编码转换
     [IO.File]::WriteAllBytes($path, $Document.Bytes)
 
+    # 两阶段提交：这里只登记 pending。intendedHash 不是“已完成”的证明，
+    # 回滚时只有在当前 hosts 正好等于它时才把它当作已替换。
     $manifest = [pscustomobject]@{
-        createdAt = (Get-Date).ToString('o')
-        version   = $Version
-        hostsPath = $Document.Path
-        preHash   = $Document.OriginalHash
-        postHash  = $null
-        domains   = @()
+        createdAt    = (Get-Date).ToString('o')
+        version      = $Version
+        hostsPath    = $Document.Path
+        preHash      = $Document.OriginalHash
+        intendedHash = $IntendedHash
+        postHash     = $null
+        state        = 'pending'
+        txnId        = $TxnId
+        committedAt  = ''
+        verified     = $false
+        domains      = @($Domains)
     }
     $manifestPath = "$path.json"
-    $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+    Write-JsonFileAtomic -Path $manifestPath -Object $manifest
 
     # 首次接管快照，不参与轮换
     $initial = Get-ChildItem -LiteralPath $BackupDir -Filter 'hosts-initial-*.bak' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -485,8 +736,6 @@ function Write-HostsDocument {
             throw 'hosts 在本次运行期间被其他程序修改，已中止且未写入。请重试。'
         }
 
-        $backup = Backup-HostsDocument -Document $Document -BackupDir $BackupDir -Version $Version
-
         $enc = if ($Document.Encoding -eq 'UTF8') { [Text.UTF8Encoding]::new($Document.HasBom) } else { [Text.ASCIIEncoding]::new() }
         $payload = $enc.GetBytes($Update.Text)
         if ($Document.Encoding -eq 'UTF8' -and $Document.HasBom) {
@@ -499,8 +748,16 @@ function Write-HostsDocument {
             $bytes = $payload
         }
 
+        # 两阶段提交：备份 + pending 记录先落盘，Replace 成功后才升级成 committed。
+        # intendedHash 只描述“准备写入什么”，不能提前当成已完成。
+        $expectedHash = Get-Sha256Hex -Bytes $bytes
+        $txnId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $backup = Backup-HostsDocument -Document $Document -BackupDir $BackupDir -Version $Version `
+            -IntendedHash $expectedHash -Domains @($Update.FinalMap.Keys) -TxnId $txnId
+
         $dir = Split-Path -Parent $Document.Path
         $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer.' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $replaced = $false
         try {
             [IO.File]::WriteAllBytes($temp, $bytes)
             # 读回校验
@@ -509,29 +766,66 @@ function Write-HostsDocument {
                 throw '临时文件读回校验失败。'
             }
             [IO.File]::Replace($temp, $Document.Path, [NullString]::Value)
+            $replaced = $true
         } catch {
             if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+            if (-not $replaced) {
+                # 替换没有发生：把这次备份标成 aborted（尽力而为），不要让回滚把它当成候选
+                try {
+                    $m0 = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                    $m0.state = 'aborted'
+                    $m0.intendedHash = $null
+                    Write-JsonFileAtomic -Path $backup.ManifestPath -Object $m0
+                } catch { }
+            }
             throw
         } finally {
             if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
         }
 
-        $newHash = (Get-FileHash -LiteralPath $Document.Path -Algorithm SHA256).Hash
-        $expectedHash = Get-Sha256Hex -Bytes $bytes
-        if ($newHash -ne $expectedHash) {
-            # 内容不一致，自动还原
+        # 到这里 File.Replace 已经成功：hosts 就是新内容，后面任何失败都不能再报“未提交”。
+        $warning = ''
+        $newHash = $null
+        $verified = $false
+        try {
+            $newHash = (Get-FileHash -LiteralPath $Document.Path -Algorithm SHA256).Hash
+            $verified = ($newHash -eq $expectedHash)
+        } catch {
+            $warning = "hosts 已替换，但读回校验失败（$(Protect-ErrorMessage -Text $_.Exception.Message)）；无法确认最终内容。"
+        }
+
+        if ($newHash -and -not $verified) {
+            # 内容不一致：自动还原，并把这次备份标成 aborted
             Copy-Item -LiteralPath $backup.Path -Destination $Document.Path -Force
+            try {
+                $m1 = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                $m1.state = 'aborted'
+                $m1.postHash = $null
+                $m1.intendedHash = $null
+                Write-JsonFileAtomic -Path $backup.ManifestPath -Object $m1
+            } catch { }
             throw '写入后校验失败，已自动从备份还原。'
         }
 
-        $manifest = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-        $manifest.postHash = $newHash
-        $manifest.domains = @($Update.FinalMap.Keys)
-        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $backup.ManifestPath -Encoding utf8
+        # 完成标记写失败不影响“已经提交”这个事实：manifest 仍是 pending，
+        # 回滚会按“当前内容 == intendedHash”把它恢复成已完成。
+        try {
+            $manifest = Get-Content -LiteralPath $backup.ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+            $manifest.state = 'committed'
+            $manifest.postHash = if ($newHash) { $newHash } else { $null }
+            $manifest.verified = [bool]$verified
+            $manifest.committedAt = (Get-Date).ToString('o')
+            $manifest.domains = @($Update.FinalMap.Keys)
+            Write-JsonFileAtomic -Path $backup.ManifestPath -Object $manifest
+        } catch {
+            $note = "hosts 已写入，但提交标记未能落盘（$(Protect-ErrorMessage -Text $_.Exception.Message)）；回滚时会按当前内容识别这次提交。"
+            $warning = if ($warning) { "$warning $note" } else { $note }
+        }
 
-        # 提交时间必须在事务锁内、读写校验之后取，才是“这次替换真正完成”的时间
+        # 提交时间必须在事务锁内、替换之后取，才是“这次替换真正完成”的时间
         return [pscustomobject]@{
-            Changed = $true; Backup = $backup.Path; NewHash = $newHash; CommittedAt = (Get-Date)
+            Changed = $true; Backup = $backup.Path; NewHash = $newHash
+            CommittedAt = (Get-Date); Verified = $verified; Warning = $warning
         }
     } finally {
         if ($acquired) { $mutex.ReleaseMutex() }
@@ -574,22 +868,29 @@ function Invoke-HostsRollbackLocked {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$HostsPath,
-        [Parameter(Mandatory)][string]$BackupDir,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$BackupDir,
         [string]$LegacyBackupDir,
         # 指定要恢复的备份文件；不指定则用最近一次
         [string]$BackupPath,
-        [switch]$Force
+        [switch]$Force,
+        # 显式允许使用不可信目录/文件里的备份：只用于人工恢复，必须配合 -RollbackFrom
+        [switch]$AllowUntrustedBackup
     )
 
     $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $isSystem = $true
     try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
 
-    $dirs = @($BackupDir)
-    if ($isSystem -and $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $dirs += $LegacyBackupDir }
+    $rawDirs = @($BackupDir)
+    if ($isSystem -and $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $rawDirs += $LegacyBackupDir }
+
+    # 系统 hosts 只从“管理员/SYSTEM 独占写权限”的目录里自动挑选备份。
+    # 非系统 hosts（沙箱）没有提权面，不做这个限制。
+    $dirFilter = Select-TrustedBackupDirs -Dirs $rawDirs -IsSystem $isSystem -AllowUntrusted:$AllowUntrustedBackup
+    $dirs = @($dirFilter.Trusted)
+    $untrustedDirs = @($dirFilter.Untrusted)
 
     $all = @(foreach ($d in $dirs) {
-            if (-not (Test-Path -LiteralPath $d)) { continue }
             Get-ChildItem -LiteralPath $d -Filter 'hosts-*.bak' -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -notlike 'hosts-initial-*' }
         })
@@ -610,8 +911,14 @@ function Invoke-HostsRollbackLocked {
                 # 否则它会排到所有带时间的备份后面（R6）。
                 $sortAt = ConvertTo-BackupTimestamp -Value $m.createdAt
                 if (-not $sortAt) { $sortAt = ConvertTo-BackupTimestampFromName -Name $bak.Name }
+                # 新格式显式带 state；旧格式没有 state，仍按“有 postHash 就是已完成”判定
+                $state = ([string]$m.state).ToLowerInvariant()
+                if (-not $state) { $state = if ($m.postHash) { 'committed' } else { 'pending' } }
+                # 替换根本没发生的记录（aborted）不是候选，不能拿来恢复
+                if ($state -eq 'aborted') { continue }
                 $candidates += [pscustomobject]@{
-                    File = $bak; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false
+                    File = $bak; Manifest = $m; State = $state
+                    Committed = ($state -eq 'committed'); Legacy = $false
                     SortAt = $sortAt; SortName = $bak.Name
                 }
             } catch { continue }
@@ -632,6 +939,22 @@ function Invoke-HostsRollbackLocked {
         @{ Expression = { if ($_.SortAt) { $_.SortAt } else { [datetime]::MinValue } }; Descending = $true }
         @{ Expression = { $_.SortName }; Descending = $true }
     )
+    # 当前 hosts 的哈希既用于挑选，也用于后面的“无变化”判断
+    $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
+
+    # 两阶段提交的恢复：Replace 已经发生、但完成标记没写成的 pending 记录，
+    # 只要当前内容正好是它声明的 intendedHash，就按“已完成”参与挑选。
+    foreach ($c in $candidates) {
+        if ($c.Committed) { continue }
+        if (-not $c.Manifest) { continue }
+        $intended = [string]$c.Manifest.intendedHash
+        if ($intended -and $currentHash -eq $intended) {
+            $c.Committed = $true
+            $c | Add-Member -NotePropertyName RecoveredAt -NotePropertyValue (Get-Date) -Force
+            $c.Manifest.postHash = $intended
+        }
+    }
+
     $byName = @($candidates | Sort-Object -Property $sortKeys)
     $committed = @($candidates | Where-Object { $_.Committed } | Sort-Object -Property $sortKeys)
 
@@ -661,9 +984,26 @@ function Invoke-HostsRollbackLocked {
         }
         $selected = [pscustomobject]@{ File = $file; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false }
     } else {
-        if ($byName.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
+        if ($byName.Count -eq 0) {
+            $hint = if ($untrustedDirs.Count -gt 0) {
+                "。以下备份目录可被普通用户改写，已按来源不可信跳过：$($untrustedDirs -join ', ')。确认内容可信后再用 -RollbackFrom <文件> -AllowUntrustedBackup。"
+            } else { '' }
+            throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')$hint"
+        }
         # 优先最新的已完成事务；没有已完成事务时才退回最新的未完成备份
         $selected = if ($committed.Count -gt 0) { $committed[0] } else { $byName[0] }
+    }
+
+    # 文件自身的 ACL/所有者也要可信：目录被加固之后，旧文件仍可能带着不安全的显式权限
+    if ($isSystem -and -not $AllowUntrustedBackup) {
+        $trustRoot = Get-BackupTrustRoot -Path $selected.File.FullName
+        if (-not (Test-BackupPathTrusted -Path $selected.File.FullName -Root $trustRoot)) {
+            throw "该备份（或其所在目录）可被普通用户改写，无法确认来源，已拒绝：$($selected.File.FullName)。确认内容可信后可用 -RollbackFrom <文件> -AllowUntrustedBackup 显式恢复。"
+        }
+        $manifestTrustedPath = "$($selected.File.FullName).json"
+        if ((Test-Path -LiteralPath $manifestTrustedPath) -and -not (Test-BackupPathTrusted -Path $manifestTrustedPath -Root $trustRoot)) {
+            throw "该备份的 manifest 可被普通用户改写，无法确认来源，已拒绝：$manifestTrustedPath"
+        }
     }
 
     # 备份内容必须与 preHash 一致：损坏/被替换的备份永远不能用来覆盖 hosts（-Force 也不行）
@@ -672,8 +1012,6 @@ function Invoke-HostsRollbackLocked {
     if ($selected.Manifest -and $backupHash -ne [string]$selected.Manifest.preHash) {
         throw "备份内容与 manifest 不一致（可能已损坏或被替换），已拒绝：$($selected.File.FullName)"
     }
-
-    $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
 
     # 当前内容已经等于备份内容：无变化成功，不重复替换
     if ($currentHash -eq $backupHash) {
@@ -726,10 +1064,11 @@ function Invoke-HostsRollback {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$HostsPath,
-        [Parameter(Mandatory)][string]$BackupDir,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$BackupDir,
         [string]$LegacyBackupDir,
         [string]$BackupPath,
-        [switch]$Force
+        [switch]$Force,
+        [switch]$AllowUntrustedBackup
     )
     $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
     $acquired = $false

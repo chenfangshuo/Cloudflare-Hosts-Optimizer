@@ -1,7 +1,7 @@
 name: Release
 
 # 打 v* tag 即发布：打包（git archive zip + SHA256）并创建 GitHub Release。
-# 发布说明取 CHANGELOG.md 里对应版本的小节；找不到时用自动生成的变更列表。
+# 发布说明取 CHANGELOG.md 里对应版本的小节；找不到时只用版本号作标题（不自动生成变更列表）。
 
 on:
   push:

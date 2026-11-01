@@ -8,6 +8,7 @@
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $script:RepoRoot = $repoRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\Domains.ps1')
     . (Join-Path $repoRoot 'lib\HostsFile.ps1')
 
@@ -582,5 +583,220 @@ Describe '回滚异常组合（v0.5.4）' {
         $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir
         $r.Unchanged | Should -BeFalse
         (Get-Content $tmp -Raw).Trim() | Should -Be 'restore'
+    }
+}
+
+Describe 'F03 备份来源可信度' {
+    BeforeAll {
+        function New-TestAcl {
+            param([string]$OwnerSid, [object[]]$Rules = @())
+            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new($OwnerSid))
+            foreach ($r in $Rules) { $acl.AddAccessRule($r) }
+            return $acl
+        }
+        function New-TestRule {
+            param(
+                [string]$Sid,
+                [string]$Rights,
+                [string]$Type = 'Allow',
+                [string]$Inheritance = 'None',
+                [string]$Propagation = 'None'
+            )
+            $rightsValue = if ($Rights -match '^\d+$') {
+                [System.Security.AccessControl.FileSystemRights][int]$Rights
+            } else {
+                [System.Security.AccessControl.FileSystemRights]$Rights
+            }
+            return [System.Security.AccessControl.FileSystemAccessRule]::new(
+                [System.Security.Principal.SecurityIdentifier]::new($Sid),
+                $rightsValue,
+                [System.Security.AccessControl.InheritanceFlags]$Inheritance,
+                [System.Security.AccessControl.PropagationFlags]$Propagation,
+                [System.Security.AccessControl.AccessControlType]$Type)
+        }
+    }
+
+    It '所有者是 Administrators 且只有管理员可写时可信' {
+        $rules = @(
+            (New-TestRule -Sid 'S-1-5-18' -Rights 'FullControl'),
+            (New-TestRule -Sid 'S-1-5-32-544' -Rights 'FullControl'),
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights 'ReadAndExecute')
+        )
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+    }
+
+    It '普通用户有写权限时不可信' {
+        $rules = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write')
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+    }
+
+    It '显式授予普通用户 SID 的 Modify 也不可信' {
+        $rules = @(New-TestRule -Sid 'S-1-5-21-111111111-222222222-333333333-1001' -Rights 'Modify')
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+    }
+
+    It '所有者是普通用户时不可信' {
+        Test-AclEntries -OwnerSid 'S-1-5-21-111111111-222222222-333333333-1001' | Should -BeFalse
+    }
+
+    It '仅 WRITE_DAC 也不可信' {
+        $rules = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'ChangePermissions')
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+    }
+
+    It '父目录模式忽略“建文件”权限，但仍拦截删除' {
+        $create = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write' -Inheritance 'ContainerInherit')
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $create -Ancestor | Should -BeTrue
+
+        $delete = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Delete' -Inheritance 'ContainerInherit')
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $delete -Ancestor | Should -BeFalse
+    }
+
+    It '普通用户拥有的临时目录不可信' {
+        $d = Join-Path $TestDrive 'trust-dir'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Test-BackupPathTrusted -Path $d -Root $TestDrive | Should -BeFalse
+    }
+
+    It '不存在的路径不可信' {
+        Test-BackupPathTrusted -Path (Join-Path $TestDrive 'nope') -Root $TestDrive | Should -BeFalse
+    }
+
+    It '系统 hosts 自动挑选只保留可信目录，-AllowUntrustedBackup 才放行' {
+        $d = Join-Path $TestDrive 'untrusted-bk'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $r = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $true
+        @($r.Trusted).Count | Should -Be 0
+        @($r.Untrusted) | Should -Contain $d
+
+        $r2 = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $true -AllowUntrusted
+        @($r2.Trusted) | Should -Contain $d
+
+        $r3 = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $false
+        @($r3.Trusted) | Should -Contain $d
+    }
+}
+
+Describe 'F08 备份目录选择与回退' {
+    It '只计算已存在的候选目录，不创建' {
+        $a = Join-Path $TestDrive 'bk-a'
+        $b = Join-Path $TestDrive 'bk-b'
+        New-Item -ItemType Directory -Force -Path $a | Out-Null
+        $dirs = @(Get-HostsBackupDirs -BaseCandidates @($a, $b))
+        $dirs | Should -Contain $a
+        $dirs | Should -Not -Contain $b
+        Test-Path -LiteralPath $b | Should -BeFalse
+    }
+
+    It '首个候选不可创建时回退到下一个' {
+        $bad = Join-Path $TestDrive 'bk-file'
+        Set-Content -LiteralPath $bad -Value 'not a directory'
+        $good = Join-Path $TestDrive 'bk-good'
+        $dir = Get-HostsBackupDir -BaseCandidates @($bad, $good)
+        $dir | Should -Be $good
+        Test-Path -LiteralPath (Join-Path $good '.cfo-write-test-should-not-exist.tmp') | Should -BeFalse
+    }
+}
+
+Describe 'F05 两阶段提交' {
+    BeforeAll {
+        function Get-ContentHash {
+            param([string]$Text)
+            return Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($Text))
+        }
+        function New-ManifestBackup {
+            param([string]$Dir, [string]$Name, [string]$Content, [hashtable]$Manifest)
+            $bak = Join-Path $Dir $Name
+            [IO.File]::WriteAllText($bak, $Content)
+            ($Manifest | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+            return $bak
+        }
+    }
+
+    It '未完成的 B→C 不会被当成最新已完成事务（回滚应恢复 A）' {
+        $h = Join-Path $TestDrive 'p1-hosts'
+        [IO.File]::WriteAllText($h, 'B')
+        $dir = Join-Path $TestDrive 'p1-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $hA = Get-ContentHash 'A'; $hB = Get-ContentHash 'B'; $hC = Get-ContentHash 'C'
+
+        $null = New-ManifestBackup -Dir $dir -Name 'hosts-20260101-000001-aaaaaaaa.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:01.0000000+08:00'; hostsPath = $h
+            preHash = $hA; intendedHash = $hB; postHash = $hB; state = 'committed'
+        }
+        $null = New-ManifestBackup -Dir $dir -Name 'hosts-20260101-000002-bbbbbbbb.bak' -Content 'B' -Manifest @{
+            createdAt = '2026-01-01T00:00:02.0000000+08:00'; hostsPath = $h
+            preHash = $hB; intendedHash = $hC; postHash = $null; state = 'pending'
+        }
+
+        $r = Invoke-HostsRollback -HostsPath $h -BackupDir $dir
+        $r.Unchanged | Should -BeFalse
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'A'
+    }
+
+    It '已替换但完成标记未落盘的 pending，按已完成恢复且不需要 -Force' {
+        $h = Join-Path $TestDrive 'p2-hosts'
+        [IO.File]::WriteAllText($h, 'C')
+        $dir = Join-Path $TestDrive 'p2-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $hB = Get-ContentHash 'B'; $hC = Get-ContentHash 'C'
+
+        $null = New-ManifestBackup -Dir $dir -Name 'hosts-20260101-000003-cccccccc.bak' -Content 'B' -Manifest @{
+            createdAt = '2026-01-01T00:00:03.0000000+08:00'; hostsPath = $h
+            preHash = $hB; intendedHash = $hC; postHash = $null; state = 'pending'
+        }
+
+        $r = Invoke-HostsRollback -HostsPath $h -BackupDir $dir -Force:$false
+        $r.Unchanged | Should -BeFalse
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'B'
+    }
+
+    It 'aborted 记录不参与挑选' {
+        $h = Join-Path $TestDrive 'p3-hosts'
+        [IO.File]::WriteAllText($h, 'B')
+        $dir = Join-Path $TestDrive 'p3-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $hA = Get-ContentHash 'A'; $hB = Get-ContentHash 'B'
+        $null = New-ManifestBackup -Dir $dir -Name 'hosts-20260101-000004-dddddddd.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:04.0000000+08:00'; hostsPath = $h
+            preHash = $hA; intendedHash = $hB; postHash = $null; state = 'aborted'
+        }
+        { Invoke-HostsRollback -HostsPath $h -BackupDir $dir } | Should -Throw '*没有找到*'
+    }
+
+    It '旧格式（无 state、有 postHash）仍按已完成处理' {
+        $h = Join-Path $TestDrive 'p4-hosts'
+        [IO.File]::WriteAllText($h, 'B')
+        $dir = Join-Path $TestDrive 'p4-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $hA = Get-ContentHash 'A'; $hB = Get-ContentHash 'B'
+        $null = New-ManifestBackup -Dir $dir -Name 'hosts-20260101-000005-eeeeeeee.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:05.0000000+08:00'; hostsPath = $h
+            preHash = $hA; postHash = $hB
+        }
+        $r = Invoke-HostsRollback -HostsPath $h -BackupDir $dir
+        $r.Unchanged | Should -BeFalse
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'A'
+    }
+
+    It '写入成功后 manifest 标记为 committed 并记录实际哈希' {
+        $tmp = Join-Path $TestDrive 'p5-hosts.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $dir = Join-Path $TestDrive 'p5-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+        $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $dir -Version 'test'
+        $w.Changed | Should -BeTrue
+        $w.Verified | Should -BeTrue
+        $w.Warning | Should -BeNullOrEmpty
+
+        $m = Get-Content -LiteralPath "$($w.Backup).json" -Raw -Encoding utf8 | ConvertFrom-Json
+        $m.state | Should -Be 'committed'
+        $m.intendedHash | Should -Not -BeNullOrEmpty
+        $m.postHash | Should -Be (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+        $m.verified | Should -BeTrue
     }
 }

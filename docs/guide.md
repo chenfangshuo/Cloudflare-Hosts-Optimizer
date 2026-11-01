@@ -34,7 +34,7 @@
 ### 首次启动
 
 ```text
-Cloudflare-Hosts-Optimizer 0.5.5
+Cloudflare-Hosts-Optimizer 0.5.6
 域名 12 个 · hosts 已写入 10 个 · CFST 已安装
 上次运行：2026-11-01 10:28 · 写入 · 退出码 0
 最近提交：写入 · 2026-11-01 10:28
@@ -63,7 +63,7 @@ Cloudflare-Hosts-Optimizer 0.5.5
 | 4 定时任务 | 安装 DryRun / AutoApply 任务，或卸载 | AutoApply 需要 |
 | 5 查看上次报告 | 显示 `last-report.txt`：80 行以内全看，更长时取头部 + 最后 40 行 | 否 |
 | 6 打开 README | 用记事本打开仓库根目录的 `README.md` | 否 |
-| 7 环境自检 (Doctor) | 只读检查环境、hosts、域名、CFST、端点、代理/TUN、备份、计划任务 | 否 |
+| 7 环境自检 (Doctor) | 检查环境、hosts、域名、CFST、端点、代理/TUN、备份、计划任务（不改 hosts） | 否 |
 | 8 只看结果 (DryRun，不改 hosts) | 完整跑一遍但不写 hosts（菜单里会顺带写报告） | 否 |
 | 9 正式写入 hosts | 写入系统 hosts | 是（弹 UAC） |
 | 10 回滚到上次备份 | 用最近一次备份恢复 hosts | 是（弹 UAC） |
@@ -77,7 +77,8 @@ Cloudflare-Hosts-Optimizer 0.5.5
 - 会先弹 UAC，取消则回到菜单，不会中断；
 - 管理员窗口跑完后提示「执行完毕（退出码 N），按 Enter 关闭此窗口」，按回车窗口自动关闭、
   回到菜单；结束后主窗口也会显示管理员窗口的退出码；
-- 结果同时写进 `last-report.txt`，菜单里可以查看。
+- 正式写入和 DryRun 的结果写进 `last-report.txt`，菜单里可以查看；**回滚默认不覆盖报告**，
+  只在 `last-run.json` 里更新摘要。
 
 「定时任务」子菜单会先列出已注册任务（名称、状态、下次运行、上次结果）；查询失败时显示
 「任务状态：未知（查询失败…）」，不会当成没有任务。安装 AutoApply 会先确认（它会按计划
@@ -128,7 +129,8 @@ Cloudflare-Hosts-Optimizer 0.5.5
 ```
 
 **隐私边界**：只打开 `metadata.json`，绝不读取 `cookies.json`、`userInfo.json`、
-`downloadHistory.json`；控制台只打印数量，不打印域名、passkey 或完整 URL。
+`downloadHistory.json`；命令行默认只打印数量，菜单导入会列出前 15 个域名供确认。
+任何情况下都不打印 passkey 或完整 URL。
 为避免异常备份，导入器会拒绝重复的 `metadata.json` 和超过 8MB 的解压内容。
 
 如果你用的是 PTPP（PT-Depiler 的前身），备份结构不同，当前不保证支持；改用
@@ -210,7 +212,8 @@ Cloudflare-Hosts-Optimizer\
 
 - 延迟扫描：每个候选几十字节的 trace 请求。
 - 吞吐初测：32 × 1MB ≈ 32MB；决赛 6 × 3 × 2MB ≈ 36MB。
-- 站点验证：每域名典型 6–10 次、最坏 11 次 HEAD；403/503 额外 1 次 ≤64KB 的 GET。
+- 站点验证：每域名典型 6–10 次、最坏 11 次 HEAD；每个返回 403/503 的 HEAD 都可能再补
+  1 次 ≤64KB 的 GET（不是整域名只补一次）。同一物理 IP 最多 2 次 HEAD。
 
 合计约 **70MB**，可用 `-ThroughputCandidates`、`-ThroughputBytes`、`-RefineTop` 调整。
 
@@ -324,8 +327,9 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\Cloudflare-Hosts-O
 | `-PlanPath` | `.\plan.json` | `-Plan` 的 JSON 输出路径 |
 | `-Rollback` | | 用最近一次备份恢复 hosts（不依赖 domains.txt） |
 | `-RollbackFrom` | 最近一次 | 与 `-Rollback` 同用，恢复指定的 `hosts-*.bak`，用于退回更早状态 |
+| `-AllowUntrustedBackup` | | 与 `-Rollback`、`-RollbackFrom` 同用：允许恢复普通用户可写目录里的备份（只在你确认来源时使用） |
 | `-Version` | | 打印版本号并退出 |
-| `-Doctor` | | 只读自检，有失败项退出码 1 |
+| `-Doctor` | | 自检（不改 hosts、不需要管理员），有失败项退出码 1 |
 | `-InstallTask` | | 注册计划任务并退出（默认 DryRun，不需要管理员） |
 | `-UninstallTask` | | 删除计划任务并退出；不带 `-TaskName` 时删两个默认任务 |
 | `-TaskMode` | `DryRun` | 计划任务模式：`DryRun` 只写报告，`AutoApply` 自动写入 hosts（需管理员） |

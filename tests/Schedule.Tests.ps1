@@ -71,8 +71,9 @@ Describe 'New-OptimizerTaskSpec' {
             SpeedTestUrl = 'https://speed.cloudflare.com/__down?bytes={bytes}'
         }
         $s.Arguments | Should -Match '-NoCfst'
-        $s.Arguments | Should -Match '-TopN "2"'
-        $s.Arguments | Should -Match '-SpeedTestUrl "https://speed\.cloudflare\.com/__down\?bytes=\{bytes\}"'
+        # 不含空白/引号的参数不再强行加引号（0.5.6 起按 Windows 命令行规则序列化）
+        $s.Arguments | Should -Match '-TopN 2'
+        $s.Arguments | Should -Match '-SpeedTestUrl https://speed\.cloudflare\.com/__down\?bytes=\{bytes\}'
         # 排序：NoCfst 在 SpeedTestUrl 前，SpeedTestUrl 在 TopN 前
         $s.Arguments.IndexOf('-NoCfst') | Should -BeLessThan $s.Arguments.IndexOf('-SpeedTestUrl')
     }
@@ -113,5 +114,95 @@ Describe 'Uninstall-OptimizerTask' {
     It '不传任务名时目标为两个默认任务' {
         $rows = @(Uninstall-OptimizerTask -WhatIf)
         @($rows.TaskName) | Should -Be @('Cloudflare-Hosts-Optimizer DryRun', 'Cloudflare-Hosts-Optimizer AutoApply')
+    }
+}
+
+Describe 'F02 卸载只处理本工具的精确任务' {
+    It '拒绝通配符任务名' {
+        { Uninstall-OptimizerTask -TaskName '*' -WhatIf } | Should -Throw '*任务名无效*'
+        { Uninstall-OptimizerTask -TaskName '?' -WhatIf } | Should -Throw '*任务名无效*'
+    }
+
+    It '数组里有一个非法名时不删除任何任务' {
+        Mock Get-ScheduledTask { @() }
+        Mock Remove-OptimizerTask { }
+        { Uninstall-OptimizerTask -TaskName @('Valid Name', '*') -WhatIf } | Should -Throw
+        Should -Invoke Remove-OptimizerTask -Times 0
+    }
+
+    It '同名但不是本工具注册的任务不会被删除' {
+        Mock Get-ScheduledTask {
+            [pscustomobject]@{
+                TaskName = 'Cloudflare-Hosts-Optimizer DryRun'
+                Actions  = @([pscustomobject]@{ Execute = 'C:\Windows\System32\notepad.exe'; Arguments = '' })
+            }
+        }
+        Mock Remove-OptimizerTask { }
+        $rows = @(Uninstall-OptimizerTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun' -WhatIf)
+        $rows[0].Removed | Should -BeFalse
+        $rows[0].Detail | Should -Match '不是本工具'
+        Should -Invoke Remove-OptimizerTask -Times 0
+    }
+
+    It '本工具注册的任务按对象删除，方括号按字面匹配' {
+        $script:f02Task = [pscustomobject]@{
+            TaskName = 'My [Special] Task'
+            Actions  = @([pscustomobject]@{
+                    Execute   = 'C:\Program Files\PowerShell\7\pwsh.exe'
+                    Arguments = '-NoProfile -File D:\tools\Cloudflare-Hosts-Optimizer.ps1 -DryRun'
+                })
+        }
+        Mock Get-ScheduledTask { $script:f02Task }
+        Mock Remove-OptimizerTask { }
+        # 不加 -WhatIf，让 ShouldProcess 返回 true；真正的删除命令已被 Mock 拦截
+        $rows = @(Uninstall-OptimizerTask -TaskName 'My [Special] Task')
+        $rows[0].Removed | Should -BeTrue
+        $rows[0].Detail | Should -Be '已删除'
+        Should -Invoke Remove-OptimizerTask -Times 1
+    }
+}
+
+Describe 'F09 任务参数序列化' {
+    It '不含空白和引号的参数原样输出' {
+        ConvertTo-NativeArgument -Value '2' | Should -Be '2'
+        ConvertTo-NativeArgument -Value 'D:\cfst\cfst.exe' | Should -Be 'D:\cfst\cfst.exe'
+    }
+
+    It '不含空白的尾反斜杠路径不需要引号（反斜杠只在引号内才需要翻倍）' {
+        ConvertTo-NativeArgument -Value 'D:\cfst\' | Should -Be 'D:\cfst\'
+    }
+
+    It '含空格的尾反斜杠路径必须加引号并翻倍' {
+        ConvertTo-NativeArgument -Value 'D:\my cfst\' | Should -Be '"D:\my cfst\\"'
+    }
+
+    It '含空白的参数加引号' {
+        ConvertTo-NativeArgument -Value 'C:\a b\x.txt' | Should -Be '"C:\a b\x.txt"'
+    }
+
+    It '引号前的反斜杠按规则转义' {
+        ConvertTo-NativeArgument -Value 'a\"b' | Should -Be '"a\\\"b"'
+    }
+
+    It '真实子进程往返：尾反斜杠与含空格路径不失真' {
+        $echo = Join-Path $TestDrive 'echo-args.ps1'
+        Set-Content -LiteralPath $echo -Encoding utf8 -Value 'param([string]$CfstPath,[string]$DomainsFile) Write-Output ($CfstPath + "|" + $DomainsFile)'
+        $spec = New-OptimizerTaskSpec -Root $script:RepoRoot -ExtraParameters @{
+            CfstPath    = 'D:\my cfst\'
+            DomainsFile = 'C:\a b\d.txt'
+        }
+        $scriptPath = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = (Get-Command pwsh).Source
+        $psi.Arguments = $spec.Arguments.Replace(
+            (ConvertTo-NativeArgument -Value $scriptPath),
+            (ConvertTo-NativeArgument -Value $echo))
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $p.WaitForExit()
+        $out.Trim() | Should -Be 'D:\my cfst\|C:\a b\d.txt'
     }
 }

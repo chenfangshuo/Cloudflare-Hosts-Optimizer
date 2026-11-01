@@ -73,10 +73,40 @@ function Read-RunSummary {
     }
 }
 
+# PowerShell 7.5+ 的 ConvertFrom-Json 会把 ISO 时间直接反序列化成 DateTime。
+# 再用 [string] 转一次会丢毫秒/时区（变成“2026/11/1 17:00:00”这类本地化文本），
+# 同秒内的提交会因此排错顺序，缓存也会按错误时区算寿命。这里接受对象：
+# DateTime/DateTimeOffset 原样使用，只有字符串才按 RoundtripKind 解析。
 function ConvertTo-SummaryDate {
-    param([AllowEmptyString()][string]$Text)
-    if (-not $Text) { return $null }
-    try { return [datetime]::Parse($Text) } catch { return $null }
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $text = [string]$Value
+    if (-not $text) { return $null }
+    try {
+        return [datetime]::Parse($text, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+    } catch { return $null }
+}
+
+# 内部比较统一 UTC；显示时转回本地时间，避免 UTC+8 用户看到早 8 小时的时间。
+function ConvertTo-SummaryUtc {
+    param($Value)
+    $t = ConvertTo-SummaryDate -Value $Value
+    if (-not $t) { return $null }
+    if ($t.Kind -eq [DateTimeKind]::Utc) { return $t }
+    if ($t.Kind -eq [DateTimeKind]::Local) { return $t.ToUniversalTime() }
+    # Unspecified（旧格式没有偏移）：按本地时间解释，和以前的行为一致
+    return [datetime]::SpecifyKind($t, [DateTimeKind]::Local).ToUniversalTime()
+}
+
+function Format-SummaryLocalTime {
+    param($Value)
+    $t = ConvertTo-SummaryDate -Value $Value
+    if (-not $t) { return '' }
+    if ($t.Kind -eq [DateTimeKind]::Utc) { $t = $t.ToLocalTime() }
+    return $t.ToString('yyyy-MM-dd HH:mm')
 }
 
 function Write-RunSummary {
@@ -114,8 +144,8 @@ function Write-RunSummary {
         }
         $record = [ordered]@{ lastRun = $Run; commits = $commits }
         if ($existing) {
-            $oldFinished = ConvertTo-SummaryDate -Text ([string]$existing.lastRun.finishedAt)
-            $newFinished = ConvertTo-SummaryDate -Text ([string]$Run.finishedAt)
+            $oldFinished = ConvertTo-SummaryUtc -Value $existing.lastRun.finishedAt
+            $newFinished = ConvertTo-SummaryUtc -Value $Run.finishedAt
             if ($oldFinished -and $newFinished -and $oldFinished -gt $newFinished) {
                 $record.lastRun = $existing.lastRun
             }
@@ -123,14 +153,15 @@ function Write-RunSummary {
 
         if ($Committed) {
             # 提交时间取事务锁内记录的 committedAt；缺失时才退回 finishedAt
-            $newAt = ConvertTo-SummaryDate -Text ([string]$Run.committedAt)
-            if (-not $newAt) { $newAt = ConvertTo-SummaryDate -Text ([string]$Run.finishedAt) }
+            $newAt = ConvertTo-SummaryDate -Value $Run.committedAt
+            if (-not $newAt) { $newAt = ConvertTo-SummaryDate -Value $Run.finishedAt }
             $key = ConvertTo-SummaryPathKey -Path ([string]$Run.hostsPath)
             if ($key -and $newAt) {
                 $oldAt = $null
                 $old = $commits[$key]
-                if ($old) { $oldAt = ConvertTo-SummaryDate -Text ([string]$old.at) }
-                if (-not $oldAt -or $newAt -ge $oldAt) {
+                if ($old) { $oldAt = ConvertTo-SummaryUtc -Value $old.at }
+                $newUtc = ConvertTo-SummaryUtc -Value $newAt
+                if (-not $oldAt -or $newUtc -ge $oldAt) {
                     $commits[$key] = [pscustomobject]@{
                         runId     = $Run.runId
                         mode      = if ($CommitMode) { $CommitMode } else { $Run.mode }
@@ -173,9 +204,7 @@ function Format-RunSummaryLine {
     if ($Summary -and $Summary.lastRun) {
         $r = $Summary.lastRun
         $mode = if ($modeLabel.ContainsKey([string]$r.mode)) { $modeLabel[[string]$r.mode] } else { [string]$r.mode }
-        $time = ''
-        $t = ConvertTo-SummaryDate -Text ([string]$r.finishedAt)
-        if ($t) { $time = $t.ToString('yyyy-MM-dd HH:mm') }
+        $time = Format-SummaryLocalTime -Value $r.finishedAt
         $sandbox = ''
         if ($SystemHostsPath -and $r.hostsPath) {
             try {
@@ -209,9 +238,7 @@ function Format-RunSummaryLine {
     }
     if ($commit) {
         $mode = if ($commit.mode -eq 'rollback') { '回滚' } else { '写入' }
-        $time = ''
-        $t = ConvertTo-SummaryDate -Text ([string]$commit.at)
-        if ($t) { $time = $t.ToString('yyyy-MM-dd HH:mm') }
+        $time = Format-SummaryLocalTime -Value $commit.at
         $lastCommitText = "最近提交：$mode · $time"
     }
 

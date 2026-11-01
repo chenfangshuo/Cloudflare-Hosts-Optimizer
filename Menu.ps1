@@ -22,6 +22,7 @@ $HostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
 $ReportPath = Join-Path $Root 'last-report.txt'
 $CfstDir = Join-Path $Root 'cfst'
 
+. (Join-Path $Root 'lib\Safety.ps1')
 . (Join-Path $Root 'lib\Domains.ps1')
 . (Join-Path $Root 'lib\HostsFile.ps1')
 . (Join-Path $Root 'lib\Probe.ps1')
@@ -381,7 +382,8 @@ function Invoke-EditDomains {
             Write-Host "domains.txt 现有 $(@($r.Domains).Count) 个域名。" -ForegroundColor Green
             return
         }
-        Write-Host "有 $($invalid.Count) 个非法项：$($invalid -join ', ')" -ForegroundColor Yellow
+        $invalidText = @($r.InvalidItems | ForEach-Object { "第 $($_.Line) 行 $($_.Preview)" }) -join '，'
+        Write-Host "有 $($invalid.Count) 个非法项：$invalidText" -ForegroundColor Yellow
         $again = Read-Host '重新打开编辑？[Y/n]'
         if ($again -match '^[Nn]') { return }
     }
@@ -396,7 +398,10 @@ function Show-DomainOverview {
     } else {
         Write-Host "domains.txt（$($o.Listed.Count) 个）：" -ForegroundColor Cyan
         foreach ($d in $o.Listed) { Write-Host "  $d" }
-        if ($o.Invalid.Count -gt 0) { Write-Host "非法项：$($o.Invalid -join ', ')" -ForegroundColor Yellow }
+        if ($o.Invalid.Count -gt 0) {
+            $invalidText = @($o.InvalidItems | ForEach-Object { "第 $($_.Line) 行 $($_.Preview)" }) -join '，'
+            Write-Host "非法项：$invalidText" -ForegroundColor Yellow
+        }
     }
     Write-Host ''
     if ($o.HostsError) {
@@ -418,7 +423,13 @@ function Show-Report {
         Write-Host '还没有报告：先跑一次 DryRun 或正式写入。' -ForegroundColor Yellow
         return
     }
-    $lines = @(Get-Content -LiteralPath $ReportPath)
+    # 报告可能正被别的程序独占打开；读失败不应该结束整个菜单
+    try {
+        $lines = @(Get-Content -LiteralPath $ReportPath -ErrorAction Stop)
+    } catch {
+        Write-Host "报告读取失败：$(Protect-ErrorMessage -Text $_.Exception.Message)" -ForegroundColor Red
+        return
+    }
     $marker = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i].Trim() -eq '=== 详细日志 ===') { $marker = $i; break }
@@ -432,7 +443,12 @@ function Show-Report {
         Write-Host '提示：以下为较早报告；最近一次运行（或回滚）没有覆盖它。' -ForegroundColor Yellow
     }
 
-    $time = (Get-Item -LiteralPath $ReportPath).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    try {
+        $time = (Get-Item -LiteralPath $ReportPath -ErrorAction Stop).LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    } catch {
+        Write-Host "报告读取失败：$(Protect-ErrorMessage -Text $_.Exception.Message)" -ForegroundColor Red
+        return
+    }
     Write-Host "报告：$ReportPath（$time）" -ForegroundColor DarkGray
     if ($lines.Count -le 80) {
         foreach ($l in $lines) { Write-Host $l }
@@ -604,19 +620,42 @@ if ($Action) {
     exit 0
 }
 
-try {
-    $firstMenu = $true
-    while ($true) {
+# 主循环抽成函数：单次动作的异常在这里吞掉并回到菜单，只有退出/致命错误才结束会话。
+function Invoke-MenuLoop {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ReadChoice,
+        [Parameter(Mandatory)][scriptblock]$InvokeAction,
+        [Parameter(Mandatory)][scriptblock]$OnError,
+        [int]$MaxIterations = 10000
+    )
+    $first = $true
+    for ($i = 0; $i -lt $MaxIterations; $i++) {
         # 首次打开按状态定位；执行过动作或从子菜单返回后默认停在“退出”，
         # 避免连续按 Enter 重复启动 DryRun/写入。
-        $spec = Read-MenuChoice -Menu Main -Returning:(-not $firstMenu)
-        $firstMenu = $false
-        if (-not $spec -or $spec.Kind -eq 'Exit') { break }
-        $keep = Invoke-Choice -Spec $spec
-        if (-not $keep) { break }
+        $spec = & $ReadChoice $first
+        $first = $false
+        if (-not $spec -or $spec.Kind -eq 'Exit') { return }
+        try {
+            $keep = & $InvokeAction $spec
+        } catch {
+            & $OnError $_
+            $keep = $true
+        }
+        if (-not $keep) { return }
     }
+}
+
+try {
+    Invoke-MenuLoop `
+        -ReadChoice { param($first) Read-MenuChoice -Menu Main -Returning:(-not $first) } `
+        -InvokeAction { param($spec) Invoke-Choice -Spec $spec } `
+        -OnError {
+            param($err)
+            Write-Host "操作出错：$(Protect-ErrorMessage -Text $err.Exception.Message)" -ForegroundColor Red
+            Pause-Menu
+        }
 } catch {
-    Write-Host "菜单出错：$($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "菜单出错：$(Protect-ErrorMessage -Text $_.Exception.Message)" -ForegroundColor Red
     Pause-Menu
     exit 1
 }

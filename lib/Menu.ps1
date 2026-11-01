@@ -253,12 +253,14 @@ function Get-DomainOverview {
     )
     $listed = @()
     $invalid = @()
+    $invalidItems = @()
     $listedError = ''
     if (Test-Path -LiteralPath $DomainsFile) {
         try {
             $res = Read-DomainsFile -Path $DomainsFile
             $listed = @($res.Domains)
             $invalid = @($res.Invalid)
+            $invalidItems = @($res.InvalidItems)
         } catch {
             $listedError = $_.Exception.Message
         }
@@ -285,6 +287,7 @@ function Get-DomainOverview {
         DomainsFile  = $DomainsFile
         Listed       = @($listed)
         Invalid      = @($invalid)
+        InvalidItems = @($invalidItems)
         ListedError  = $listedError
         Managed      = $managed
         HostsError   = $hostsError

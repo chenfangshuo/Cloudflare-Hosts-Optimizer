@@ -545,3 +545,78 @@ Describe 'Get-CfClassRank / 复核降级' {
         (Resolve-SwitchConfirmation -BaseTtfb 0.5 -BestTtfb 0.5 -BaselineClass 'waf' -CandidateClass 'ok' -Reason 'better-class').Switch | Should -BeTrue
     }
 }
+
+Describe 'F11 切换阈值边界' {
+    It '14.96% 不应因四舍五入被放行' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 1.0 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.8504 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15 -MinImprovementMs 30
+        $d.Changed | Should -BeFalse
+    }
+
+    It '恰好 15% 应通过（浮点结果是 14.999999999999996）' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 0.6 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.51 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 15 -MinImprovementMs 30
+        $d.Changed | Should -BeTrue
+        $d.ImprovementPct | Should -Be 15
+    }
+
+    It '恰好 30ms 应通过（浮点结果 29.99999999999997）' {
+        $b = [pscustomobject]@{ IP = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 0.3 }
+        $c = @([pscustomobject]@{ IP = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.27 })
+        $d = Select-DomainIp -Baseline $b -Candidates $c -MinImprovementPct 0 -MinImprovementMs 30
+        $d.Changed | Should -BeTrue
+    }
+
+    It '复核路径同样使用未舍入值' {
+        $ok = Resolve-SwitchConfirmation -BaseTtfb 0.6 -BestTtfb 0.51 -MinImprovementPct 15 -MinImprovementMs 30
+        $ok.Switch | Should -BeTrue
+
+        $bad = Resolve-SwitchConfirmation -BaseTtfb 1.0 -BestTtfb 0.8504 -MinImprovementPct 15 -MinImprovementMs 30
+        $bad.Switch | Should -BeFalse
+    }
+}
+
+Describe 'F07 每 IP 请求预算辅助函数' {
+    It '同一 IP 第 3 次不再放行' {
+        $budget = @{}
+        Test-ProbeBudgetAllows -Budget $budget -Ip '1.1.1.1' | Should -BeTrue
+        Add-ProbeUse -Budget $budget -Ip '1.1.1.1'
+        Test-ProbeBudgetAllows -Budget $budget -Ip '1.1.1.1' | Should -BeTrue
+        Add-ProbeUse -Budget $budget -Ip '1.1.1.1'
+        Test-ProbeBudgetAllows -Budget $budget -Ip '1.1.1.1' | Should -BeFalse
+        Add-ProbeUse -Budget $budget -Ip '1.1.1.1'
+        $budget['1.1.1.1'] | Should -Be 3
+    }
+
+    It '没有 RemoteIp 的探测不计数，但没有 IP 时默认放行' {
+        $budget = @{}
+        Add-ProbeUse -Budget $budget -Ip ''
+        Add-ProbeUse -Budget $budget -Ip $null
+        $budget.Count | Should -Be 0
+        Test-ProbeBudgetAllows -Budget $budget -Ip '' | Should -BeTrue
+    }
+}
+
+Describe 'F10 机房缓存的时间类型' {
+    It 'UTC 缓存 13.8 天仍然有效（不受本机时区影响）' {
+        $path = Join-Path $TestDrive 'cache-f10a.json'
+        [pscustomobject]@{
+            version = 1; updatedAt = '2026-10-18T04:00:00Z'; colos = @('HKG', 'LAX')
+        } | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding utf8
+        $now = [datetime]::Parse('2026-11-01T00:00:00Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        Read-ColoCache -Path $path -MaxAgeDays 14 -Now $now | Should -Not -BeNullOrEmpty
+    }
+
+    It 'UTC 缓存 14.2 天已过期' {
+        $path = Join-Path $TestDrive 'cache-f10b.json'
+        [pscustomobject]@{
+            version = 1; updatedAt = '2026-10-17T20:00:00Z'; colos = @('HKG', 'LAX')
+        } | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding utf8
+        $now = [datetime]::Parse('2026-11-01T00:00:00Z', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+        Read-ColoCache -Path $path -MaxAgeDays 14 -Now $now | Should -BeNullOrEmpty
+    }
+}

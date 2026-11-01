@@ -30,7 +30,8 @@ No commands — download, extract, double-click:
 3. **(Optional) Press `3` to download / update CFST**: wider candidate coverage and usually a
    better result; without it the built-in scanner is used, but it can miss good IPs.
 4. **(Optional) Press `8` for a dry run**: no hosts changes, just a preview of what would switch.
-5. **Press `9` to apply**, confirm the UAC prompt — and press `10` to roll back at any time.
+5. **Press `9` to apply**, confirm the UAC prompt — and **select item 10 ("roll back")** with the
+   arrow keys at any time.
 
 Keys: `↑`/`↓` to move, `1`–`9` jump to the first nine items, item 10 ("roll back") with the arrow
 keys, `0` to exit / go back, `Enter` to confirm, `Esc` to go back. The first run takes about

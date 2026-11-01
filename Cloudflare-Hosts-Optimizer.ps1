@@ -32,6 +32,11 @@
     与 -Rollback 同用：恢复指定备份（hosts-*.bak 文件），而不是最近一次。
     只在最近一次备份已经写坏、需要退回更早状态时使用。
 
+.PARAMETER AllowUntrustedBackup
+    与 -Rollback 同用：允许使用“普通用户可改写”的目录/文件里的备份。
+    系统 hosts 的自动回滚默认只信管理员/SYSTEM 独占写权限的备份；只有你确认某个
+    旧备份内容可信、又需要人工恢复时才用这个开关。它不会绕过 manifest/preHash 校验。
+
 .PARAMETER Version
     打印版本号并退出。
 
@@ -186,6 +191,7 @@ param(
     [string]$HostsPath,
     [string]$ReportPath,
     [string]$PlanPath,
+    [switch]$AllowUntrustedBackup,
     [ValidateRange(1, 5)][int]$ScanSamples = 2,
     [ValidateRange(16, 512)][int]$MaxCandidates = 192,
     [ValidateRange(4, 64)][int]$ThroughputCandidates = 32,
@@ -196,7 +202,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.5'
+$ScriptVersion = '0.5.6'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -212,6 +218,7 @@ if ($Version) {
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $script:RepoRoot = $Root
 
+. (Join-Path $Root 'lib\Safety.ps1')
 . (Join-Path $Root 'lib\Domains.ps1')
 . (Join-Path $Root 'lib\HostsFile.ps1')
 . (Join-Path $Root 'lib\Probe.ps1')
@@ -367,7 +374,8 @@ function Invoke-Doctor {
     if ($Domains) {
         $bad = @($Domains | Where-Object { -not (ConvertTo-NormalizedDomain -Value $_ -Strict) })
         if ($bad.Count -gt 0) {
-            & $add '域名' '域名列表' 'FAIL' "非法项：$($bad -join ', ')"
+            $badPreview = @($bad | ForEach-Object { Get-SafeInputPreview -Value $_ })
+            & $add '域名' '域名列表' 'FAIL' "非法项：$($badPreview -join ', ')"
         } else {
             $domainList = @($Domains | ForEach-Object { ConvertTo-NormalizedDomain -Value $_ -Strict })
             & $add '域名' '域名列表' 'OK' "来自 -Domains，共 $($domainList.Count) 个"
@@ -378,7 +386,8 @@ function Invoke-Doctor {
         try {
             $res = Read-DomainsFile -Path $domainsFileResolved
             if ($res.Invalid.Count -gt 0) {
-                & $add '域名' 'domains.txt' 'FAIL' "非法项：$($res.Invalid -join ', ')"
+                $invalidText = @($res.InvalidItems | ForEach-Object { "第 $($_.Line) 行 $($_.Preview)" }) -join '，'
+                & $add '域名' 'domains.txt' 'FAIL' "非法项：$invalidText"
             } elseif (@($res.Domains).Count -eq 0) {
                 & $add '域名' 'domains.txt' 'WARN' "文件里没有域名：$domainsFileResolved"
             } else {
@@ -558,18 +567,36 @@ function Invoke-TaskInstall {
     if ($script:ScriptBoundParameters.ContainsKey('Domains')) {
         Fail '-InstallTask 不支持 -Domains：域名数组没法安全写进任务命令行，也会把站点清单暴露在任务参数里。请用 domains.txt 或 -DomainsFile。' 2
     }
-    $df = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
+    # 任务的工作目录固定为仓库根；相对路径必须在这里按“调用者当前目录”定死成绝对路径，
+    # 否则安装时校验的和运行时打开的可能不是同一个文件。
+    $makeAbsolute = {
+        param([string]$p)
+        if (-not $p) { return $p }
+        try {
+            if ([IO.Path]::IsPathRooted($p)) { return [IO.Path]::GetFullPath($p) }
+            return [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $p))
+        } catch { return $p }
+    }
+
+    $df = & $makeAbsolute ($(if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }))
     if (-not (Test-Path -LiteralPath $df)) { Fail "找不到域名文件：$df。计划任务每次运行都要用它。" 2 }
     $res = Read-DomainsFile -Path $df
-    if ($res.Invalid.Count -gt 0) { Fail "域名文件含非法项：$($res.Invalid -join ', ')" 2 }
+    if ($res.Invalid.Count -gt 0) {
+        $invalidText = @($res.InvalidItems | ForEach-Object { "第 $($_.Line) 行 $($_.Preview)" }) -join '，'
+        Fail "域名文件含非法项：$invalidText" 2
+    }
     if (@($res.Domains).Count -eq 0) { Fail "域名文件里没有域名：$df" 2 }
 
     $extra = @{}
     foreach ($k in $script:TaskPassThroughParams) {
         if ($script:ScriptBoundParameters.ContainsKey($k)) { $extra[$k] = $script:ScriptBoundParameters[$k] }
     }
-    if ($DomainsFile) { $extra['DomainsFile'] = $DomainsFile }
-    $report = if ($ReportPath) { $ReportPath } else { Join-Path $Root 'last-report.txt' }
+    # 路径类参数定成绝对路径；SpeedTestUrl/ProbeUrl 是 URL，不能碰
+    foreach ($k in @('DomainsFile', 'CfstPath', 'ColoCachePath')) {
+        if ($extra.ContainsKey($k)) { $extra[$k] = & $makeAbsolute ([string]$extra[$k]) }
+    }
+    if ($DomainsFile) { $extra['DomainsFile'] = $df }
+    $report = & $makeAbsolute ($(if ($ReportPath) { $ReportPath } else { Join-Path $Root 'last-report.txt' }))
 
     try {
         $spec = New-OptimizerTaskSpec -Root $Root -Mode $TaskMode -IntervalDays $TaskIntervalDays -At $TaskAt `
@@ -590,7 +617,12 @@ function Invoke-TaskInstall {
 
 function Invoke-TaskUninstall {
     $names = if ($TaskName) { @($TaskName) } else { $script:DefaultTaskNames }
-    try { $rows = @(Uninstall-OptimizerTask -TaskName $names) }
+    # 先校验全部名字：通配符交给原生命令会被当成模式，可能删到别的程序的任务
+    foreach ($n in @($names)) {
+        $nameError = Test-OptimizerTaskName -TaskName $n
+        if ($nameError) { Fail "任务名无效「$n」：$nameError" 2 }
+    }
+    try { $rows = @(Uninstall-OptimizerTask -TaskName $names -ScriptPath (Join-Path $Root 'Cloudflare-Hosts-Optimizer.ps1')) }
     catch { Fail $_.Exception.Message 1 }
 
     $failed = @()
@@ -642,13 +674,31 @@ function Invoke-Main {
     $planFile = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
     if ($Rollback -and ($DryRun -or $planMode)) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
     if ($RollbackFrom -and -not $Rollback) { Fail '-RollbackFrom 只能与 -Rollback 一起使用。' 2 }
+    if ($AllowUntrustedBackup -and -not $Rollback) { Fail '-AllowUntrustedBackup 只能与 -Rollback 一起使用。' 2 }
+
+    # ---- 输出路径不得与输入文件（或彼此）指向同一个文件 ----
+    # 报告/计划/缓存/摘要都是“旁路输出”，不经过 hosts 事务；一旦和 hosts 撞车就会绕开保护。
+    $script:SafeInputPaths = @($hostsPathResolved, $domainsFileResolved)
+    if ($RollbackFrom) { $script:SafeInputPaths += $RollbackFrom }
+    $mainOutputs = @($script:ReportPathResolved, $planFile, (Join-Path $Root 'last-run.json'))
+    if ($ColoCachePath) { $mainOutputs += $ColoCachePath; $mainOutputs += "$ColoCachePath.tmp" }
+    foreach ($out in $mainOutputs) {
+        if (-not $out) { continue }
+        $others = @($mainOutputs | Where-Object { $_ -and $_ -ne $out })
+        $conflict = Assert-OutputPathSafe -Path $out -InputPaths $script:SafeInputPaths -OtherOutputs $others
+        if ($conflict) { Fail $conflict 2 }
+    }
 
     if ($Rollback) {
         Assert-AdminForPath $hostsPathResolved
         $script:RunMode = 'rollback'
         $script:RunHostsPath = $hostsPathResolved
-        $backupDir = Get-HostsBackupDir -HostsPath $hostsPathResolved -FallbackRoot $Root
-        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDir -LegacyBackupDir (Join-Path $Root 'backup') -BackupPath $RollbackFrom -Force:$Force
+        # 只查、不创建：回滚不应该为了找备份去建目录或写探针
+        $backupDirs = @(Get-HostsBackupDirs -HostsPath $hostsPathResolved -FallbackRoot $Root)
+        if ($AllowUntrustedBackup) {
+            Say '警告：-AllowUntrustedBackup 已启用；会接受普通用户可写目录里的备份，请确认来源。' 'Yellow'
+        }
+        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDirs -LegacyBackupDir (Join-Path $Root 'backup') -BackupPath $RollbackFrom -Force:$Force -AllowUntrustedBackup:$AllowUntrustedBackup
         $flush = Clear-DnsCache
         if ($r.Unchanged) { Say "hosts 已经是该备份的内容，无需恢复：$($r.Restored)" 'Green' }
         else { Say "已恢复 hosts：$($r.Restored)" 'Green' }
@@ -667,13 +717,14 @@ function Invoke-Main {
     if ($Domains) {
         foreach ($d in $Domains) {
             $n = ConvertTo-NormalizedDomain -Value $d -Strict
-            if (-not $n) { Fail "非法域名：$d" 2 }
+            if (-not $n) { Fail ("非法域名：{0}" -f (Get-SafeInputPreview -Value $d)) 2 }
             $domainList += $n
         }
     } else {
         $res = Read-DomainsFile -Path $domainsFileResolved
         if ($res.Invalid.Count -gt 0) {
-            Fail ("域名文件含非法项：{0}" -f ($res.Invalid -join ', ')) 2
+            $invalidText = @($res.InvalidItems | ForEach-Object { "第 $($_.Line) 行 $($_.Preview)" }) -join '，'
+            Fail ("域名文件含非法项：{0}" -f $invalidText) 2
         }
         $domainList = @($res.Domains)
     }
@@ -700,7 +751,8 @@ function Invoke-Main {
     Start-Step '检查环境与端点' '约 5 秒' -Total 6
     Show-ProxyCheck -TargetDomains $domainList
     $tun = Test-TunAdapter
-    if ($tun -and -not $DryRun -and -not $planMode -and -not $Force) {
+    # DryRun/Plan 同样会真实请求目标站，不能因为“不写 hosts”就放行 TUN
+    if ($tun -and -not $Force) {
         Fail '检测到 TUN 网卡。--noproxy 只能绕过 HTTP 代理，绕不过 TUN；为避免测速和访问走代理，已中止。关闭 TUN/透明代理后重试，或确认风险后加 -Force 继续。' 3
     }
     Say ''
@@ -948,6 +1000,9 @@ function Invoke-Main {
         Update-TaskSpinner -Detail ("{0}/{1} {2}" -f $verifyIndex, $domainList.Count, $d)
         # 1) 基线：不指定 IP，走系统当前路径
         $baseResult = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
+        # 每个物理 IP 最多 2 次 HEAD：基线、候选、复核都记在这里；失败但打到某个 IP 的探测也算。
+        $ipProbes = @{}
+        Add-ProbeUse -Budget $ipProbes -Ip $baseResult.RemoteIp
         $baseline = [pscustomobject]@{
             IP = $baseResult.RemoteIp; Ok = $baseResult.Ok
             Class = $baseResult.Class; Ttfb = $baseResult.Ttfb
@@ -963,7 +1018,9 @@ function Invoke-Main {
         foreach ($p in $globalCandidates) {
             if ($probes -ge $MaxDomainProbes) { break }
             if ($seen.Contains($p.IP)) { continue }
+            if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $p.IP)) { continue }
             $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+            Add-ProbeUse -Budget $ipProbes -Ip $p.IP
             $candidates += [pscustomobject]@{
                 IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'global'
             }
@@ -978,7 +1035,9 @@ function Invoke-Main {
             foreach ($p in $reserveCandidates) {
                 if ($probes -ge $MaxDomainProbes) { break }
                 if ($seen.Contains($p.IP)) { continue }
+                if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $p.IP)) { continue }
                 $r = Test-DomainIp -Domain $d -Ip $p.IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                Add-ProbeUse -Budget $ipProbes -Ip $p.IP
                 $candidates += [pscustomobject]@{
                     IP = $p.IP; Colo = $p.Colo; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'reserve'
                 }
@@ -992,7 +1051,9 @@ function Invoke-Main {
             foreach ($ip in @($previousMap[$d] | Select-Object -Unique)) {
                 if ($probes -ge $MaxDomainProbes) { break }
                 if ($seen.Contains($ip)) { continue }
+                if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $ip)) { continue }
                 $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                Add-ProbeUse -Budget $ipProbes -Ip $ip
                 $candidates += [pscustomobject]@{
                     IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'previous'
                 }
@@ -1014,7 +1075,9 @@ function Invoke-Main {
                     Select-Object -Unique | Select-Object -First 2)
             foreach ($ip in $dnsIps) {
                 if ($seen.Contains($ip)) { continue }
+                if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $ip)) { continue }
                 $r = Test-DomainIp -Domain $d -Ip $ip -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                Add-ProbeUse -Budget $ipProbes -Ip $ip
                 $candidates += [pscustomobject]@{
                     IP = $ip; Colo = ''; Ok = $r.Ok; Class = $r.Class; Ttfb = $r.Ttfb; Source = 'dns'
                 }
@@ -1034,28 +1097,57 @@ function Invoke-Main {
             $best = @($candidates | Where-Object { $_.IP -eq $decision.IP } | Select-Object -First 1)
             if ($best.Count -gt 0) {
                 $b2 = Test-DomainIp -Domain $d -CurlExe $curlExe -NoResolve -MaxTime $VerifyTimeoutSec
+                Add-ProbeUse -Budget $ipProbes -Ip $b2.RemoteIp
                 Start-Sleep -Milliseconds $VerifyDelayMs
-                $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
-                Start-Sleep -Milliseconds $VerifyDelayMs
 
-                $baseSamples = @()
-                if ($b2.Ok) { $baseSamples += $b2.Ttfb }
-                $candSamples = @()
-                if ($c2.Ok) { $candSamples += $c2.Ttfb }
+                # 系统解析在两次探测之间换了 IP（可能是候选、第三个地址或 IPv6）：
+                # 两个不同 IP 的样本不能合并成同一条基线，本次不切换。
+                $baselineIpChanged = [bool]($b2.Ok -and $b2.RemoteIp -and $baseline.IP -and ($b2.RemoteIp -ne $baseline.IP))
+                if ($baselineIpChanged) {
+                    $decision = [pscustomobject]@{
+                        IP = $baseline.IP; Changed = $false; Reason = 'baseline-ip-changed'
+                        ImprovementPct = $null; BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
+                    }
+                } else {
+                    $c2 = $null
+                    $budgetBlocked = $false
+                    if ($b2.Ok) {
+                        # 同一个 IP 最多 2 次 HEAD；已经用满就不再复核
+                        if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $best[0].IP)) {
+                            $budgetBlocked = $true
+                        } else {
+                            $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                            Add-ProbeUse -Budget $ipProbes -Ip $best[0].IP
+                            Start-Sleep -Milliseconds $VerifyDelayMs
+                        }
+                    }
 
-                $confirm = Resolve-SwitchConfirmation -BaseTtfb $baseline.Ttfb -BestTtfb $best[0].Ttfb `
-                    -BaseSamples $baseSamples -CandidateSamples $candSamples `
-                    -CandidateFlaky:(-not $c2.Ok) -BaselineRetestFailed:(-not $b2.Ok) `
-                    -BaselineClass $b2.Class -CandidateClass $c2.Class `
-                    -Reason $decision.Reason `
-                    -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
+                    if ($budgetBlocked) {
+                        $decision = [pscustomobject]@{
+                            IP = $baseline.IP; Changed = $false; Reason = 'candidate-budget-exhausted'
+                            ImprovementPct = $null; BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
+                        }
+                    } else {
+                        $baseSamples = @()
+                        if ($b2.Ok) { $baseSamples += $b2.Ttfb }
+                        $candSamples = @()
+                        if ($c2 -and $c2.Ok) { $candSamples += $c2.Ttfb }
 
-                # 复核中位数回写到两边（成功和失败都写），报告里的
-                # BaseTTFB / ChosenTTFB / BestTTFB 才能和 ImprovePct 对得上。
-                if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
-                if ($null -ne $confirm.BestMs) { $best[0].Ttfb = [double]$confirm.BestMs / 1000.0 }
+                        $confirm = Resolve-SwitchConfirmation -BaseTtfb $baseline.Ttfb -BestTtfb $best[0].Ttfb `
+                            -BaseSamples $baseSamples -CandidateSamples $candSamples `
+                            -CandidateFlaky:([bool]($c2 -and -not $c2.Ok)) -BaselineRetestFailed:(-not $b2.Ok) `
+                            -BaselineClass $b2.Class -CandidateClass $(if ($c2) { $c2.Class } else { '' }) `
+                            -Reason $decision.Reason `
+                            -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
 
-                $decision = Resolve-ConfirmedDecision -Confirm $confirm -Best $best[0] -BaselineIP $baseline.IP
+                        # 复核中位数回写到两边（成功和失败都写），报告里的
+                        # BaseTTFB / ChosenTTFB / BestTTFB 才能和 ImprovePct 对得上。
+                        if ($null -ne $confirm.BaseMs) { $baseline.Ttfb = [double]$confirm.BaseMs / 1000.0 }
+                        if ($null -ne $confirm.BestMs) { $best[0].Ttfb = [double]$confirm.BestMs / 1000.0 }
+
+                        $decision = Resolve-ConfirmedDecision -Confirm $confirm -Best $best[0] -BaselineIP $baseline.IP
+                    }
+                }
             }
         }
 
@@ -1170,6 +1262,8 @@ function Invoke-Main {
 
         if ($planMode) {
             try {
+                $planConflict = Assert-OutputPathSafe -Path $planFile -InputPaths @($script:SafeInputPaths)
+                if ($planConflict) { Fail $planConflict 2 }
                 $planDoc = New-PlanDocument -Version $ScriptVersion -HostsPath $hostsPathResolved `
                     -Decisions $decisions -FinalMap $update.FinalMap -Warnings $update.Warnings -Changed $update.Changed
                 $planDir = Split-Path -Parent $planFile
@@ -1191,6 +1285,7 @@ function Invoke-Main {
         }
         if ($write.Changed) {
             Say "已写入 hosts（备份：$($write.Backup)）" 'Green'
+            if ($write.Warning) { Say "警告：$($write.Warning)" 'Yellow' }
         } else {
             Say 'hosts 内容无变化，未写入。' 'Green'
         }
@@ -1275,6 +1370,28 @@ if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not 
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
 
+# ---- 入口先做一次路径碰撞检查 ----
+# 参数错误时尾部也会写报告（在 catch 之后），所以必须在这里拦下，不能只靠 Invoke-Main。
+$script:SafeInputPaths = @()
+$entryHosts = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
+$entryDomains = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
+$entryPlan = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
+$entryColo = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+$entryInputs = @($entryHosts, $entryDomains)
+if ($RollbackFrom) { $entryInputs += $RollbackFrom }
+$entryOutputs = @($script:ReportPathResolved, $entryPlan, $entryColo, "$entryColo.tmp", (Join-Path $Root 'last-run.json'))
+$entryErrors = @()
+foreach ($out in $entryOutputs) {
+    if (-not $out) { continue }
+    $others = @($entryOutputs | Where-Object { $_ -and $_ -ne $out })
+    $conflict = Assert-OutputPathSafe -Path $out -InputPaths $entryInputs -OtherOutputs $others
+    if ($conflict) { $entryErrors += $conflict }
+}
+if ($entryErrors.Count -gt 0) {
+    foreach ($e in @($entryErrors | Select-Object -Unique)) { [Console]::Error.WriteLine("错误：$e") }
+    exit 2
+}
+
 $script:RunId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $script:RunStarted = Get-Date
 $script:RunMode = ''
@@ -1289,7 +1406,8 @@ try {
     Invoke-Main | Out-Null
 } catch {
     Stop-TaskSpinner
-    $msg = $_.Exception.Message
+    # 异常消息可能夹带用户原样输入的 URL（含 passkey），统一脱敏后再输出/落盘
+    $msg = Protect-ErrorMessage -Text $_.Exception.Message
     Write-Host "错误：$msg" -ForegroundColor Red
     $script:Log.Add("ERROR: $msg")
     $script:ExitCode = if ($script:FailCode) { $script:FailCode } else { 1 }
@@ -1297,36 +1415,47 @@ try {
 }
 
 if ($script:ReportPathResolved) {
-    try {
-        $runModeText = switch ($script:RunMode) {
-            'write' { '写入 hosts' } 'dryrun' { 'DryRun' } 'plan' { 'Plan' } 'rollback' { '回滚' } default { '' }
+    # 写盘前再确认一次：扫描过程中目标可能被换成 hosts 的别名
+    $reportConflict = Assert-OutputPathSafe -Path $script:ReportPathResolved -InputPaths @($script:SafeInputPaths)
+    if ($reportConflict) {
+        Write-Host "警告：报告没有写入。$reportConflict" -ForegroundColor Yellow
+    } else {
+        try {
+            $runModeText = switch ($script:RunMode) {
+                'write' { '写入 hosts' } 'dryrun' { 'DryRun' } 'plan' { 'Plan' } 'rollback' { '回滚' } default { '' }
+            }
+            $header = @(
+                "# Cloudflare-Hosts-Optimizer $ScriptVersion"
+                "runId: $($script:RunId)"
+                "模式: $runModeText"
+                "退出码: $($script:ExitCode)"
+                "结果: $($script:RunSummaryLine)"
+                "生成时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                '注意：本报告含站点清单与详细日志，分享前请先检查。'
+                '=== 详细日志 ==='
+            )
+            ($header + $script:Log) | Out-File -LiteralPath $script:ReportPathResolved -Encoding utf8
+        } catch {
+            Write-Host "警告：报告写入失败：$(Protect-ErrorMessage -Text $_.Exception.Message)" -ForegroundColor Yellow
         }
-        $header = @(
-            "# Cloudflare-Hosts-Optimizer $ScriptVersion"
-            "runId: $($script:RunId)"
-            "模式: $runModeText"
-            "退出码: $($script:ExitCode)"
-            "结果: $($script:RunSummaryLine)"
-            "生成时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            '=== 详细日志 ==='
-        )
-        ($header + $script:Log) | Out-File -LiteralPath $script:ReportPathResolved -Encoding utf8
-    } catch {
-        Write-Host "警告：报告写入失败：$($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 
 # 运行摘要只用于菜单展示；失败不影响退出码
 if ($script:RunMode) {
-    try {
-        $run = New-RunSummaryRecord -Mode $script:RunMode -HostsPath $script:RunHostsPath `
-            -StartedAt $script:RunStarted -FinishedAt (Get-Date) -ExitCode $script:ExitCode `
-            -Changed ([bool]$script:RunChanged) -Updated ([int]$script:RunCounts.updated) `
-            -Kept ([int]$script:RunCounts.kept) -Unverified ([int]$script:RunCounts.unverified) `
-            -RunId $script:RunId -CommittedAt $script:RunCommittedAt
-        $null = Write-RunSummary -Path (Join-Path $Root 'last-run.json') -Run $run `
-            -Committed:([bool]$script:RunChanged -and $null -ne $script:RunCommittedAt) -CommitMode $script:RunMode
-    } catch { }
+    $summaryPath = Join-Path $Root 'last-run.json'
+    $summaryConflict = Assert-OutputPathSafe -Path $summaryPath -InputPaths @($script:SafeInputPaths)
+    if (-not $summaryConflict) {
+        try {
+            $run = New-RunSummaryRecord -Mode $script:RunMode -HostsPath $script:RunHostsPath `
+                -StartedAt $script:RunStarted -FinishedAt (Get-Date) -ExitCode $script:ExitCode `
+                -Changed ([bool]$script:RunChanged) -Updated ([int]$script:RunCounts.updated) `
+                -Kept ([int]$script:RunCounts.kept) -Unverified ([int]$script:RunCounts.unverified) `
+                -RunId $script:RunId -CommittedAt $script:RunCommittedAt
+            $null = Write-RunSummary -Path $summaryPath -Run $run `
+                -Committed:([bool]$script:RunChanged -and $null -ne $script:RunCommittedAt) -CommitMode $script:RunMode
+        } catch { }
+    }
 }
 
 exit $script:ExitCode
