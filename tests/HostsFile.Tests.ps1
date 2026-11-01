@@ -800,3 +800,126 @@ Describe 'F05 两阶段提交' {
         $m.verified | Should -BeTrue
     }
 }
+
+Describe 'C05 ACL 泛型权限与父链' {
+    It '非 InheritOnly 的 GENERIC_ALL 对普通用户不可信' {
+        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;GA;;;WD)')
+        $rules = @($sd.DiscretionaryAcl)
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+    }
+
+    It 'InheritOnly 的 GENERIC_ALL 不作用于对象本身' {
+        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;OICIIO;GA;;;WD)')
+        $rules = @($sd.DiscretionaryAcl)
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+    }
+
+    It '具体写权限位仍被识别' {
+        # 0x120116 = 删除 + 写属性等
+        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;0x120116;;;WD)')
+        $rules = @($sd.DiscretionaryAcl)
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+    }
+
+    It '只读规则仍然可信' {
+        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;0x120089;;;WD)')
+        $rules = @($sd.DiscretionaryAcl)
+        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+    }
+
+    It '普通用户目录里的备份文件不可信（文件与父链一起查）' {
+        $dir = Join-Path $TestDrive 'c05-dir'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $f = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $f -Value 'x'
+        Test-BackupPathTrusted -Path $f -Root $TestDrive | Should -BeFalse
+    }
+}
+
+Describe 'C03 读回哈希失败后的回滚' {
+    It '替换后哈希读取抛错时，正常回滚不需要 -Force' {
+        $tmp = Join-Path $TestDrive 'c03-hosts.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $dir = Join-Path $TestDrive 'c03-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+        $script:c03HashCalls = 0
+        Mock Get-FileHash {
+            $script:c03HashCalls++
+            if ($script:c03HashCalls -eq 2) { throw 'Injected hash failure' }
+            $bytes = [IO.File]::ReadAllBytes($LiteralPath)
+            [pscustomobject]@{ Hash = (Get-Sha256Hex -Bytes $bytes) }
+        }
+
+        $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $dir -Version 'test'
+        $w.Changed | Should -BeTrue
+        $w.Verified | Should -BeFalse
+        $w.Warning | Should -Not -BeNullOrEmpty
+
+        $m = Get-Content -LiteralPath "$($w.Backup).json" -Raw -Encoding utf8 | ConvertFrom-Json
+        $m.state | Should -Be 'committed'
+        $m.postHash | Should -BeNullOrEmpty
+        $m.intendedHash | Should -Not -BeNullOrEmpty
+
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir } | Should -Not -Throw
+        (Get-Content -LiteralPath $tmp -Raw) | Should -Match '203\.0\.113\.10'
+    }
+}
+
+Describe 'C04 pending 恢复落盘' {
+    BeforeAll {
+        function Get-ContentHash2 {
+            param([string]$Text)
+            return Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($Text))
+        }
+        function New-ManifestBackup2 {
+            param([string]$Dir, [string]$Name, [string]$Content, [hashtable]$Manifest)
+            $bak = Join-Path $Dir $Name
+            [IO.File]::WriteAllText($bak, $Content)
+            ($Manifest | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+            return $bak
+        }
+    }
+
+    It '有旧历史的 pending 恢复后，重复回滚停在同一个版本' {
+        $h = Join-Path $TestDrive 'c04-hosts'
+        [IO.File]::WriteAllText($h, 'C')
+        $dir = Join-Path $TestDrive 'c04-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $hA = Get-ContentHash2 'A'; $hB = Get-ContentHash2 'B'; $hC = Get-ContentHash2 'C'
+
+        $null = New-ManifestBackup2 -Dir $dir -Name 'hosts-20260101-000001-aaaaaaaa.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:01.0000000+08:00'; hostsPath = $h
+            preHash = $hA; intendedHash = $hB; postHash = $hB; state = 'committed'
+        }
+        $pending = New-ManifestBackup2 -Dir $dir -Name 'hosts-20260101-000002-bbbbbbbb.bak' -Content 'B' -Manifest @{
+            createdAt = '2026-01-01T00:00:02.0000000+08:00'; hostsPath = $h
+            preHash = $hB; intendedHash = $hC; postHash = $null; state = 'pending'
+        }
+
+        $r1 = Invoke-HostsRollback -HostsPath $h -BackupDir $dir
+        $r1.Unchanged | Should -BeFalse
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'B'
+
+        $m = Get-Content -LiteralPath "$pending.json" -Raw -Encoding utf8 | ConvertFrom-Json
+        $m.state | Should -Be 'committed'
+        $m.postHash | Should -Be $hC
+
+        $r2 = Invoke-HostsRollback -HostsPath $h -BackupDir $dir
+        $r2.Unchanged | Should -BeTrue
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'B'
+    }
+}
+
+Describe 'C06 不可信来源开关必须指定文件' {
+    It '只给 -AllowUntrustedBackup 不给备份路径时拒绝' {
+        $h = Join-Path $TestDrive 'c06-hosts'
+        [IO.File]::WriteAllText($h, 'A')
+        $dir = Join-Path $TestDrive 'c06-bk'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        { Invoke-HostsRollback -HostsPath $h -BackupDir $dir -AllowUntrustedBackup } |
+            Should -Throw '*RollbackFrom*'
+    }
+}

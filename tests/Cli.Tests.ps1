@@ -7,7 +7,13 @@
 #>
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
-    $script:Main = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+    # 在临时目录里放一份源码副本再运行：脚本的 Root 取自身 PSScriptRoot，
+    # 直接跑真实仓库会让失败运行（退出码 2）覆盖用户真实的 last-run.json。
+    $script:SandboxRoot = Join-Path $TestDrive 'cli-repo'
+    New-Item -ItemType Directory -Path $script:SandboxRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1') -Destination $script:SandboxRoot
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'lib') -Destination (Join-Path $script:SandboxRoot 'lib') -Recurse
+    $script:Main = Join-Path $script:SandboxRoot 'Cloudflare-Hosts-Optimizer.ps1'
     $script:Pwsh = (Get-Process -Id $PID).Path
     if (-not $script:Pwsh) { $script:Pwsh = (Get-Command pwsh).Source }
 
@@ -138,5 +144,38 @@ Describe '入口参数互斥仍然有效' {
         $r = Invoke-Cli -Arguments @('-DryRun', '-AllowUntrustedBackup')
         $r.ExitCode | Should -Be 2
         $r.Output | Should -Match 'AllowUntrustedBackup'
+    }
+}
+
+Describe 'C07 输出互相相等' {
+    It 'PlanPath 与 ReportPath 相同会在入口拒绝，文件保持原样' {
+        $shared = Join-Path $TestDrive 'shared-plan-report.json'
+        Set-Content -LiteralPath $shared -Value 'ORIGINAL_PLAN' -Encoding utf8
+        $hosts = New-HostsFixture -Name 'c07-hosts'
+        # 域名非法，确保不会走到网络阶段
+        $r = Invoke-Cli -Arguments @('-Plan', '-PlanPath', $shared, '-ReportPath', $shared,
+            '-HostsPath', $hosts, '-Domains', 'not a domain')
+        $r.ExitCode | Should -Be 2
+        (Get-Content -LiteralPath $shared -Raw) | Should -Match 'ORIGINAL_PLAN'
+    }
+}
+
+Describe 'C06 不可信来源开关' {
+    It '缺少 -RollbackFrom 时退出码 2' {
+        $r = Invoke-Cli -Arguments @('-Rollback', '-AllowUntrustedBackup')
+        $r.ExitCode | Should -Be 2
+        $r.Output | Should -Match 'AllowUntrustedBackup'
+    }
+}
+
+Describe 'C09 CLI 测试隔离' {
+    It '不写真实仓库的 last-run.json' {
+        $real = Join-Path $script:RepoRoot 'last-run.json'
+        $before = if (Test-Path -LiteralPath $real) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($real)) } else { $null }
+        $h = New-HostsFixture -Name 'c09-hosts'
+        $report = Join-Path $TestDrive 'c09-report.txt'
+        $null = Invoke-Cli -Arguments @('-DryRun', '-Rollback', '-HostsPath', $h, '-ReportPath', $report)
+        $after = if (Test-Path -LiteralPath $real) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($real)) } else { $null }
+        $after | Should -Be $before
     }
 }

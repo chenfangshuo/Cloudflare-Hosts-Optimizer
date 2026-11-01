@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    . (Join-Path $repoRoot 'lib\Safety.ps1')
     . (Join-Path $repoRoot 'lib\Probe.ps1')
 }
 
@@ -618,5 +619,59 @@ Describe 'F10 机房缓存的时间类型' {
         $now = [datetime]::Parse('2026-11-01T00:00:00Z', [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::RoundtripKind)
         Read-ColoCache -Path $path -MaxAgeDays 14 -Now $now | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'C02 切换前复核的下一步' {
+    It '复核解析到别的 IP（成功）→ ip-changed' {
+        $b2 = [pscustomobject]@{ RemoteIp = '2.2.2.2'; Ok = $true; Class = 'ok'; Ttfb = 0.5 }
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'ip-changed'
+    }
+
+    It '复核解析到别的 IP 但响应受限/失败 → 仍是 ip-changed' {
+        $b2 = [pscustomobject]@{ RemoteIp = '2.2.2.2'; Ok = $false; Class = 'restricted'; Ttfb = 0 }
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'ip-changed'
+    }
+
+    It '复核仍是原 IP 但失败 → 仍要复核候选' {
+        $b2 = [pscustomobject]@{ RemoteIp = '1.1.1.1'; Ok = $false; Class = 'bad'; Ttfb = 0 }
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'need-candidate'
+    }
+
+    It '复核没有 RemoteIp → 仍要复核候选' {
+        $b2 = [pscustomobject]@{ RemoteIp = ''; Ok = $false; Class = ''; Ttfb = 0 }
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' | Should -Be 'need-candidate'
+    }
+
+    It '候选预算已满且 IP 未变 → budget-blocked' {
+        $b2 = [pscustomobject]@{ RemoteIp = '1.1.1.1'; Ok = $true; Class = 'ok'; Ttfb = 1 }
+        Get-RecheckPlan -BaselineIp '1.1.1.1' -B2 $b2 -BestIp '2.2.2.2' -CandidateBudgetAllows $false |
+            Should -Be 'budget-blocked'
+    }
+}
+
+Describe 'C01 机房缓存写在预检之后被换成输入别名' {
+    It '预置的 Path.tmp 是 hosts 的硬链接时不会截断 hosts' {
+        $hosts = Join-Path $TestDrive 'cache-hosts'
+        [IO.File]::WriteAllText($hosts, "127.0.0.1 localhost`r`n")
+        $cache = Join-Path $TestDrive 'colo-cache.json'
+        $trap = "$cache.tmp"
+        New-Item -ItemType HardLink -Path $trap -Target $hosts | Out-Null
+
+        $ok = Write-ColoCache -Path $cache -Colos @('HKG', 'LAX') -ProtectedPaths @($hosts)
+        $ok | Should -BeTrue
+        (Get-Content -LiteralPath $hosts -Raw) | Should -Match 'localhost'
+        Test-Path -LiteralPath $cache | Should -BeTrue
+    }
+
+    It '目标本身是 hosts 的硬链接时拒绝写入' {
+        $hosts = Join-Path $TestDrive 'cache-hosts2'
+        [IO.File]::WriteAllText($hosts, "127.0.0.1 localhost`r`n")
+        $cache = Join-Path $TestDrive 'colo-cache2.json'
+        New-Item -ItemType HardLink -Path $cache -Target $hosts | Out-Null
+
+        $ok = Write-ColoCache -Path $cache -Colos @('HKG', 'LAX') -ProtectedPaths @($hosts)
+        $ok | Should -BeFalse
+        (Get-Content -LiteralPath $hosts -Raw) | Should -Match 'localhost'
     }
 }

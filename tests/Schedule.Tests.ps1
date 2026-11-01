@@ -206,3 +206,36 @@ Describe 'F09 任务参数序列化' {
         $out.Trim() | Should -Be 'D:\my cfst\|C:\a b\d.txt'
     }
 }
+
+Describe 'C08 任务归属只认实际 -File 目标' {
+    BeforeAll {
+        function New-TaskObj {
+            param([string]$Arguments, [string]$Execute = 'C:\Program Files\PowerShell\7\pwsh.exe')
+            return [pscustomobject]@{
+                TaskName = 'x'
+                Actions  = @([pscustomobject]@{ Execute = $Execute; Arguments = $Arguments })
+            }
+        }
+        $script:TaskScript = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+    }
+
+    It '参数标签里出现本脚本名不算本工具任务' {
+        $t = New-TaskObj -Arguments '-NoProfile -File "C:\OtherTool\Backup.ps1" -Label "Cloudflare-Hosts-Optimizer.ps1"'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript | Should -BeFalse
+    }
+
+    It '-Command 里只是打印脚本名不算' {
+        $t = New-TaskObj -Arguments '-NoProfile -Command "Write-Output Cloudflare-Hosts-Optimizer.ps1"'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript | Should -BeFalse
+    }
+
+    It '非 pwsh 宿主不算' {
+        $t = New-TaskObj -Arguments '-NoProfile -File "D:\x\Cloudflare-Hosts-Optimizer.ps1"' -Execute 'C:\Windows\System32\notepad.exe'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript | Should -BeFalse
+    }
+
+    It '真正 -File 指向本脚本才算（允许目录搬迁）' {
+        $t = New-TaskObj -Arguments '-NoProfile -ExecutionPolicy Bypass -File "D:\moved\Cloudflare-Hosts-Optimizer.ps1" -DryRun'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript | Should -BeTrue
+    }
+}

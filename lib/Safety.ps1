@@ -148,6 +148,22 @@ function Test-PathCollision {
     return $result
 }
 
+# 受保护输入的完整集合：**系统 hosts 永远在内**，再加上本次实际使用的目标。
+# 自定义 -HostsPath 不能让系统 hosts 从保护集合里消失——报告误指系统 hosts 同样会覆盖它。
+function Get-ProtectedInputPaths {
+    [CmdletBinding()]
+    param(
+        [string]$HostsPath,
+        [string]$DomainsFile,
+        [string]$RollbackFrom
+    )
+    $list = @((Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'))
+    if ($HostsPath) { $list += $HostsPath }
+    if ($DomainsFile) { $list += $DomainsFile }
+    if ($RollbackFrom) { $list += $RollbackFrom }
+    return @($list)
+}
+
 # 返回 $null 表示安全；否则返回一句可以直接展示的错误。
 function Assert-OutputPathSafe {
     [CmdletBinding()]
@@ -171,10 +187,13 @@ function Assert-OutputPathSafe {
 
     foreach ($other in @($OtherOutputs)) {
         if (-not $other) { continue }
-        $sameNormalized = $false
-        try { $sameNormalized = (Get-NormalizedPath -Path $other) -ceq (Get-NormalizedPath -Path $Path) } catch { }
-        if ($sameNormalized) {
+        # 输出之间也必须比文件身份，不能只比字符串：两个不同的写法/硬链接同样是同一个文件
+        $r = Test-PathCollision -Left $Path -Right $other
+        if ($r.Collision) {
             return "多个输出指向同一个文件，已拒绝：$Path"
+        }
+        if ($r.Uncertain) {
+            return "无法确认两个输出「$Path」和「$other」是否为同一文件，已拒绝。"
         }
     }
     return $null

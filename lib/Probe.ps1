@@ -476,13 +476,17 @@ function Write-ColoCache {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string[]]$Colos
+        [string[]]$Colos,
+        # 受保护输入（hosts/域名文件/回滚源）：落盘前再确认目标没有变成它们的别名
+        [string[]]$ProtectedPaths = @()
     )
+    $tmp = $null
     try {
         $cols = @($Colos | Where-Object { $_ -match '^[A-Z]{3}$' } | Select-Object -Unique | Sort-Object)
         if ($cols.Count -eq 0) { return $false }
         $dir = Split-Path -Parent $Path
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        if (-not $dir) { $dir = '.' }
+        if (-not (Test-Path -LiteralPath $dir)) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
         }
         $doc = [pscustomobject]@{
@@ -490,14 +494,43 @@ function Write-ColoCache {
             updatedAt = (Get-Date).ToUniversalTime().ToString('o')
             colos     = $cols
         }
-        $tmp = "$Path.tmp"
-        $doc | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmp -Encoding utf8
+        # 固定 "$Path.tmp" 会在预检之后被换成输入文件的硬链接，Set-Content 直接截断输入。
+        # 用不可预测的临时名 + 原子 Move，写坏也只会写坏缓存本身。
+        $tmp = Join-Path $dir ('.cfo-colo-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        [IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+
+        foreach ($p in @($ProtectedPaths)) {
+            if (-not $p) { continue }
+            $r = Test-PathCollision -Left $Path -Right $p
+            if ($r.Collision -or $r.Uncertain) { return $false }
+        }
         Move-Item -LiteralPath $tmp -Destination $Path -Force
         return $true
     } catch {
         # 缓存写不进去不影响本次结果
         return $false
+    } finally {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
     }
+}
+
+# 切换前复核的下一步：只要复核请求落到的 IP 与首次基线不同（无论成功、失败还是 restricted），
+# 就按"基线身份已变"处理；否则候选必须在预算允许时重新验证。
+function Get-RecheckPlan {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$BaselineIp,
+        $B2,
+        [AllowEmptyString()][string]$BestIp,
+        [bool]$CandidateBudgetAllows = $true
+    )
+    if ($B2 -and $B2.RemoteIp -and $BaselineIp -and ($B2.RemoteIp -ne $BaselineIp)) {
+        return 'ip-changed'
+    }
+    if (-not $CandidateBudgetAllows) { return 'budget-blocked' }
+    return 'need-candidate'
 }
 
 function Get-CachableColos {

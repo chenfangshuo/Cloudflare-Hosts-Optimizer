@@ -225,8 +225,12 @@ function Test-OptimizerTaskOwnership {
         $argText = [string]$a.Arguments
         if (-not $exe -or $exe -notmatch '(?i)(^|\\)pwsh(-preview)?\.exe$') { return $false }
         if (-not $argText) { return $false }
-        # 只要求脚本文件名一致：仓库整体搬目录后，旧任务仍然应该删得掉
-        if ($argText.IndexOf($expectedName, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+        # 必须解析实际执行的 -File 目标，不能因为参数里任何位置出现脚本名就当成自己的任务
+        # （别的工具可以把本工具名当标签或要处理的文件）。只比文件名，仓库搬目录后仍可删。
+        $fileMatch = [regex]::Match($argText, '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))')
+        if (-not $fileMatch.Success) { return $false }
+        $target = if ($fileMatch.Groups[1].Success) { $fileMatch.Groups[1].Value } else { $fileMatch.Groups[2].Value }
+        if ([IO.Path]::GetFileName($target) -ne $expectedName) { return $false }
     }
     return $true
 }

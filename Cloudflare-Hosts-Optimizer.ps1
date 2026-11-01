@@ -675,16 +675,22 @@ function Invoke-Main {
     if ($Rollback -and ($DryRun -or $planMode)) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
     if ($RollbackFrom -and -not $Rollback) { Fail '-RollbackFrom 只能与 -Rollback 一起使用。' 2 }
     if ($AllowUntrustedBackup -and -not $Rollback) { Fail '-AllowUntrustedBackup 只能与 -Rollback 一起使用。' 2 }
+    # 这个开关只授权“用户指定的那一份”备份；不能用来在所有不可信目录里自动挑最新
+    if ($AllowUntrustedBackup -and -not $RollbackFrom) { Fail '-AllowUntrustedBackup 必须同时指定 -RollbackFrom <备份文件>。' 2 }
 
     # ---- 输出路径不得与输入文件（或彼此）指向同一个文件 ----
     # 报告/计划/缓存/摘要都是“旁路输出”，不经过 hosts 事务；一旦和 hosts 撞车就会绕开保护。
-    $script:SafeInputPaths = @($hostsPathResolved, $domainsFileResolved)
-    if ($RollbackFrom) { $script:SafeInputPaths += $RollbackFrom }
-    $mainOutputs = @($script:ReportPathResolved, $planFile, (Join-Path $Root 'last-run.json'))
-    if ($ColoCachePath) { $mainOutputs += $ColoCachePath; $mainOutputs += "$ColoCachePath.tmp" }
-    foreach ($out in $mainOutputs) {
+    # 系统 hosts 永远在保护集合里，即使本次用的是沙箱 -HostsPath。
+    $script:SafeInputPaths = @(Get-ProtectedInputPaths -HostsPath $hostsPathResolved -DomainsFile $domainsFileResolved -RollbackFrom $RollbackFrom)
+    $coloCacheResolved = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    $mainOutputs = @($script:ReportPathResolved, $planFile, $coloCacheResolved, (Join-Path $Root 'last-run.json'))
+    for ($i = 0; $i -lt $mainOutputs.Count; $i++) {
+        $out = $mainOutputs[$i]
         if (-not $out) { continue }
-        $others = @($mainOutputs | Where-Object { $_ -and $_ -ne $out })
+        $others = @()
+        for ($j = 0; $j -lt $mainOutputs.Count; $j++) {
+            if ($j -ne $i -and $mainOutputs[$j]) { $others += $mainOutputs[$j] }
+        }
         $conflict = Assert-OutputPathSafe -Path $out -InputPaths $script:SafeInputPaths -OtherOutputs $others
         if ($conflict) { Fail $conflict 2 }
     }
@@ -903,7 +909,7 @@ function Invoke-Main {
     # 留着它会让覆盖检查永远失败，缓存等于没有
     if ($useCache -and $pool.Count -eq $probeTarget -and $probeTarget -ge 64) {
         $observed = @(Get-CachableColos -Candidates $candidates)
-        if ($observed.Count -gt 0 -and -not (Write-ColoCache -Path $cacheFile -Colos $observed)) {
+        if ($observed.Count -gt 0 -and -not (Write-ColoCache -Path $cacheFile -Colos $observed -ProtectedPaths $script:SafeInputPaths)) {
             Say "警告：机房缓存写入失败（$cacheFile），不影响本次结果。" 'Yellow'
         }
     }
@@ -1102,27 +1108,25 @@ function Invoke-Main {
 
                 # 系统解析在两次探测之间换了 IP（可能是候选、第三个地址或 IPv6）：
                 # 两个不同 IP 的样本不能合并成同一条基线，本次不切换。
-                $baselineIpChanged = [bool]($b2.Ok -and $b2.RemoteIp -and $baseline.IP -and ($b2.RemoteIp -ne $baseline.IP))
-                if ($baselineIpChanged) {
+                # 注意：失败/受限但带着新 RemoteIp 的响应同样算“换了 IP”。
+                $recheckPlan = Get-RecheckPlan -BaselineIp $baseline.IP -B2 $b2 -BestIp $best[0].IP `
+                    -CandidateBudgetAllows (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $best[0].IP)
+                if ($recheckPlan -eq 'ip-changed') {
                     $decision = [pscustomobject]@{
                         IP = $baseline.IP; Changed = $false; Reason = 'baseline-ip-changed'
                         ImprovementPct = $null; BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
                     }
                 } else {
                     $c2 = $null
-                    $budgetBlocked = $false
-                    if ($b2.Ok) {
-                        # 同一个 IP 最多 2 次 HEAD；已经用满就不再复核
-                        if (-not (Test-ProbeBudgetAllows -Budget $ipProbes -Ip $best[0].IP)) {
-                            $budgetBlocked = $true
-                        } else {
-                            $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
-                            Add-ProbeUse -Budget $ipProbes -Ip $best[0].IP
-                            Start-Sleep -Milliseconds $VerifyDelayMs
-                        }
+                    if ($recheckPlan -eq 'need-candidate') {
+                        # 基线复核失败也要验证候选：早先一次成功不能替代这一次
+                        $c2 = Test-DomainIp -Domain $d -Ip $best[0].IP -CurlExe $curlExe -MaxTime $VerifyTimeoutSec
+                        Add-ProbeUse -Budget $ipProbes -Ip $best[0].IP
+                        Start-Sleep -Milliseconds $VerifyDelayMs
                     }
 
-                    if ($budgetBlocked) {
+                    if (-not $c2) {
+                        # 预算不足，无法确认候选：保守不切换
                         $decision = [pscustomobject]@{
                             IP = $baseline.IP; Changed = $false; Reason = 'candidate-budget-exhausted'
                             ImprovementPct = $null; BestIP = $best[0].IP; BestTtfb = $best[0].Ttfb
@@ -1373,17 +1377,20 @@ if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not 
 # ---- 入口先做一次路径碰撞检查 ----
 # 参数错误时尾部也会写报告（在 catch 之后），所以必须在这里拦下，不能只靠 Invoke-Main。
 $script:SafeInputPaths = @()
-$entryHosts = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
 $entryDomains = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
 $entryPlan = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
 $entryColo = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
-$entryInputs = @($entryHosts, $entryDomains)
-if ($RollbackFrom) { $entryInputs += $RollbackFrom }
-$entryOutputs = @($script:ReportPathResolved, $entryPlan, $entryColo, "$entryColo.tmp", (Join-Path $Root 'last-run.json'))
+$entryInputs = @(Get-ProtectedInputPaths -HostsPath $HostsPath -DomainsFile $entryDomains -RollbackFrom $RollbackFrom)
+$entryOutputs = @($script:ReportPathResolved, $entryPlan, $entryColo, (Join-Path $Root 'last-run.json'))
 $entryErrors = @()
-foreach ($out in $entryOutputs) {
+for ($i = 0; $i -lt $entryOutputs.Count; $i++) {
+    $out = $entryOutputs[$i]
     if (-not $out) { continue }
-    $others = @($entryOutputs | Where-Object { $_ -and $_ -ne $out })
+    # 按槽位排除自己；不能按“值相等”过滤，否则 PlanPath 与 ReportPath 相同时两条都会被滤掉
+    $others = @()
+    for ($j = 0; $j -lt $entryOutputs.Count; $j++) {
+        if ($j -ne $i -and $entryOutputs[$j]) { $others += $entryOutputs[$j] }
+    }
     $conflict = Assert-OutputPathSafe -Path $out -InputPaths $entryInputs -OtherOutputs $others
     if ($conflict) { $entryErrors += $conflict }
 }

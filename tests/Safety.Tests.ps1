@@ -139,3 +139,34 @@ Describe 'Protect-ErrorMessage' {
         (Protect-ErrorMessage -Text "a`tb") | Should -Be "a`tb"
     }
 }
+
+Describe 'C01 受保护输入始终包含系统 hosts' {
+    It '即使指定了沙箱 -HostsPath，系统 hosts 仍在保护集合里' {
+        $paths = @(Get-ProtectedInputPaths -HostsPath 'C:\tmp\sandbox-hosts' -DomainsFile 'C:\tmp\d.txt')
+        $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+        $paths | Should -Contain $systemHosts
+        $paths | Should -Contain 'C:\tmp\sandbox-hosts'
+        $paths | Should -Contain 'C:\tmp\d.txt'
+    }
+
+    It '报告指向系统 hosts 时会被拒绝' {
+        $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+        $inputs = @(Get-ProtectedInputPaths -HostsPath 'C:\tmp\sandbox-hosts' -DomainsFile 'C:\tmp\d.txt')
+        Assert-OutputPathSafe -Path $systemHosts -InputPaths $inputs | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'C07 输出之间按文件身份比较' {
+    It '两个输出是同一个硬链接时拒绝' {
+        $a = Join-Path $TestDrive 'out-a.txt'
+        $b = Join-Path $TestDrive 'out-b.txt'
+        Set-Content -LiteralPath $a -Value 'x'
+        New-Item -ItemType HardLink -Path $b -Target $a | Out-Null
+        Assert-OutputPathSafe -Path $a -InputPaths @() -OtherOutputs @($b) | Should -Not -BeNullOrEmpty
+    }
+
+    It '两个输出只是字符串相同也拒绝' {
+        $p = Join-Path $TestDrive 'same.txt'
+        Assert-OutputPathSafe -Path $p -InputPaths @() -OtherOutputs @($p) | Should -Not -BeNullOrEmpty
+    }
+}

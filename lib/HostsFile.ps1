@@ -415,9 +415,29 @@ function Test-AclEntries {
     }
 
     foreach ($rule in @($Rules)) {
-        if ($rule.AccessControlType -ne 'Allow') { continue }
-        if (-not ($rule.FileSystemRights -band $mask)) { continue }
-        $sid = Get-AclSidString -Identity $rule.IdentityReference
+        $type = if ($rule.PSObject.Properties['AccessControlType']) { $rule.AccessControlType } else { $null }
+        if ($type -and $type -ne 'Allow') { continue }
+        if ($rule.PSObject.Properties['AceQualifier'] -and $rule.AceQualifier -ne 'AccessAllowed') { continue }
+
+        # InheritOnly 的 ACE 不作用于对象本身，只作用于子对象；子对象会单独检查
+        $isInheritOnly = $false
+        if ($rule.PSObject.Properties['PropagationFlags']) {
+            $isInheritOnly = [bool]($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)
+        } elseif ($rule.PSObject.Properties['AceFlags']) {
+            $isInheritOnly = [bool]($rule.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly)
+        }
+        if ($isInheritOnly) { continue }
+
+        $rights = if ($rule.PSObject.Properties['FileSystemRights']) { [int]$rule.FileSystemRights } else { [int]$rule.AccessMask }
+        $specific = ($rights -band [int]$mask) -ne 0
+        # 泛型高位不能靠 -band 具体位识别：GENERIC_ALL=0x10000000、GENERIC_WRITE=0x40000000
+        $genericAll = ($rights -band 0x10000000) -ne 0
+        $genericWrite = ($rights -band 0x40000000) -ne 0
+        $dangerous = if ($Ancestor) { $genericAll } else { $genericAll -or $genericWrite }
+        if (-not ($specific -or $dangerous)) { continue }
+
+        $identity = if ($rule.PSObject.Properties['IdentityReference']) { $rule.IdentityReference } else { $rule.SecurityIdentifier }
+        $sid = Get-AclSidString -Identity $identity
         if (-not $sid -or $sid -notin $script:TrustedSids) { return $false }
     }
     return $true
@@ -437,7 +457,7 @@ function Test-AclTrusted {
     }
 }
 
-# 目录/文件本身必须可信；目录还要向上检查到 Root（不含 Root 的父级）。
+# 目标本身必须可信；**文件和目录都要**向上检查到 Root（含 Root 的父级，防止 Root 被父目录替换）。
 function Test-BackupPathTrusted {
     [CmdletBinding()]
     param(
@@ -452,11 +472,12 @@ function Test-BackupPathTrusted {
     } catch {
         return $false
     }
-    if (-not $item.PSIsContainer) { return $true }
 
-    $current = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $current = if ($item.PSIsContainer) { $full } else { Split-Path -Parent $full }
     $stop = if ($Root) { [IO.Path]::GetFullPath($Root).TrimEnd('\') } else { $null }
-    while ($true) {
+
+    while ($current) {
         if ($stop -and $current -ieq $stop) { break }
         $parent = Split-Path -Parent $current
         if (-not $parent -or $parent -eq $current) { break }
@@ -468,6 +489,20 @@ function Test-BackupPathTrusted {
             return $false
         }
         $current = $parent
+    }
+
+    # 信任根本身也不能被它的父目录删除/替换（ProgramData 允许建目录，但不允许删除别人的目录）
+    if ($stop) {
+        if ($stop -ieq $current) {
+            $rootParent = Split-Path -Parent $stop
+            if ($rootParent -and $rootParent -ne $stop) {
+                try {
+                    if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $rootParent -ErrorAction Stop) -Ancestor)) { return $false }
+                } catch {
+                    return $false
+                }
+            }
+        }
     }
     return $true
 }
@@ -877,6 +912,11 @@ function Invoke-HostsRollbackLocked {
         [switch]$AllowUntrustedBackup
     )
 
+    # 这个开关只授权“用户点名的那一份”，不能变成“在所有不可信目录里自动挑最新”
+    if ($AllowUntrustedBackup -and -not $BackupPath) {
+        throw '-AllowUntrustedBackup 必须同时指定 -RollbackFrom <备份文件>，不能用于自动挑选备份。'
+    }
+
     $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $isSystem = $true
     try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
@@ -900,6 +940,13 @@ function Invoke-HostsRollbackLocked {
     $candidates = @()
     foreach ($bak in $all) {
         $manifestPath = "$($bak.FullName).json"
+        # 来源检查必须在候选进入排序/覆盖保护之前：guard 也可能来自一份没被选中的 manifest
+        if ($isSystem -and -not $AllowUntrustedBackup) {
+            $trustRoot = Get-BackupTrustRoot -Path $bak.FullName
+            if (-not (Test-BackupPathTrusted -Path $bak.FullName -Root $trustRoot)) { continue }
+            if ((Test-Path -LiteralPath $manifestPath) -and
+                -not (Test-BackupPathTrusted -Path $manifestPath -Root $trustRoot)) { continue }
+        }
         if (Test-Path -LiteralPath $manifestPath) {
             try {
                 $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
@@ -951,7 +998,23 @@ function Invoke-HostsRollbackLocked {
         if ($intended -and $currentHash -eq $intended) {
             $c.Committed = $true
             $c | Add-Member -NotePropertyName RecoveredAt -NotePropertyValue (Get-Date) -Force
-            $c.Manifest.postHash = $intended
+            $c.Manifest | Add-Member -NotePropertyName postHash -NotePropertyValue $intended -Force
+        }
+    }
+
+    # 恢复必须落盘：只在内存里改，下一次自动回滚会把它当成 pending 不匹配，
+    # 转而去选更早的已完成事务，重复点回滚就变成逐版本撤销。
+    foreach ($c in @($candidates | Where-Object { $_.PSObject.Properties['RecoveredAt'] })) {
+        try {
+            $m = $c.Manifest
+            # 旧清单可能没有这些字段，用 Add-Member -Force 补齐
+            $m | Add-Member -NotePropertyName state -NotePropertyValue 'committed' -Force
+            $m | Add-Member -NotePropertyName postHash -NotePropertyValue ([string]$m.intendedHash) -Force
+            $m | Add-Member -NotePropertyName verified -NotePropertyValue $false -Force
+            $m | Add-Member -NotePropertyName recoveredAt -NotePropertyValue (Get-Date).ToString('o') -Force
+            Write-JsonFileAtomic -Path "$($c.File.FullName).json" -Object $m
+        } catch {
+            throw "无法把恢复后的提交状态写回备份清单，已中止回滚（hosts 未修改）：$($_.Exception.Message)"
         }
     }
 
@@ -1023,9 +1086,16 @@ function Invoke-HostsRollbackLocked {
 
     # 覆盖保护：用“最新已完成事务的 postHash”比对当前文件，而不是所选备份自己的
     # postHash。-Force 只绕过这一步；目标归属和备份完整性已经在上面检查过。
+    # 覆盖保护参考“最新已完成事务”的内容哈希。读回失败的事务 postHash 为空，
+    # 但它的 intendedHash 就是这次实际装进去的内容，可以作为 guard；否则正常回滚会被迫加 -Force。
     $guard = $null
-    if ($committed.Count -gt 0) { $guard = [string]$committed[0].Manifest.postHash }
-    elseif ($selected.Manifest -and $selected.Manifest.postHash) { $guard = [string]$selected.Manifest.postHash }
+    if ($committed.Count -gt 0) {
+        $guard = [string]$committed[0].Manifest.postHash
+        if (-not $guard) { $guard = [string]$committed[0].Manifest.intendedHash }
+    } elseif ($selected.Manifest) {
+        $guard = [string]$selected.Manifest.postHash
+        if (-not $guard) { $guard = [string]$selected.Manifest.intendedHash }
+    }
 
     $allowed = [bool]$Force
     if (-not $allowed -and $guard -and $currentHash -eq $guard) { $allowed = $true }

@@ -29,7 +29,9 @@ Describe 'F07 每 IP 请求预算' {
 
     It '基线复核换了 IP 时不切换' {
         $script:MainSource | Should -Match 'baseline-ip-changed'
-        $script:MainSource | Should -Match '\$baselineIpChanged'
+        $script:MainSource | Should -Match 'Get-RecheckPlan'
+        # 复核失败也不能跳过候选验证
+        $script:MainSource | Should -Match "need-candidate"
     }
 }
 
