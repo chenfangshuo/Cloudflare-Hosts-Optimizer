@@ -207,68 +207,21 @@ function Install-OptimizerTask {
     return $Spec
 }
 
-# 把一条 Windows 命令行拆成参数（去掉引号；不处理反斜杠转义——本工具生成的参数不需要）。
-function Split-NativeArgumentList {
-    [CmdletBinding()]
-    param([AllowEmptyString()][string]$Text)
-    $out = [System.Collections.Generic.List[string]]::new()
-    $sb = [Text.StringBuilder]::new()
-    $inQuotes = $false
-    foreach ($ch in $Text.ToCharArray()) {
-        if ($ch -eq [char]'"') { $inQuotes = -not $inQuotes; continue }
-        if (-not $inQuotes -and [char]::IsWhiteSpace($ch)) {
-            if ($sb.Length -gt 0) { $out.Add($sb.ToString()); [void]$sb.Clear() }
-            continue
-        }
-        [void]$sb.Append($ch)
-    }
-    if ($sb.Length -gt 0) { $out.Add($sb.ToString()) }
-    return @($out)
-}
-
-# 判断 pwsh 这次到底用什么入口。只接受“本工具实际会生成的那套宿主参数”：
-#   -NoProfile -ExecutionPolicy Bypass -File <脚本> [脚本自己的参数...]
-# 在到达 -File 之前，遇到其他执行模式、隐式脚本路径或任何不认识 token，一律保守判定
-# “不是本工具的任务”——绝不能跳过去、把后面别的工具的 -File 当成宿主入口。
+# 判断 pwsh 这次到底用什么入口。只接受本工具实际生成的宿主前缀形状：
+#   [-NoProfile|-NoLogo|-NonInteractive|-ExecutionPolicy <值>|-WindowStyle <值>]... -File <脚本>
+# 锚定失败（-Command/-EncodedCommand、隐式 .ps1、未知开关）一律判为“不是本工具”，
+# 不会把后面别的工具的 -File 当成宿主入口。目标 token 必须有结束边界，
+# 避免 "x.ps1".other.ps1 这种 native argv 拼接被截断误认。
 function Get-PwshEntryTarget {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Arguments)
-    $tokens = @(Split-NativeArgumentList -Text $Arguments)
-
-    # 这些入口模式后面跟的是“代码/命令字符串”，不是脚本路径
-    $stopSwitches = @('-command', '-c', '-encodedcommand', '-e', '-ec', '-commandwithargs', '-cwa')
-    # 宿主开关：带一个值的
-    $valueSwitches = @(
-        '-executionpolicy', '-windowstyle', '-workingdirectory', '-configurationname',
-        '-psconsolefile', '-version', '-inputformat', '-outputformat', '-settingsfile',
-        '-custompipename'
-    )
-    # 宿主开关：不取值
-    $flagSwitches = @(
-        '-noprofile', '-nologo', '-noninteractive', '-noexit', '-sta', '-mta', '-login',
-        '-noprofileloadtime', '-interactive'
-    )
-
-    for ($i = 0; $i -lt $tokens.Count; $i++) {
-        $lower = $tokens[$i].ToLowerInvariant()
-        if ($lower -in $stopSwitches) {
-            return [pscustomobject]@{ Mode = 'Command'; Target = '' }
-        }
-        if ($lower -eq '-file' -or $lower -eq '-f') {
-            $target = if ($i + 1 -lt $tokens.Count) { $tokens[$i + 1] } else { '' }
-            return [pscustomobject]@{ Mode = 'File'; Target = $target }
-        }
-        if ($lower -in $valueSwitches) {
-            if ($i + 1 -ge $tokens.Count) { return [pscustomobject]@{ Mode = 'None'; Target = '' } }
-            $i++
-            continue
-        }
-        if ($lower -in $flagSwitches) { continue }
-
-        # 隐式脚本入口（不带 -File 直接给 .ps1）或无法解释的参数：保守拒绝
-        return [pscustomobject]@{ Mode = 'Unknown'; Target = '' }
-    }
-    return [pscustomobject]@{ Mode = 'None'; Target = '' }
+    $pattern = '^\s*(?:(?:-NoProfile|-NoLogo|-NonInteractive)\s+|' +
+        '-(?:ExecutionPolicy|WindowStyle)\s+(?:"[^"]*"|\S+)\s+)*' +
+        '-(?:File|F)\s+(?:"([^"]+)"|([^"\s]+))(?=\s|$)'
+    $m = [regex]::Match($Arguments, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $m.Success) { return [pscustomobject]@{ Mode = 'Unknown'; Target = '' } }
+    $target = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+    return [pscustomobject]@{ Mode = 'File'; Target = $target }
 }
 
 # 判断一个已存在的任务是不是本工具注册的：动作必须是 pwsh + 本脚本。
@@ -285,7 +238,7 @@ function Test-OptimizerTaskOwnership {
     $scriptName = [IO.Path]::GetFileName($ScriptPath)
     $expectedName = if ($scriptName) { $scriptName } else { 'Cloudflare-Hosts-Optimizer.ps1' }
     foreach ($a in $actions) {
-        $exe = [string]$a.Execute
+        $exe = ([string]$a.Execute).Trim('"')
         $argText = [string]$a.Arguments
         if (-not $exe -or $exe -notmatch '(?i)(^|\\)pwsh(-preview)?\.exe$') { return $false }
         if (-not $argText) { return $false }

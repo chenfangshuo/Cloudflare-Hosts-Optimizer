@@ -309,3 +309,31 @@ Describe 'E01 隐式脚本入口与其他执行模式' {
         Should -Invoke Remove-OptimizerTask -Times 0
     }
 }
+
+Describe 'V060-03 目标 token 边界' {
+    BeforeAll {
+        $script:TaskScript4 = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+        function New-TaskObj4 {
+            param([string]$Arguments)
+            return [pscustomobject]@{
+                TaskName = 'Cloudflare-Hosts-Optimizer DryRun'
+                Actions  = @([pscustomobject]@{ Execute = 'C:\Program Files\PowerShell\7\pwsh.exe'; Arguments = $Arguments })
+            }
+        }
+    }
+
+    It '-f 别名仍识别' {
+        $t = New-TaskObj4 -Arguments '-NoProfile -f "C:\Moved\Cloudflare-Hosts-Optimizer.ps1" -DryRun'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript4 | Should -BeTrue
+    }
+
+    It '带空格的引号路径仍识别' {
+        $t = New-TaskObj4 -Arguments '-NoProfile -File "C:\Moved Dir\Cloudflare-Hosts-Optimizer.ps1" -DryRun'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript4 | Should -BeTrue
+    }
+
+    It '闭引号后直接拼接后缀不算本工具' {
+        $t = New-TaskObj4 -Arguments '-NoProfile -ExecutionPolicy Bypass -File "C:\tmp\Cloudflare-Hosts-Optimizer.ps1".other.ps1'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript4 | Should -BeFalse
+    }
+}
