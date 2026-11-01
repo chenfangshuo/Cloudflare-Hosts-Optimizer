@@ -34,8 +34,9 @@
 
 .PARAMETER AllowUntrustedBackup
     与 -Rollback 同用：允许使用“普通用户可改写”的目录/文件里的备份。
-    系统 hosts 的自动回滚默认只信管理员/SYSTEM 独占写权限的备份；只有你确认某个
-    旧备份内容可信、又需要人工恢复时才用这个开关。它不会绕过 manifest/preHash 校验。
+    系统 hosts 的自动回滚默认只信 %ProgramData%\Cloudflare-Hosts-Optimizer\backup；
+    只有你确认某个旧备份内容可信、又需要人工恢复时才用这个开关。
+    它不会绕过 manifest/preHash 校验。
 
 .PARAMETER Version
     打印版本号并退出。
@@ -202,7 +203,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.6'
+$ScriptVersion = '0.6.0'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -483,7 +484,7 @@ function Invoke-Doctor {
     if (-not $bk.Exists) {
         & $add '存储' '备份目录' 'WARN' "尚未创建：$backupDir（第一次正式运行会创建）"
     } elseif ($isAdmin -and $bk.Writable -eq $false) {
-        & $add '存储' '备份目录' 'WARN' "不可写：$backupDir（正式运行会回退到 $Root\backup）"
+        & $add '存储' '备份目录' 'WARN' "不可写：$backupDir（系统 hosts 写入会因此中止；沙箱请检查仓库 backup 权限）"
     } else {
         $newest = if ($bk.Newest) { $bk.Newest } else { '暂无备份' }
         $note = if (-not $isAdmin) { '；非管理员，未测试写入' } else { '' }
@@ -696,7 +697,7 @@ function Invoke-Main {
         if ($AllowUntrustedBackup) {
             Say '警告：-AllowUntrustedBackup 已启用；会接受普通用户可写目录里的备份，请确认来源。' 'Yellow'
         }
-        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDirs -LegacyBackupDir (Join-Path $Root 'backup') -BackupPath $RollbackFrom -Force:$Force -AllowUntrustedBackup:$AllowUntrustedBackup
+        $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDirs -BackupPath $RollbackFrom -Force:$Force -AllowUntrustedBackup:$AllowUntrustedBackup
         $flush = Clear-DnsCache
         if ($r.Unchanged) { Say "hosts 已经是该备份的内容，无需恢复：$($r.Restored)" 'Green' }
         else { Say "已恢复 hosts：$($r.Restored)" 'Green' }

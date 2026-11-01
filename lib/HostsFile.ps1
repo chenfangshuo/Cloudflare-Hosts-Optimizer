@@ -367,14 +367,15 @@ function Update-HostsDocument {
 # ---------------------------------------------------------------------------
 # 备份来源可信度
 #
-# 备份 + manifest 都是普通文件，本工具只能靠哈希判断“自洽”，不能认证“来源”。
-# 只要目录（或文件）能被非管理员改写，攻击者就能伪造一对内容与 metadata 完全匹配的
-# 备份，让自动回滚把任意 hosts 内容以管理员权限写回去。所以：
-#   * 系统 hosts 的自动回滚只信“所有者是 SYSTEM/Administrators/TrustedInstaller，
-#     且非受信主体没有任何写类权限”的目录与文件；
-#   * 查不到 ACL、icacls 失败一律按不可信处理；
-#   * 父目录只额外检查“能否删除/替换子目录”，ProgramData 允许普通用户建自己的目录
-#     是正常的，不能因此把整条链判死。
+# 系统 hosts 的自动回滚只信本工具在 ProgramData 下创建/加固的备份目录：
+#   * 备份目录 owner 必须是 SYSTEM/Administrators/TrustedInstaller，且普通用户没有
+#     写/删除/改权限；
+#   * 应用根只要求 owner 受信且父目录不能被普通用户删除/替换（ProgramData 默认允许
+#     用户建自己的子目录，不能因此判死）；
+#   * 从应用根到备份目录的每一级都不能是 ReparsePoint；
+#   * 已存在但不可信的目录直接失败，不做“修复后信任”；
+#   * 旧文件即使后来 ACL 变好，也不能证明内容历史，来源检查不过就跳过。
+# 仓库 backup、任意其他路径对系统 hosts 一律不可信，只能显式人工恢复。
 # ---------------------------------------------------------------------------
 
 $script:TrustedSids = @(
@@ -398,51 +399,8 @@ function Get-AclSidString {
 }
 
 # 纯函数：只根据“所有者 SID + 访问规则”判断，不碰文件系统。
-# 注意 mask 只能用具体权限位：把 FullControl 放进 mask 会让任何权限都匹配。
-function Test-AclEntries {
-    [CmdletBinding()]
-    param(
-        [string]$OwnerSid,
-        [object[]]$Rules = @(),
-        [switch]$Ancestor
-    )
-    if (-not $OwnerSid -or $OwnerSid -notin $script:TrustedSids) { return $false }
-
-    $mask = if ($Ancestor) {
-        [Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
-    } else {
-        [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
-    }
-
-    foreach ($rule in @($Rules)) {
-        $type = if ($rule.PSObject.Properties['AccessControlType']) { $rule.AccessControlType } else { $null }
-        if ($type -and $type -ne 'Allow') { continue }
-        if ($rule.PSObject.Properties['AceQualifier'] -and $rule.AceQualifier -ne 'AccessAllowed') { continue }
-
-        # InheritOnly 的 ACE 不作用于对象本身，只作用于子对象；子对象会单独检查
-        $isInheritOnly = $false
-        if ($rule.PSObject.Properties['PropagationFlags']) {
-            $isInheritOnly = [bool]($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)
-        } elseif ($rule.PSObject.Properties['AceFlags']) {
-            $isInheritOnly = [bool]($rule.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly)
-        }
-        if ($isInheritOnly) { continue }
-
-        $rights = if ($rule.PSObject.Properties['FileSystemRights']) { [int]$rule.FileSystemRights } else { [int]$rule.AccessMask }
-        $specific = ($rights -band [int]$mask) -ne 0
-        # 泛型高位不能靠 -band 具体位识别：GENERIC_ALL=0x10000000、GENERIC_WRITE=0x40000000
-        $genericAll = ($rights -band 0x10000000) -ne 0
-        $genericWrite = ($rights -band 0x40000000) -ne 0
-        $dangerous = if ($Ancestor) { $genericAll } else { $genericAll -or $genericWrite }
-        if (-not ($specific -or $dangerous)) { continue }
-
-        $identity = if ($rule.PSObject.Properties['IdentityReference']) { $rule.IdentityReference } else { $rule.SecurityIdentifier }
-        $sid = Get-AclSidString -Identity $identity
-        if (-not $sid -or $sid -notin $script:TrustedSids) { return $false }
-    }
-    return $true
-}
-
+# mask 只用具体权限位；GENERIC_ALL/GENERIC_WRITE 高位单独判断。
+# -Ancestor 用于父目录：只拦删除/删除子项/改权限/取得所有权，允许普通用户建自己的子目录。
 function Test-AclTrusted {
     [CmdletBinding()]
     param(
@@ -451,64 +409,108 @@ function Test-AclTrusted {
     )
     if (-not $Acl) { return $false }
     try {
-        return (Test-AclEntries -OwnerSid (Get-AclSidString -Identity $Acl.Owner) -Rules @($Acl.Access) -Ancestor:$Ancestor)
+        $owner = Get-AclSidString -Identity $Acl.Owner
+        if (-not $owner -or $owner -notin $script:TrustedSids) { return $false }
+
+        $mask = if ($Ancestor) {
+            [Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+        } else {
+            [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+        }
+        foreach ($rule in @($Acl.Access)) {
+            if ($null -ne $rule.AccessControlType -and $rule.AccessControlType -ne 'Allow') { continue }
+            if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+
+            $rights = [int]$rule.FileSystemRights
+            $specific = ($rights -band [int]$mask) -ne 0
+            $genericAll = ($rights -band 0x10000000) -ne 0
+            $genericWrite = ($rights -band 0x40000000) -ne 0
+            $dangerous = if ($Ancestor) { $genericAll } else { $genericAll -or $genericWrite }
+            if (-not ($specific -or $dangerous)) { continue }
+
+            $sid = Get-AclSidString -Identity $rule.IdentityReference
+            if (-not $sid -or $sid -notin $script:TrustedSids) { return $false }
+        }
+        return $true
     } catch {
         return $false
     }
 }
 
-# 目标本身必须可信；**文件和目录都要**向上检查到 Root（含 Root 的父级，防止 Root 被父目录替换）。
+function Get-BackupRoot {
+    [CmdletBinding()]
+    param()
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if (-not $programData) { return '' }
+    return (Join-Path $programData 'Cloudflare-Hosts-Optimizer')
+}
+
+# 目录可信：路径边界 + 逐级 ReparsePoint + 应用根/备份目录 ACL + ProgramData 父目录检查。
 function Test-BackupPathTrusted {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string]$Root
+        [string]$AppRoot
     )
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $app = if ($AppRoot) { $AppRoot } else { Get-BackupRoot }
+    if (-not $app) { return $false }
     try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
-        if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $Path -ErrorAction Stop))) { return $false }
-    } catch {
+        $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $appFull = [IO.Path]::GetFullPath($app).TrimEnd('\')
+    } catch { return $false }
+    if (-not ($full -ieq $appFull -or $full.StartsWith($appFull + '\', [StringComparison]::OrdinalIgnoreCase))) {
         return $false
     }
 
-    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    # 文件从它的**直接父目录**开始查；目录从自身开始。每一级都要查，不能先向上跳一级。
-    $current = if ($item.PSIsContainer) { $full } else { Split-Path -Parent $full }
-    $stop = if ($Root) { [IO.Path]::GetFullPath($Root).TrimEnd('\') } else { $null }
-
+    # 从目标逐级向上走到应用根，拒绝任何 ReparsePoint
+    $current = $full
     while ($current) {
-        try {
-            $currentItem = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-            if ($currentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
-            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $current -ErrorAction Stop) -Ancestor)) { return $false }
-        } catch {
-            return $false
-        }
-        if ($stop -and $current -ieq $stop) { break }
+        try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop } catch { return $false }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        if ($current -ieq $appFull) { break }
         $parent = Split-Path -Parent $current
-        if (-not $parent -or $parent -eq $current) { break }
+        if (-not $parent -or $parent -eq $current) { return $false }
         $current = $parent
     }
 
-    # 信任根本身也不能被它的父目录删除/替换（ProgramData 允许建目录，但不允许删除别人的目录）
-    if ($stop -and $stop -ieq $current) {
-        $rootParent = Split-Path -Parent $stop
-        if ($rootParent -and $rootParent -ne $stop) {
-            try {
-                if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $rootParent -ErrorAction Stop) -Ancestor)) { return $false }
-            } catch {
-                return $false
-            }
-        }
+    # 应用根：owner 受信 + 父目录删除/改权限检查（不要求普通用户不能建子目录）
+    try {
+        if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $appFull -ErrorAction Stop) -Ancestor)) { return $false }
+    } catch { return $false }
+
+    # 备份目录本身：owner 受信，且非受信 SID 没有任何写/删除/改权限
+    if ($full -ine $appFull) {
+        try {
+            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $full -ErrorAction Stop))) { return $false }
+        } catch { return $false }
+    }
+
+    # %ProgramData% 本身不能被普通用户删除/替换其子项
+    $appParent = Split-Path -Parent $appFull
+    if ($appParent) {
+        try {
+            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $appParent -ErrorAction Stop) -Ancestor)) { return $false }
+        } catch { return $false }
     }
     return $true
 }
 
-# 受信链检查的终点：ProgramData 下的应用目录，或仓库根目录。
-# 纯策略：系统 hosts 的自动挑选只保留可信目录；显式 -AllowUntrustedBackup 或
-# 沙箱目标不做限制。不存在的目录直接忽略。
+# 单个候选文件：owner + 写类 ACE + ReparsePoint；不追父链（目录已单独检查）。
+function Test-BackupFileTrusted {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        return (Test-AclTrusted -Acl (Get-Acl -LiteralPath $Path -ErrorAction Stop))
+    } catch {
+        return $false
+    }
+}
+
+# 系统 hosts 的自动挑选只保留可信目录；沙箱不做限制。
 function Select-TrustedBackupDirs {
     [CmdletBinding()]
     param(
@@ -519,7 +521,7 @@ function Select-TrustedBackupDirs {
     $untrusted = @()
     foreach ($d in @($Dirs)) {
         if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
-        if (-not $IsSystem -or (Test-BackupPathTrusted -Path $d -Root (Get-BackupTrustRoot -Path $d))) {
+        if (-not $IsSystem -or (Test-BackupPathTrusted -Path $d)) {
             $trusted += $d
         } else {
             $untrusted += $d
@@ -528,47 +530,97 @@ function Select-TrustedBackupDirs {
     return [pscustomobject]@{ Trusted = @($trusted); Untrusted = @($untrusted) }
 }
 
-function Get-BackupTrustRoot {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
-    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    if ($programData) {
-        $appDir = Join-Path $programData 'Cloudflare-Hosts-Optimizer'
-        try {
-            if ([IO.Path]::GetFullPath($Path).StartsWith([IO.Path]::GetFullPath($appDir), [StringComparison]::OrdinalIgnoreCase)) {
-                return $appDir
-            }
-        } catch { }
-    }
-    if ($script:RepoRoot) { return $script:RepoRoot }
-    return (Split-Path -Parent $PSScriptRoot)
-}
-
-# 创建备份目录（必要时加固），并写一个临时文件确认真的可写。
-# “目录存在”不等于“可写”：ProgramData 可能被管理员建好并加固，普通用户随后写不进去。
-function New-BackupDirectory {
+# 纯函数：计算备份位置。系统 hosts 只有 ProgramData，沙箱只有仓库 targets；没有 fallback。
+function Get-HostsBackupPlan {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [switch]$Harden
+        [string]$HostsPath,
+        [string]$FallbackRoot,
+        [string[]]$BaseCandidates
     )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null
-        if ($Harden) {
-            & icacls $Path /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "无法设置备份目录权限（icacls 退出码 $LASTEXITCODE）：$Path"
+    $isSystem = $true
+    if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
+
+    $targetId = $null
+    if ($HostsPath -and -not $isSystem) {
+        try {
+            $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
+            $targetId = (Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($normalized))).Substring(0, 16).ToLowerInvariant()
+        } catch { $targetId = $null }
+    }
+
+    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
+    $appRoot = Get-BackupRoot
+    $programDataBase = if ($appRoot) { Join-Path $appRoot 'backup' } else { '' }
+
+    if ($BaseCandidates) {
+        $bases = @($BaseCandidates)
+    } elseif ($isSystem) {
+        $bases = @($programDataBase) | Where-Object { $_ }
+    } else {
+        $bases = @((Join-Path $root 'backup'))
+    }
+
+    $dirs = @(foreach ($base in @($bases)) {
+            if (-not $base) { continue }
+            $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
+            [pscustomobject]@{ Base = $base; Dir = $dir }
+        })
+    return [pscustomobject]@{
+        IsSystem        = $isSystem
+        TargetId        = $targetId
+        AppRoot         = $appRoot
+        ProgramDataBase = $programDataBase
+        Bases           = @($bases)
+        Dirs            = @($dirs)
+    }
+}
+
+# 准备唯一一个备份目录：新目录创建并加固；已存在目录只复查，不可信直接失败。
+function Initialize-HostsBackupDirectory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan)
+    $entries = @($Plan.Dirs)
+    if ($entries.Count -eq 0) { throw '无法准备备份目录：没有可用位置。' }
+    $entry = $entries[0]
+    $isProgramData = ($Plan.ProgramDataBase -and $entry.Base -ieq $Plan.ProgramDataBase)
+
+    if ($Plan.IsSystem) {
+        if (Test-Path -LiteralPath $Plan.AppRoot) {
+            if (-not (Test-BackupPathTrusted -Path $Plan.AppRoot)) {
+                throw "备份根目录不可信：$($Plan.AppRoot)。请删除或修复该目录（owner 必须是 Administrators/SYSTEM），或改用沙箱 -HostsPath。"
+            }
+        } else {
+            New-Item -ItemType Directory -Force -Path $Plan.AppRoot -ErrorAction Stop | Out-Null
+            & icacls $Plan.AppRoot /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "无法加固备份根目录：$($Plan.AppRoot)" }
+            if (-not (Test-BackupPathTrusted -Path $Plan.AppRoot)) {
+                throw "备份根目录加固后仍不可信：$($Plan.AppRoot)"
             }
         }
     }
-    $probe = Join-Path $Path ('.cfo-write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
+
+    if (-not (Test-Path -LiteralPath $entry.Dir)) {
+        New-Item -ItemType Directory -Force -Path $entry.Dir -ErrorAction Stop | Out-Null
+    }
+    if ($isProgramData) {
+        & icacls $entry.Dir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)R' 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "无法加固备份目录：$($entry.Dir)" }
+    }
+
+    $probe = Join-Path $entry.Dir ('.cfo-write-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::WriteAllText($probe, 'ok')
     } catch {
-        throw "备份目录不可写：$Path（$($_.Exception.Message)）"
+        throw "备份目录不可写：$($entry.Dir)（$($_.Exception.Message)）"
     } finally {
         if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
     }
+
+    if ($Plan.IsSystem -and -not (Test-BackupPathTrusted -Path $entry.Dir)) {
+        throw "备份目录加固后仍不可信：$($entry.Dir)"
+    }
+    return $entry.Dir
 }
 
 function Get-HostsBackupDir {
@@ -576,88 +628,21 @@ function Get-HostsBackupDir {
     param(
         [string]$HostsPath,
         [string]$FallbackRoot,
-        # 仅供测试注入候选目录；正常调用不要传
         [string[]]$BaseCandidates
     )
-
-    $isSystem = $true
-    if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
-
-    # 非系统 hosts 使用按目标路径哈希隔离的子目录，避免沙箱备份被系统 hosts 回滚选中
-    $targetId = $null
-    if ($HostsPath -and -not $isSystem) {
-        $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
-        $hash = (Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
-        $targetId = $hash.Substring(0, 16)
-    }
-
-    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
-    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-
-    # 候选按优先级排列：ProgramData 下的加固目录，其次脚本目录下的 backup。
-    # 沙箱（非系统 hosts）在普通权限下通常建不了 ProgramData 子目录，必须能落到 fallback。
-    $programDataBase = if ($programData) { Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup' } else { '' }
-    $bases = @()
-    if ($BaseCandidates) {
-        $bases = @($BaseCandidates)
-    } else {
-        if ($programDataBase) { $bases += $programDataBase }
-        $bases += (Join-Path $root 'backup')
-    }
-
-    $lastError = ''
-    foreach ($base in $bases) {
-        $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
-        # 只加固 ProgramData 下的目录；仓库里的 fallback 必须保持当前用户可写，
-        # 否则普通用户第一次写完就再也写不进去。
-        $harden = ($programDataBase -and $base -ieq $programDataBase)
-        try {
-            if ($harden) { New-BackupDirectory -Path $dir -Harden }
-            else { New-BackupDirectory -Path $dir }
-            return $dir
-        } catch {
-            $lastError = $_.Exception.Message
-        }
-    }
-    throw "无法准备备份目录：$lastError"
+    $plan = Get-HostsBackupPlan -HostsPath $HostsPath -FallbackRoot $FallbackRoot -BaseCandidates $BaseCandidates
+    return (Initialize-HostsBackupDirectory -Plan $plan)
 }
 
-# 只计算候选目录，不创建、不写探针 —— 回滚查找备份时用。
 function Get-HostsBackupDirs {
     [CmdletBinding()]
     param(
         [string]$HostsPath,
         [string]$FallbackRoot,
-        # 仅供测试注入候选目录；正常调用不要传
         [string[]]$BaseCandidates
     )
-    $isSystem = $true
-    if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
-    $targetId = $null
-    if ($HostsPath -and -not $isSystem) {
-        try {
-            $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
-            $hash = (Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
-            $targetId = $hash.Substring(0, 16)
-        } catch { $targetId = $null }
-    }
-
-    $root = if ($FallbackRoot) { $FallbackRoot } elseif ($script:RepoRoot) { $script:RepoRoot } else { $PSScriptRoot }
-    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
-    $bases = @()
-    if ($BaseCandidates) {
-        $bases = @($BaseCandidates)
-    } else {
-        if ($programData) { $bases += (Join-Path $programData 'Cloudflare-Hosts-Optimizer\backup') }
-        $bases += (Join-Path $root 'backup')
-    }
-
-    $dirs = @()
-    foreach ($base in $bases) {
-        $dir = if ($targetId) { Join-Path $base "targets\$targetId" } else { $base }
-        if (Test-Path -LiteralPath $dir) { $dirs += $dir }
-    }
-    return @($dirs)
+    $plan = Get-HostsBackupPlan -HostsPath $HostsPath -FallbackRoot $FallbackRoot -BaseCandidates $BaseCandidates
+    return @($plan.Dirs | Where-Object { Test-Path -LiteralPath $_.Dir } | ForEach-Object { $_.Dir })
 }
 
 # 读 JSON；文件不存在或解析失败返回 $null，由调用方决定是跳过还是报错。
@@ -921,14 +906,11 @@ function Invoke-HostsRollback {
     param(
         [Parameter(Mandatory)][string]$HostsPath,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$BackupDir,
-        [string]$LegacyBackupDir,
         # 指定要恢复的备份文件；不指定则用最近一次
         [string]$BackupPath,
         [switch]$Force,
         # 显式允许使用不可信目录/文件里的备份：只用于人工恢复，必须配合 -RollbackFrom
-        [switch]$AllowUntrustedBackup,
-        # 仅供测试：把沙箱 -HostsPath 当成系统 hosts，用于验证来源信任策略
-        [switch]$AssumeSystemHosts
+        [switch]$AllowUntrustedBackup
     )
 
     $mutexState = Enter-GlobalMutex
@@ -939,10 +921,8 @@ function Invoke-HostsRollback {
     }
 
     $isSystem = Test-SystemHostsPath -Path $HostsPath
-    if ($AssumeSystemHosts) { $isSystem = $true }
 
     $rawDirs = @($BackupDir)
-    if ($isSystem -and $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $rawDirs += $LegacyBackupDir }
 
     # 系统 hosts 只从“管理员/SYSTEM 独占写权限”的目录里自动挑选备份。
     # 非系统 hosts（沙箱）没有提权面，不做这个限制。
@@ -957,49 +937,37 @@ function Invoke-HostsRollback {
                 Where-Object { $_.Name -notlike 'hosts-initial-*' }
         })
 
-    # 候选：manifest 必须同时有 hostsPath（匹配当前目标）和 preHash；
-    # 无 manifest 的旧备份只允许“legacy 目录 + 系统 hosts”。
+    # 候选：manifest 必须同时有 hostsPath（匹配当前目标）和 preHash。
+    # 来源检查必须在读取/排序/覆盖保护之前：guard 也可能来自一份没被选中的 manifest，
+    # pending 恢复也会采纳未选中的清单。系统 hosts 对 .bak 和 .json 都做轻量文件检查。
     $candidates = @()
     foreach ($bak in $all) {
         $manifestPath = "$($bak.FullName).json"
-        # 来源检查必须在候选进入排序/覆盖保护之前：guard 也可能来自一份没被选中的 manifest
         if ($isSystem) {
-            $trustRoot = Get-BackupTrustRoot -Path $bak.FullName
-            if (-not (Test-BackupPathTrusted -Path $bak.FullName -Root $trustRoot)) { continue }
-            if ((Test-Path -LiteralPath $manifestPath) -and
-                -not (Test-BackupPathTrusted -Path $manifestPath -Root $trustRoot)) { continue }
-        }
-        if (Test-Path -LiteralPath $manifestPath) {
-            try {
-                $m = Read-JsonFile -Path $manifestPath
-                if (-not $m.hostsPath -or -not $m.preHash) { continue }
-                $same = $false
-                $same = Test-SamePath -Left $m.hostsPath -Right $HostsPath
-                if (-not $same) { continue }
-                # 缺 createdAt 的旧 manifest：退回文件名里的时间，而不是 MinValue，
-                # 否则它会排到所有带时间的备份后面（R6）。
-                $sortAt = ConvertTo-BackupTimestamp -Value $m.createdAt
-                if (-not $sortAt) { $sortAt = ConvertTo-BackupTimestampFromName -Name $bak.Name }
-                # 新格式显式带 state；旧格式没有 state，仍按“有 postHash 就是已完成”判定
-                $state = ([string]$m.state).ToLowerInvariant()
-                if (-not $state) { $state = if ($m.postHash) { 'committed' } else { 'pending' } }
-                # 替换根本没发生的记录（aborted）不是候选，不能拿来恢复
-                if ($state -eq 'aborted') { continue }
-                $candidates += [pscustomobject]@{
-                    File = $bak; Manifest = $m; State = $state
-                    Committed = ($state -eq 'committed'); Legacy = $false
-                    SortAt = $sortAt; SortName = $bak.Name
-                }
-            } catch { continue }
-        } else {
-            $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
-                (Test-SamePath -Left $bak.DirectoryName -Right $LegacyBackupDir)
-            if (-not ($isLegacy -and $isSystem)) { continue }
-            $candidates += [pscustomobject]@{
-                File = $bak; Manifest = $null; Committed = $false; Legacy = $true
-                SortAt = (ConvertTo-BackupTimestampFromName -Name $bak.Name); SortName = $bak.Name
+            if (-not (Test-BackupFileTrusted -Path $bak.FullName)) { continue }
+            if (Test-Path -LiteralPath $manifestPath) {
+                if (-not (Test-BackupFileTrusted -Path $manifestPath)) { continue }
             }
         }
+        if (-not (Test-Path -LiteralPath $manifestPath)) { continue }
+        try {
+            $m = Read-JsonFile -Path $manifestPath
+            if (-not $m.hostsPath -or -not $m.preHash) { continue }
+            if (-not (Test-SamePath -Left $m.hostsPath -Right $HostsPath)) { continue }
+            # 缺 createdAt 的旧 manifest：退回文件名里的时间，而不是 MinValue。
+            $sortAt = ConvertTo-BackupTimestamp -Value $m.createdAt
+            if (-not $sortAt) { $sortAt = ConvertTo-BackupTimestampFromName -Name $bak.Name }
+            # 新格式显式带 state；旧格式没有 state，仍按“有 postHash 就是已完成”判定
+            $state = ([string]$m.state).ToLowerInvariant()
+            if (-not $state) { $state = if ($m.postHash) { 'committed' } else { 'pending' } }
+            # 替换根本没发生的记录（aborted）不是候选，不能拿来恢复
+            if ($state -eq 'aborted') { continue }
+            $candidates += [pscustomobject]@{
+                File = $bak; Manifest = $m; State = $state
+                Committed = ($state -eq 'committed')
+                SortAt = $sortAt; SortName = $bak.Name
+            }
+        } catch { continue }
     }
 
     # 同一秒内的多次提交，文件名里的 GUID 是随机的；优先按 manifest 的 createdAt 排序，
@@ -1032,8 +1000,6 @@ function Invoke-HostsRollback {
             # 旧清单可能没有这些字段，用 Add-Member -Force 补齐
             $m | Add-Member -NotePropertyName state -NotePropertyValue 'committed' -Force
             $m | Add-Member -NotePropertyName postHash -NotePropertyValue ([string]$m.intendedHash) -Force
-            $m | Add-Member -NotePropertyName verified -NotePropertyValue $false -Force
-            $m | Add-Member -NotePropertyName recoveredAt -NotePropertyValue (Get-Date).ToString('o') -Force
             Write-JsonFileAtomic -Path "$($c.File.FullName).json" -Object $m
         } catch {
             throw "无法把恢复后的提交状态写回备份清单，已中止回滚（hosts 未修改）：$($_.Exception.Message)"
@@ -1056,6 +1022,15 @@ function Invoke-HostsRollback {
         if (-not (Test-Path -LiteralPath $manifestPath)) {
             throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($file.FullName)"
         }
+        # 显式恢复也要先确认点名文件的来源；-AllowUntrustedBackup 才放宽这一份
+        if ($isSystem -and -not $AllowUntrustedBackup) {
+            if (-not (Test-BackupFileTrusted -Path $file.FullName)) {
+                throw "该备份可被普通用户改写，无法确认来源，已拒绝：$($file.FullName)。确认内容可信后可用 -AllowUntrustedBackup 显式恢复。"
+            }
+            if (-not (Test-BackupFileTrusted -Path $manifestPath)) {
+                throw "该备份的 manifest 可被普通用户改写，无法确认来源，已拒绝：$manifestPath"
+            }
+        }
         $m = Read-JsonFile -Path $manifestPath
         if (-not $m) { throw "该备份的 manifest 无法读取，已拒绝：$manifestPath" }
         $sameTarget = $false
@@ -1068,7 +1043,7 @@ function Invoke-HostsRollback {
         if (-not $m.preHash) {
             throw "该备份的 manifest 缺少 preHash，无法确认内容完整，已拒绝：$($file.FullName)"
         }
-        $selected = [pscustomobject]@{ File = $file; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false }
+        $selected = [pscustomobject]@{ File = $file; Manifest = $m; Committed = [bool]$m.postHash }
     } else {
         if ($byName.Count -eq 0) {
             $hint = if ($untrustedDirs.Count -gt 0) {
@@ -1080,15 +1055,14 @@ function Invoke-HostsRollback {
         $selected = if ($committed.Count -gt 0) { $committed[0] } else { $byName[0] }
     }
 
-    # 文件自身的 ACL/所有者也要可信：目录被加固之后，旧文件仍可能带着不安全的显式权限
+    # 选中后再复查一次文件来源：扫描与使用之间文件仍可能被替换
     if ($isSystem -and -not $AllowUntrustedBackup) {
-        $trustRoot = Get-BackupTrustRoot -Path $selected.File.FullName
-        if (-not (Test-BackupPathTrusted -Path $selected.File.FullName -Root $trustRoot)) {
-            throw "该备份（或其所在目录）可被普通用户改写，无法确认来源，已拒绝：$($selected.File.FullName)。确认内容可信后可用 -RollbackFrom <文件> -AllowUntrustedBackup 显式恢复。"
+        if (-not (Test-BackupFileTrusted -Path $selected.File.FullName)) {
+            throw "该备份可被普通用户改写，无法确认来源，已拒绝：$($selected.File.FullName)。确认内容可信后可用 -RollbackFrom <文件> -AllowUntrustedBackup 显式恢复。"
         }
-        $manifestTrustedPath = "$($selected.File.FullName).json"
-        if ((Test-Path -LiteralPath $manifestTrustedPath) -and -not (Test-BackupPathTrusted -Path $manifestTrustedPath -Root $trustRoot)) {
-            throw "该备份的 manifest 可被普通用户改写，无法确认来源，已拒绝：$manifestTrustedPath"
+        $selectedManifest = "$($selected.File.FullName).json"
+        if ((Test-Path -LiteralPath $selectedManifest) -and -not (Test-BackupFileTrusted -Path $selectedManifest)) {
+            throw "该备份的 manifest 可被普通用户改写，无法确认来源，已拒绝：$selectedManifest"
         }
     }
 
@@ -1124,7 +1098,7 @@ function Invoke-HostsRollback {
     if (-not $allowed -and $guard -and $currentHash -eq $guard) { $allowed = $true }
     # 回滚过一次之后再回滚同一份备份会命中上面的“无变化”分支，不需要额外判断 preHash
     if (-not $allowed) {
-        if ($selected.Legacy -or -not $guard) {
+        if (-not $guard) {
             throw '无法确认当前 hosts 是否被改过（没有可参考的已完成事务）。确认要覆盖请加 -Force。'
         }
         throw 'hosts 在最后一次成功写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'

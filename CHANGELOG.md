@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.6.0 - 2026-11-01
+
+本版没有新增功能，是对 0.5.6 评审修复的一次收敛：删掉不再需要的防御和重复代码，
+把备份来源的信任边界收窄到明确的一处。
+
+### Security
+
+- **系统 hosts 的自动回滚只信 ProgramData 备份目录**：应用根固定为
+  `%ProgramData%\Cloudflare-Hosts-Optimizer`，备份目录为 `...\backup`；检查应用根和
+  备份目录的 owner/写类 ACE、逐级 ReparsePoint，以及 `%ProgramData%` 父目录的
+  删除/改权限。仓库 `backup` 和其他位置对系统 hosts 一律不可信，只能用
+  `-RollbackFrom <文件> + -AllowUntrustedBackup` 显式恢复。
+- **不再把旧备份“加固后升级”为可信**：已存在但不可信的目录直接失败，不执行
+  “先 icacls 修复再继续”；旧 `.bak`/`.json` 通不过来源检查就跳过。加固只能证明
+  “现在谁能改文件”，不能证明内容在加固前没有被改过。
+- **候选清单在进入排序/覆盖保护/pending 恢复前检查**：所有会参与决策的 `.bak` 和
+  `.json` 都做轻量 owner/写类 ACE/ReparsePoint 检查，避免未选中的伪造清单提供
+  `postHash` guard 或驱动 pending 恢复。
+- **计划任务归属只接受本工具生成的入口形状**：锚定宿主前缀正则，要求 `-File` 目标
+  token 有结束边界；`-Command`、隐式 `.ps1`、未知开关、`"x.ps1".other.ps1` 拼接
+  都不会被误认。精确任务名、通配符拦截、按对象删除保持不变。
+
+### Changed
+
+- 系统 hosts 的备份目录不可用/不可信时**直接中止写入**，不再回退到项目目录；
+  沙箱 `-HostsPath` 只用仓库 `backup\targets\<hash>`，不碰 ProgramData。
+  v0.5.6 已落在 ProgramData `targets\<hash>` 的沙箱历史不会被新位置自动发现，
+  需要时用 `-RollbackFrom` 人工恢复。
+- 删除 manifest 里只写不读的 `txnId`、`verified`、`recoveredAt`、`domains`
+  （`domains` 会把站点清单写进备份目录）；`$w.Verified` 返回值和替换后校验行为不变。
+- `last-run.json` 只服务菜单显示，去掉全局互斥锁和原子替换；写坏时菜单回退到
+  “上次报告时间”，下一次有提交的运行会重新生成。
+- 删除无调用方的进度助手、Probe 死参数、CFST 不可达的大小检查，以及菜单里重复的
+  pwsh 查找/暂停/参数序列化。
+- `docs/`、`CLAUDE.md` 的备份信任说明改为新模型；`CONTRIBUTING.md` 删掉已经过期的
+  `docs/images/` export-ignore 说明。
+
+### Fixed
+
+- `.bak` 轮换时同时删除对应的 `.json`，不再无限堆积。
+- 回滚路径的全局互斥锁现在会 `Dispose()`。
+- 备份目录不再只在新建时加固；已存在的备份目录每次使用前都复查 ACL。
+- 备份根路径比较带目录分隔符边界，`Cloudflare-Hosts-Optimizer-evil` 不会混入。
+
 ## 0.5.6 - 2026-11-01
 
 本版全部来自一次独立全工程评审（4 P0 / 3 P1 / 5 P2），没有新增功能。

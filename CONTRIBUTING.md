@@ -42,7 +42,8 @@ Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
 
 发布包只包含 git 已跟踪的文件，不会带 `domains.txt`、`cfst/`、`backup/`、`plan.json`
 或 `dist/`；`.gitattributes` 里标了 `export-ignore` 的开发文件（`.github/`、`.gitignore`、
-`.gitattributes`、`tests/`、`scripts/`、`CONTRIBUTING.md`、`docs/images/`）也不会进包。
+`.gitattributes`、`tests/`、`scripts/`、`CONTRIBUTING.md`）也不会进包；
+`docs/images/` 会保留在发布包里，README 的截图才能正常显示。
 
 发布由 tag 触发的 workflow（`.github/workflows/release.yml`）自动完成：推 `v*` tag 后，
 Actions 会检查 tag 是否在 `main` 上、版本号是否与 `$ScriptVersion` 一致，跑语法检查和

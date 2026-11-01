@@ -34,7 +34,7 @@
 ### 首次启动
 
 ```text
-Cloudflare-Hosts-Optimizer 0.5.6
+Cloudflare-Hosts-Optimizer 0.6.0
 域名 12 个 · hosts 已写入 10 个 · CFST 已安装
 上次运行：2026-11-01 10:28 · 写入 · 退出码 0
 最近提交：写入 · 2026-11-01 10:28
@@ -400,7 +400,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\Cloudflare-Hosts-O
 | 导入中间产物 | `<工具目录>\domains.imported.txt` |
 | 运行报告 | `<工具目录>\last-report.txt` |
 | 运行摘要（最近运行/最近提交） | `<工具目录>\last-run.json` |
-| 备份 | `%ProgramData%\Cloudflare-Hosts-Optimizer\backup` |
+| 备份 | 系统 hosts：`%ProgramData%\Cloudflare-Hosts-Optimizer\backup`；沙箱 `-HostsPath`：`<工具目录>\backup\targets\<hash>` |
 | 机房缓存 | `%LOCALAPPDATA%\Cloudflare-Hosts-Optimizer\colo-cache.json` |
 | CFST | `<工具目录>\cfst\cfst.exe` + `ip.txt` |
 

@@ -198,17 +198,27 @@ BitTorrent 的 IPv6 对等连接不受影响；tracker 专用子域名建议不�
 
 ### 备份与清单
 
-- 目录：优先 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`，创建时会设成
-  "管理员/系统可写、普通用户只读"；如果它建不了或写不进（普通用户跑沙箱时很常见），
-  回退到项目目录下的 `backup`。回滚查找会同时扫描这两个位置，但**只自动信任
-  管理员/SYSTEM 独占写权限的目录**——项目目录里的备份可以手动 `-RollbackFrom` +
-  `-AllowUntrustedBackup` 恢复。
-- 非系统 `-HostsPath` 使用 `targets\<路径哈希>` 子目录；回滚时校验 manifest 的 `hostsPath`，
-  避免沙箱备份被系统 hosts 的回滚选中。
-- 文件名含毫秒时间戳和 GUID，附带 JSON 清单（`createdAt`、`preHash`、`postHash`、域名数）。
+- **系统 hosts**：备份只放在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`。
+  应用根和备份目录必须是管理员/SYSTEM 独占写；创建时设成"管理员/系统可写、
+  普通用户只读"。目录不可用或不可信时**直接中止写入**，不回退到项目目录。
+- **沙箱 `-HostsPath`**：只用项目目录下的 `backup\targets\<路径哈希>`，不碰 ProgramData；
+  回滚时校验 manifest 的 `hostsPath`，避免沙箱备份被系统 hosts 的回滚选中。
+- **来源检查**：系统 hosts 自动挑选时检查
+  1. 路径必须位于应用根的 `backup` 之下（带目录分隔符边界）；
+  2. 从应用根到备份目录逐级不能是 ReparsePoint；
+  3. 应用根 owner 受信、`%ProgramData%` 父目录不能被普通用户删除/替换子项；
+  4. 备份目录本身 owner 受信且普通用户没有写/删除/改权限；
+  5. 每个会参与排序、覆盖保护或 pending 恢复的 `.bak`/`.json` 单独检查 owner、
+     写类 ACE 和 ReparsePoint。
+  已存在但不可信的目录直接失败，不用 icacls 去"修复后信任"；旧文件即使后来 ACL 变好，
+  也不能证明内容历史，来源检查不过就跳过。仓库 `backup` 和其他位置对系统 hosts
+  一律不可信，只能用 `-RollbackFrom <文件> + -AllowUntrustedBackup` 显式恢复。
+- 文件名含毫秒时间戳和 GUID，附带 JSON 清单（`createdAt`、`version`、`hostsPath`、
+  `preHash`、`intendedHash`、`postHash`、`state`、`committedAt`）。
 - 选择"最近"时**优先按 manifest 的 `createdAt`**（同一秒内的多次提交也不会被随机 GUID
   打乱），没有该字段的备份退回文件名里的时间，不依赖 LastWriteTime。
-- 保留最近 10 份 + 一份首次接管快照（`hosts-initial-*.bak`，不参与轮换）。
+- 保留最近 10 份 + 一份首次接管快照（`hosts-initial-*.bak`，不参与轮换）；
+  轮换旧 `.bak` 时同步删除对应的 `.json`。
 
 ### 写入事务
 
@@ -228,15 +238,16 @@ BitTorrent 的 IPv6 对等连接不受影响；tracker 专用子域名建议不�
 - 自动回滚优先选择最近的**已完成事务**（`state=committed`；旧格式看有没有 `postHash`）；
   没有已完成事务时才退回最新的未完成备份。缺 `hostsPath`/`preHash` 的备份不参与自动选择。
   `pending` 只有在当前 hosts 哈希等于它的 `intendedHash` 时才算"已替换"。
-- **来源可信度**：系统 hosts 的自动回滚只接受所有者是 SYSTEM/Administrators/TrustedInstaller、
-  且普通用户没有写/删除/改权限的目录与文件；查不到 ACL 一律按不可信处理。
-  不可信目录被跳过时会给出提示；确实要人工恢复，用 `-RollbackFrom <文件> -AllowUntrustedBackup`
-  （它不绕过下面的内容校验）。
+- **来源可信度**：系统 hosts 的自动回滚只扫描 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`，
+  并对目录和每个候选清单做 owner/写类 ACE/ReparsePoint 检查；查不到 ACL 一律按不可信处理。
+  不可信候选被跳过时会给出提示；确实要人工恢复，用
+  `-RollbackFrom <文件> -AllowUntrustedBackup`（它不绕过下面的内容校验）。
 - 备份内容必须与清单 `preHash` 一致；不一致直接拒绝，`-Force` 也不能绕过。
 - 覆盖保护与"选哪份备份"分开：用**最新已完成事务的 `postHash`** 判断当前 hosts 是否在最后
   一次成功写入后被改过；被改过时默认拒绝，`-Force` 才允许。
 - 当前 hosts 已经等于所选备份内容时，视为无变化成功，不重复替换。
-- 无 manifest 的旧备份只允许"legacy 目录 + 系统 hosts"；当前内容与备份不同时同样需要 `-Force`。
+- 没有 manifest 的备份不参与自动挑选，也不能用 `-RollbackFrom` 恢复
+  （缺少目标与内容校验信息）；如果需要旧格式备份，请手动确认内容后恢复。
 - `-Rollback -RollbackFrom <hosts-*.bak>` 恢复到指定备份：仍校验 `hostsPath` 和 `preHash`，
   但覆盖检查基于最新成功提交（而不是所选备份自己的 `postHash`），正常的历史恢复不需要 `-Force`。
 - `-Rollback` 不依赖 `domains.txt`，域名清单丢失时仍可恢复。

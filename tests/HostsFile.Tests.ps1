@@ -32,6 +32,37 @@ BeforeAll {
         New-HostsFixture -Path $Path
         Read-HostsDocument -Path $Path
     }
+
+    # Test-AclTrusted 只读 Owner 和 Access，用普通对象即可；这样也能覆盖枚举里没有的
+    # GENERIC_ALL/GENERIC_WRITE 高位（FileSystemAccessRule 会拒绝这些数值）。
+    function New-TestAcl {
+        param([string]$OwnerSid, [object[]]$Rules = @())
+        return [pscustomobject]@{
+            Owner  = [System.Security.Principal.SecurityIdentifier]::new($OwnerSid)
+            Access = @($Rules)
+        }
+    }
+
+    function New-TestRule {
+        param(
+            [string]$Sid,
+            [string]$Rights,
+            [string]$Type = 'Allow',
+            [AllowEmptyString()][string]$Inheritance = 'None',
+            [string]$Propagation = 'None'
+        )
+        $rightsValue = if ($Rights -match '^\d+$') {
+            [int]$Rights
+        } else {
+            [System.Security.AccessControl.FileSystemRights]$Rights
+        }
+        return [pscustomobject]@{
+            AccessControlType = [System.Security.AccessControl.AccessControlType]$Type
+            PropagationFlags  = [System.Security.AccessControl.PropagationFlags]$Propagation
+            FileSystemRights  = $rightsValue
+            IdentityReference = [System.Security.Principal.SecurityIdentifier]::new($Sid)
+        }
+    }
 }
 
 Describe 'Read-HostsDocument' {
@@ -607,96 +638,70 @@ Describe '回滚异常组合（v0.5.4）' {
 }
 
 Describe 'F03 备份来源可信度' {
-    BeforeAll {
-        function New-TestAcl {
-            param([string]$OwnerSid, [object[]]$Rules = @())
-            $acl = [System.Security.AccessControl.DirectorySecurity]::new()
-            $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new($OwnerSid))
-            foreach ($r in $Rules) { $acl.AddAccessRule($r) }
-            return $acl
-        }
-        function New-TestRule {
-            param(
-                [string]$Sid,
-                [string]$Rights,
-                [string]$Type = 'Allow',
-                [string]$Inheritance = 'None',
-                [string]$Propagation = 'None'
-            )
-            $rightsValue = if ($Rights -match '^\d+$') {
-                [System.Security.AccessControl.FileSystemRights][int]$Rights
-            } else {
-                [System.Security.AccessControl.FileSystemRights]$Rights
-            }
-            return [System.Security.AccessControl.FileSystemAccessRule]::new(
-                [System.Security.Principal.SecurityIdentifier]::new($Sid),
-                $rightsValue,
-                [System.Security.AccessControl.InheritanceFlags]$Inheritance,
-                [System.Security.AccessControl.PropagationFlags]$Propagation,
-                [System.Security.AccessControl.AccessControlType]$Type)
-        }
-    }
-
-    It '所有者是 Administrators 且只有管理员可写时可信' {
-        $rules = @(
+    It '管理员独占写、普通用户只读时可信' {
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
             (New-TestRule -Sid 'S-1-5-18' -Rights 'FullControl'),
             (New-TestRule -Sid 'S-1-5-32-544' -Rights 'FullControl'),
             (New-TestRule -Sid 'S-1-5-32-545' -Rights 'ReadAndExecute')
         )
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+        Test-AclTrusted -Acl $acl | Should -BeTrue
     }
 
     It '普通用户有写权限时不可信' {
-        $rules = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write')
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write'))
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
     It '显式授予普通用户 SID 的 Modify 也不可信' {
-        $rules = @(New-TestRule -Sid 'S-1-5-21-111111111-222222222-333333333-1001' -Rights 'Modify')
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-21-111111111-222222222-333333333-1001' -Rights 'Modify'))
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
     It '所有者是普通用户时不可信' {
-        Test-AclEntries -OwnerSid 'S-1-5-21-111111111-222222222-333333333-1001' | Should -BeFalse
+        $acl = New-TestAcl -OwnerSid 'S-1-5-21-111111111-222222222-333333333-1001'
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
     It '仅 WRITE_DAC 也不可信' {
-        $rules = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'ChangePermissions')
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights 'ChangePermissions'))
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
-    It '父目录模式忽略“建文件”权限，但仍拦截删除' {
-        $create = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write' -Inheritance 'ContainerInherit')
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $create -Ancestor | Should -BeTrue
+    It '父目录模式允许建子目录，但仍拦截删除' {
+        $create = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights 'Write' -Inheritance 'ContainerInherit'))
+        Test-AclTrusted -Acl $create -Ancestor | Should -BeTrue
 
-        $delete = @(New-TestRule -Sid 'S-1-5-32-545' -Rights 'Delete' -Inheritance 'ContainerInherit')
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $delete -Ancestor | Should -BeFalse
+        $delete = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights 'Delete' -Inheritance 'ContainerInherit'))
+        Test-AclTrusted -Acl $delete -Ancestor | Should -BeFalse
     }
 
-    It '普通用户拥有的临时目录不可信' {
-        $d = Join-Path $TestDrive 'trust-dir'
-        New-Item -ItemType Directory -Force -Path $d | Out-Null
-        Test-BackupPathTrusted -Path $d -Root $TestDrive | Should -BeFalse
+    It '普通用户拥有的应用根/备份目录不可信' {
+        $app = Join-Path $TestDrive 'trust-app'
+        $bk = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $bk | Out-Null
+        Test-BackupPathTrusted -Path $bk -AppRoot $app | Should -BeFalse
+        Test-BackupPathTrusted -Path (Join-Path $TestDrive 'nope') -AppRoot $app | Should -BeFalse
+        Test-BackupPathTrusted -Path $bk -AppRoot (Join-Path $TestDrive 'other') | Should -BeFalse
     }
 
-    It '不存在的路径不可信' {
-        Test-BackupPathTrusted -Path (Join-Path $TestDrive 'nope') -Root $TestDrive | Should -BeFalse
-    }
-
-    It '系统 hosts 自动挑选只保留可信目录，沙箱不做限制' {
+    It '沙箱不做信任限制' {
         $d = Join-Path $TestDrive 'untrusted-bk'
         New-Item -ItemType Directory -Force -Path $d | Out-Null
         $r = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $true
         @($r.Trusted).Count | Should -Be 0
         @($r.Untrusted) | Should -Contain $d
 
-        # -AllowUntrustedBackup 只放宽“用户点名的那一份文件”，不再放宽整组扫描目录
         $r3 = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $false
         @($r3.Trusted) | Should -Contain $d
     }
 }
 
-Describe 'F08 备份目录选择与回退' {
+Describe 'F08 备份目录位置' {
     It '只计算已存在的候选目录，不创建' {
         $a = Join-Path $TestDrive 'bk-a'
         $b = Join-Path $TestDrive 'bk-b'
@@ -707,13 +712,31 @@ Describe 'F08 备份目录选择与回退' {
         Test-Path -LiteralPath $b | Should -BeFalse
     }
 
-    It '首个候选不可创建时回退到下一个' {
+    It '系统 hosts 只有 ProgramData 候选' {
+        Mock Get-BackupRoot { $TestDrive }
+        $plan = Get-HostsBackupPlan -HostsPath (Get-SystemHostsPath)
+        $plan.IsSystem | Should -BeTrue
+        @($plan.Dirs).Count | Should -Be 1
+        $plan.Dirs[0].Dir | Should -Be (Join-Path $TestDrive 'backup')
+    }
+
+    It '沙箱只用仓库 targets' {
+        $plan = Get-HostsBackupPlan -HostsPath (Join-Path $TestDrive 'sandbox-hosts') -FallbackRoot $TestDrive
+        $plan.IsSystem | Should -BeFalse
+        @($plan.Dirs).Count | Should -Be 1
+        $plan.Dirs[0].Dir | Should -Match ([regex]::Escape((Join-Path $TestDrive 'backup\targets\')))
+    }
+
+    It '备份目录不可创建时直接报错，不写 fallback' {
         $bad = Join-Path $TestDrive 'bk-file'
         Set-Content -LiteralPath $bad -Value 'not a directory'
-        $good = Join-Path $TestDrive 'bk-good'
-        $dir = Get-HostsBackupDir -BaseCandidates @($bad, $good)
-        $dir | Should -Be $good
-        Test-Path -LiteralPath (Join-Path $good '.cfo-write-test-should-not-exist.tmp') | Should -BeFalse
+        $plan = [pscustomobject]@{
+            IsSystem        = $false
+            AppRoot         = ''
+            ProgramDataBase = ''
+            Dirs            = @([pscustomobject]@{ Base = $bad; Dir = $bad })
+        }
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw
     }
 }
 
@@ -821,38 +844,37 @@ Describe 'F05 两阶段提交' {
     }
 }
 
-Describe 'C05 ACL 泛型权限与父链' {
-    It '非 InheritOnly 的 GENERIC_ALL 对普通用户不可信' {
-        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;GA;;;WD)')
-        $rules = @($sd.DiscretionaryAcl)
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+Describe 'C05 文件来源检查' {
+    It 'GENERIC_ALL 对普通用户不可信' {
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights '268435456'))
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
     It 'InheritOnly 的 GENERIC_ALL 不作用于对象本身' {
-        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;OICIIO;GA;;;WD)')
-        $rules = @($sd.DiscretionaryAcl)
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights '268435456' -Propagation 'InheritOnly'))
+        Test-AclTrusted -Acl $acl | Should -BeTrue
     }
 
     It '具体写权限位仍被识别' {
-        # 0x120116 = 删除 + 写属性等
-        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;0x120116;;;WD)')
-        $rules = @($sd.DiscretionaryAcl)
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeFalse
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights '1179926'))
+        Test-AclTrusted -Acl $acl | Should -BeFalse
     }
 
     It '只读规则仍然可信' {
-        $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;0x120089;;;WD)')
-        $rules = @($sd.DiscretionaryAcl)
-        Test-AclEntries -OwnerSid 'S-1-5-32-544' -Rules $rules | Should -BeTrue
+        $acl = New-TestAcl -OwnerSid 'S-1-5-32-544' -Rules @(
+            (New-TestRule -Sid 'S-1-5-32-545' -Rights '1179785'))
+        Test-AclTrusted -Acl $acl | Should -BeTrue
     }
 
-    It '普通用户目录里的备份文件不可信（文件与父链一起查）' {
+    It '普通用户拥有的备份文件不可信' {
         $dir = Join-Path $TestDrive 'c05-dir'
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $f = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
         Set-Content -LiteralPath $f -Value 'x'
-        Test-BackupPathTrusted -Path $f -Root $TestDrive | Should -BeFalse
+        Test-BackupFileTrusted -Path $f | Should -BeFalse
     }
 }
 
@@ -944,23 +966,20 @@ Describe 'C06 不可信来源开关必须指定文件' {
     }
 }
 
-Describe 'D01 文件的直接父目录也在信任链里' {
-    It '文件自身可信、直接父目录不可信时拒绝' {
+Describe 'D01 应用根可信但备份目录不可信仍拒绝' {
+    It '备份目录本身不可信时拒绝' {
         $root = Join-Path $TestDrive 'd01-root'
-        $mid = Join-Path $root 'replaceable'
-        New-Item -ItemType Directory -Force -Path $mid | Out-Null
-        $file = Join-Path $mid 'hosts-20260101-000000-aaaaaaaa.bak'
-        Set-Content -LiteralPath $file -Value 'x'
-
-        $script:d01BadDir = $mid
+        $bk = Join-Path $root 'backup'
+        New-Item -ItemType Directory -Force -Path $bk | Out-Null
+        $script:d01Bk = $bk
         Mock Get-Acl { param($LiteralPath) [pscustomobject]@{ Path = $LiteralPath } }
         Mock Test-AclTrusted {
             param($Acl, [switch]$Ancestor)
-            return ($Acl.Path -ine $script:d01BadDir)
+            if ($Acl.Path -ieq $script:d01Bk) { return $false }
+            return $true
         }
-
-        Test-BackupPathTrusted -Path $file -Root $root | Should -BeFalse
-        Should -Invoke Get-Acl -ParameterFilter { $LiteralPath -eq $script:d01BadDir } -Times 1
+        Test-BackupPathTrusted -Path $bk -AppRoot $root | Should -BeFalse
+        Should -Invoke Get-Acl -ParameterFilter { $LiteralPath -eq $script:d01Bk } -Times 1
     }
 }
 
@@ -998,8 +1017,9 @@ Describe 'D02 不可信例外只限用户点名的那一份' {
         }
 
         $script:d02BadManifest = "$bad.json"
-        Mock Test-BackupPathTrusted {
-            param($Path, $Root)
+        Mock Test-SystemHostsPath { $true }
+        Mock Test-BackupFileTrusted {
+            param($Path)
             return ($Path -ine $script:d02BadManifest)
         }
         Mock Select-TrustedBackupDirs {
@@ -1007,9 +1027,44 @@ Describe 'D02 不可信例外只限用户点名的那一份' {
             return [pscustomobject]@{ Trusted = @($Dirs); Untrusted = @() }
         }
 
-        { Invoke-HostsRollback -HostsPath $h -BackupDir @($trustedDir, $badDir) -BackupPath $trusted `
-                -AllowUntrustedBackup -AssumeSystemHosts } | Should -Throw '*Force*'
+        { Invoke-HostsRollback -HostsPath $h -BackupDir @($trustedDir, $badDir) -BackupPath $trusted -AllowUntrustedBackup } |
+            Should -Throw '*Force*'
         (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'EXTERNAL_EDIT'
-        Should -Invoke Test-BackupPathTrusted -ParameterFilter { $Path -eq $script:d02BadManifest } -Times 1
+        Should -Invoke Test-BackupFileTrusted -ParameterFilter { $Path -eq $script:d02BadManifest } -Times 1
+    }
+
+    It '未选中的不可信 pending 清单不会被恢复或写回' {
+        $h = Join-Path $TestDrive 'd02-pending-hosts'
+        [IO.File]::WriteAllText($h, 'EXTERNAL_EDIT')
+        $trustedDir = Join-Path $TestDrive 'd02p-trusted'
+        $badDir = Join-Path $TestDrive 'd02p-bad'
+        New-Item -ItemType Directory -Force -Path $trustedDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $badDir | Out-Null
+        $hA = Get-D02Hash 'A'; $hB = Get-D02Hash 'B'; $hX = Get-D02Hash 'X'; $hE = Get-D02Hash 'EXTERNAL_EDIT'
+
+        $null = New-D02Backup -Dir $trustedDir -Name 'hosts-20260101-000001-aaaaaaaa.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:01.0000000+08:00'; hostsPath = $h
+            preHash = $hA; intendedHash = $hB; postHash = $hB; state = 'committed'
+        }
+        $bad = New-D02Backup -Dir $badDir -Name 'hosts-20260101-000002-bbbbbbbb.bak' -Content 'X' -Manifest @{
+            createdAt = '2026-01-01T00:00:02.0000000+08:00'; hostsPath = $h
+            preHash = $hX; intendedHash = $hE; postHash = $null; state = 'pending'
+        }
+
+        $script:d02BadPendingManifest = "$bad.json"
+        Mock Test-SystemHostsPath { $true }
+        Mock Test-BackupFileTrusted {
+            param($Path)
+            return ($Path -ine $script:d02BadPendingManifest)
+        }
+        Mock Select-TrustedBackupDirs {
+            param($Dirs, [bool]$IsSystem)
+            return [pscustomobject]@{ Trusted = @($Dirs); Untrusted = @() }
+        }
+
+        { Invoke-HostsRollback -HostsPath $h -BackupDir @($trustedDir, $badDir) } | Should -Throw '*Force*'
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'EXTERNAL_EDIT'
+        $m = Get-Content -LiteralPath $script:d02BadPendingManifest -Raw | ConvertFrom-Json
+        $m.state | Should -Be 'pending'
     }
 }
