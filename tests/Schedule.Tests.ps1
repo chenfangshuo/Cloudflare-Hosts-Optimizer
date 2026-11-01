@@ -239,3 +239,31 @@ Describe 'C08 任务归属只认实际 -File 目标' {
         Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript | Should -BeTrue
     }
 }
+
+Describe 'D03 入口模式按宿主参数识别' {
+    BeforeAll {
+        $script:TaskScript2 = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+        function New-TaskObj2 {
+            param([string]$Arguments)
+            return [pscustomobject]@{
+                TaskName = 'x'
+                Actions  = @([pscustomobject]@{ Execute = 'C:\Program Files\PowerShell\7\pwsh.exe'; Arguments = $Arguments })
+            }
+        }
+    }
+
+    It '-Command 内部的 -File 只是数据参数，不算入口' {
+        $t = New-TaskObj2 -Arguments '-NoProfile -Command "& C:\OtherTool\OtherTool.ps1 -File C:\Moved\Cloudflare-Hosts-Optimizer.ps1 -Label data"'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeFalse
+    }
+
+    It '-Command 里出现脚本名但没有 -File 也不算' {
+        $t = New-TaskObj2 -Arguments '-NoProfile -Command "Write-Output C:\Moved\Cloudflare-Hosts-Optimizer.ps1"'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeFalse
+    }
+
+    It '宿主 -File 在 -Command 之前时仍按 -File 识别' {
+        $t = New-TaskObj2 -Arguments '-NoProfile -File "C:\Moved\Cloudflare-Hosts-Optimizer.ps1" -DryRun'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeTrue
+    }
+}

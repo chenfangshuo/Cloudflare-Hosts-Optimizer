@@ -207,6 +207,44 @@ function Install-OptimizerTask {
     return $Spec
 }
 
+# 把一条 Windows 命令行拆成参数（去掉引号；不处理反斜杠转义——本工具生成的参数不需要）。
+function Split-NativeArgumentList {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text)
+    $out = [System.Collections.Generic.List[string]]::new()
+    $sb = [Text.StringBuilder]::new()
+    $inQuotes = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($ch -eq [char]'"') { $inQuotes = -not $inQuotes; continue }
+        if (-not $inQuotes -and [char]::IsWhiteSpace($ch)) {
+            if ($sb.Length -gt 0) { $out.Add($sb.ToString()); [void]$sb.Clear() }
+            continue
+        }
+        [void]$sb.Append($ch)
+    }
+    if ($sb.Length -gt 0) { $out.Add($sb.ToString()) }
+    return @($out)
+}
+
+# 判断 pwsh 这次到底用什么入口：第一个出现的 -File / -Command / -EncodedCommand 决定。
+# -Command 字符串里出现的 "-File xxx" 只是传给那个脚本的数据，不是宿主的入口。
+function Get-PwshEntryTarget {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Arguments)
+    $tokens = @(Split-NativeArgumentList -Text $Arguments)
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $t = $tokens[$i]
+        if ($t -ieq '-File' -or $t -ieq '-f') {
+            $target = if ($i + 1 -lt $tokens.Count) { $tokens[$i + 1] } else { '' }
+            return [pscustomobject]@{ Mode = 'File'; Target = $target }
+        }
+        if ($t -ieq '-Command' -or $t -ieq '-c' -or $t -ieq '-EncodedCommand' -or $t -ieq '-e' -or $t -ieq '-ec') {
+            return [pscustomobject]@{ Mode = 'Command'; Target = '' }
+        }
+    }
+    return [pscustomobject]@{ Mode = 'None'; Target = '' }
+}
+
 # 判断一个已存在的任务是不是本工具注册的：动作必须是 pwsh + 本脚本。
 # 只按名字删太危险——同名任务可能属于别的工具，而 Get/Unregister-ScheduledTask
 # 的 -TaskName 支持通配符，'*' 会波及根目录下的所有任务。
@@ -225,12 +263,11 @@ function Test-OptimizerTaskOwnership {
         $argText = [string]$a.Arguments
         if (-not $exe -or $exe -notmatch '(?i)(^|\\)pwsh(-preview)?\.exe$') { return $false }
         if (-not $argText) { return $false }
-        # 必须解析实际执行的 -File 目标，不能因为参数里任何位置出现脚本名就当成自己的任务
-        # （别的工具可以把本工具名当标签或要处理的文件）。只比文件名，仓库搬目录后仍可删。
-        $fileMatch = [regex]::Match($argText, '(?i)(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))')
-        if (-not $fileMatch.Success) { return $false }
-        $target = if ($fileMatch.Groups[1].Success) { $fileMatch.Groups[1].Value } else { $fileMatch.Groups[2].Value }
-        if ([IO.Path]::GetFileName($target) -ne $expectedName) { return $false }
+        # 只认宿主实际选择的 -File 入口；-Command/-EncodedCommand 一律不算（内容里的 -File 不是入口）
+        $entry = Get-PwshEntryTarget -Arguments $argText
+        if ($entry.Mode -ne 'File' -or -not $entry.Target) { return $false }
+        # 只比文件名：仓库整体搬目录后，旧任务仍然应该删得掉
+        if ([IO.Path]::GetFileName($entry.Target) -ne $expectedName) { return $false }
     }
     return $true
 }

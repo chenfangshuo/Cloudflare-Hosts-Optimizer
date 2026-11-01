@@ -663,16 +663,14 @@ Describe 'F03 备份来源可信度' {
         Test-BackupPathTrusted -Path (Join-Path $TestDrive 'nope') -Root $TestDrive | Should -BeFalse
     }
 
-    It '系统 hosts 自动挑选只保留可信目录，-AllowUntrustedBackup 才放行' {
+    It '系统 hosts 自动挑选只保留可信目录，沙箱不做限制' {
         $d = Join-Path $TestDrive 'untrusted-bk'
         New-Item -ItemType Directory -Force -Path $d | Out-Null
         $r = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $true
         @($r.Trusted).Count | Should -Be 0
         @($r.Untrusted) | Should -Contain $d
 
-        $r2 = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $true -AllowUntrusted
-        @($r2.Trusted) | Should -Contain $d
-
+        # -AllowUntrustedBackup 只放宽“用户点名的那一份文件”，不再放宽整组扫描目录
         $r3 = Select-TrustedBackupDirs -Dirs @($d) -IsSystem $false
         @($r3.Trusted) | Should -Contain $d
     }
@@ -921,5 +919,75 @@ Describe 'C06 不可信来源开关必须指定文件' {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         { Invoke-HostsRollback -HostsPath $h -BackupDir $dir -AllowUntrustedBackup } |
             Should -Throw '*RollbackFrom*'
+    }
+}
+
+Describe 'D01 文件的直接父目录也在信任链里' {
+    It '文件自身可信、直接父目录不可信时拒绝' {
+        $root = Join-Path $TestDrive 'd01-root'
+        $mid = Join-Path $root 'replaceable'
+        New-Item -ItemType Directory -Force -Path $mid | Out-Null
+        $file = Join-Path $mid 'hosts-20260101-000000-aaaaaaaa.bak'
+        Set-Content -LiteralPath $file -Value 'x'
+
+        $script:d01BadDir = $mid
+        Mock Get-Acl { param($LiteralPath) [pscustomobject]@{ Path = $LiteralPath } }
+        Mock Test-AclTrusted {
+            param($Acl, [switch]$Ancestor)
+            return ($Acl.Path -ine $script:d01BadDir)
+        }
+
+        Test-BackupPathTrusted -Path $file -Root $root | Should -BeFalse
+        Should -Invoke Get-Acl -ParameterFilter { $LiteralPath -eq $script:d01BadDir } -Times 1
+    }
+}
+
+Describe 'D02 不可信例外只限用户点名的那一份' {
+    BeforeAll {
+        function Get-D02Hash {
+            param([string]$Text)
+            return Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($Text))
+        }
+        function New-D02Backup {
+            param([string]$Dir, [string]$Name, [string]$Content, [hashtable]$Manifest)
+            $bak = Join-Path $Dir $Name
+            [IO.File]::WriteAllText($bak, $Content)
+            ($Manifest | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+            return $bak
+        }
+    }
+
+    It '打开开关后，未点名的不可信清单不能提供覆盖保护' {
+        $h = Join-Path $TestDrive 'd02-hosts'
+        [IO.File]::WriteAllText($h, 'EXTERNAL_EDIT')
+        $trustedDir = Join-Path $TestDrive 'd02-trusted'
+        $badDir = Join-Path $TestDrive 'd02-bad'
+        New-Item -ItemType Directory -Force -Path $trustedDir | Out-Null
+        New-Item -ItemType Directory -Force -Path $badDir | Out-Null
+        $hA = Get-D02Hash 'A'; $hB = Get-D02Hash 'B'; $hX = Get-D02Hash 'X'; $hE = Get-D02Hash 'EXTERNAL_EDIT'
+
+        $trusted = New-D02Backup -Dir $trustedDir -Name 'hosts-20260101-000001-aaaaaaaa.bak' -Content 'A' -Manifest @{
+            createdAt = '2026-01-01T00:00:01.0000000+08:00'; hostsPath = $h
+            preHash = $hA; intendedHash = $hB; postHash = $hB; state = 'committed'
+        }
+        $bad = New-D02Backup -Dir $badDir -Name 'hosts-20260101-000002-bbbbbbbb.bak' -Content 'X' -Manifest @{
+            createdAt = '2026-01-01T00:00:02.0000000+08:00'; hostsPath = $h
+            preHash = $hX; intendedHash = $hE; postHash = $hE; state = 'committed'
+        }
+
+        $script:d02BadManifest = "$bad.json"
+        Mock Test-BackupPathTrusted {
+            param($Path, $Root)
+            return ($Path -ine $script:d02BadManifest)
+        }
+        Mock Select-TrustedBackupDirs {
+            param($Dirs, [bool]$IsSystem)
+            return [pscustomobject]@{ Trusted = @($Dirs); Untrusted = @() }
+        }
+
+        { Invoke-HostsRollback -HostsPath $h -BackupDir @($trustedDir, $badDir) -BackupPath $trusted `
+                -AllowUntrustedBackup -AssumeSystemHosts } | Should -Throw '*Force*'
+        (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'EXTERNAL_EDIT'
+        Should -Invoke Test-BackupPathTrusted -ParameterFilter { $Path -eq $script:d02BadManifest } -Times 1
     }
 }

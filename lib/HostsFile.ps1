@@ -474,33 +474,32 @@ function Test-BackupPathTrusted {
     }
 
     $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    # 文件从它的**直接父目录**开始查；目录从自身开始。每一级都要查，不能先向上跳一级。
     $current = if ($item.PSIsContainer) { $full } else { Split-Path -Parent $full }
     $stop = if ($Root) { [IO.Path]::GetFullPath($Root).TrimEnd('\') } else { $null }
 
     while ($current) {
-        if ($stop -and $current -ieq $stop) { break }
-        $parent = Split-Path -Parent $current
-        if (-not $parent -or $parent -eq $current) { break }
         try {
-            $parentItem = Get-Item -LiteralPath $parent -Force -ErrorAction Stop
-            if ($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
-            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $parent -ErrorAction Stop) -Ancestor)) { return $false }
+            $currentItem = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if ($currentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $current -ErrorAction Stop) -Ancestor)) { return $false }
         } catch {
             return $false
         }
+        if ($stop -and $current -ieq $stop) { break }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or $parent -eq $current) { break }
         $current = $parent
     }
 
     # 信任根本身也不能被它的父目录删除/替换（ProgramData 允许建目录，但不允许删除别人的目录）
-    if ($stop) {
-        if ($stop -ieq $current) {
-            $rootParent = Split-Path -Parent $stop
-            if ($rootParent -and $rootParent -ne $stop) {
-                try {
-                    if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $rootParent -ErrorAction Stop) -Ancestor)) { return $false }
-                } catch {
-                    return $false
-                }
+    if ($stop -and $stop -ieq $current) {
+        $rootParent = Split-Path -Parent $stop
+        if ($rootParent -and $rootParent -ne $stop) {
+            try {
+                if (-not (Test-AclTrusted -Acl (Get-Acl -LiteralPath $rootParent -ErrorAction Stop) -Ancestor)) { return $false }
+            } catch {
+                return $false
             }
         }
     }
@@ -514,14 +513,13 @@ function Select-TrustedBackupDirs {
     [CmdletBinding()]
     param(
         [string[]]$Dirs,
-        [bool]$IsSystem = $true,
-        [switch]$AllowUntrusted
+        [bool]$IsSystem = $true
     )
     $trusted = @()
     $untrusted = @()
     foreach ($d in @($Dirs)) {
         if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
-        if (-not $IsSystem -or $AllowUntrusted -or (Test-BackupPathTrusted -Path $d -Root (Get-BackupTrustRoot -Path $d))) {
+        if (-not $IsSystem -or (Test-BackupPathTrusted -Path $d -Root (Get-BackupTrustRoot -Path $d))) {
             $trusted += $d
         } else {
             $untrusted += $d
@@ -909,7 +907,9 @@ function Invoke-HostsRollbackLocked {
         [string]$BackupPath,
         [switch]$Force,
         # 显式允许使用不可信目录/文件里的备份：只用于人工恢复，必须配合 -RollbackFrom
-        [switch]$AllowUntrustedBackup
+        [switch]$AllowUntrustedBackup,
+        # 仅供测试：把沙箱 -HostsPath 当成系统 hosts，用于验证来源信任策略
+        [switch]$AssumeSystemHosts
     )
 
     # 这个开关只授权“用户点名的那一份”，不能变成“在所有不可信目录里自动挑最新”
@@ -920,13 +920,16 @@ function Invoke-HostsRollbackLocked {
     $systemHosts = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $isSystem = $true
     try { $isSystem = ([IO.Path]::GetFullPath($HostsPath) -ieq [IO.Path]::GetFullPath($systemHosts)) } catch { $isSystem = $true }
+    if ($AssumeSystemHosts) { $isSystem = $true }
 
     $rawDirs = @($BackupDir)
     if ($isSystem -and $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir)) { $rawDirs += $LegacyBackupDir }
 
     # 系统 hosts 只从“管理员/SYSTEM 独占写权限”的目录里自动挑选备份。
     # 非系统 hosts（沙箱）没有提权面，不做这个限制。
-    $dirFilter = Select-TrustedBackupDirs -Dirs $rawDirs -IsSystem $isSystem -AllowUntrusted:$AllowUntrustedBackup
+    # 自动扫描永远只扫可信目录；-AllowUntrustedBackup 只放宽“用户点名的那一份文件”，
+    # 不能让其他不可信清单进入候选、更不能用它们的 postHash 充当覆盖保护
+    $dirFilter = Select-TrustedBackupDirs -Dirs $rawDirs -IsSystem $isSystem
     $dirs = @($dirFilter.Trusted)
     $untrustedDirs = @($dirFilter.Untrusted)
 
@@ -941,7 +944,7 @@ function Invoke-HostsRollbackLocked {
     foreach ($bak in $all) {
         $manifestPath = "$($bak.FullName).json"
         # 来源检查必须在候选进入排序/覆盖保护之前：guard 也可能来自一份没被选中的 manifest
-        if ($isSystem -and -not $AllowUntrustedBackup) {
+        if ($isSystem) {
             $trustRoot = Get-BackupTrustRoot -Path $bak.FullName
             if (-not (Test-BackupPathTrusted -Path $bak.FullName -Root $trustRoot)) { continue }
             if ((Test-Path -LiteralPath $manifestPath) -and
@@ -1138,7 +1141,8 @@ function Invoke-HostsRollback {
         [string]$LegacyBackupDir,
         [string]$BackupPath,
         [switch]$Force,
-        [switch]$AllowUntrustedBackup
+        [switch]$AllowUntrustedBackup,
+        [switch]$AssumeSystemHosts
     )
     $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
     $acquired = $false
