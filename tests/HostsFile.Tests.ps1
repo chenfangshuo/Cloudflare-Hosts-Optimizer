@@ -1292,4 +1292,47 @@ Describe 'FS-01 相对 hosts 路径按 PowerShell 位置解析' {
             Pop-Location
         }
     }
+
+    It '盘符相对路径也按 PowerShell 位置解析，且碰撞检查在写盘前生效' {
+        $a = Join-Path $TestDrive 'fs01-drive-a'
+        $b = Join-Path $TestDrive 'fs01-drive-b'
+        New-Item -ItemType Directory -Force -Path (Join-Path $a 'sub'), (Join-Path $b 'sub') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $a 'sub\hosts.fixture'), 'OTHER_FILE')
+        [IO.File]::WriteAllText((Join-Path $b 'sub\hosts.fixture'), 'CURRENT')
+
+        $driveRel = (Split-Path -Qualifier $TestDrive) + 'sub\hosts.fixture'
+        $absB = Join-Path $b 'sub\hosts.fixture'
+        $oldCwd = [Environment]::CurrentDirectory
+        Push-Location $b
+        try {
+            [Environment]::CurrentDirectory = $a
+
+            $doc = Read-HostsDocument -Path $driveRel
+            Test-SamePath -Left $doc.Path -Right $absB | Should -BeTrue
+            Assert-OutputPathSafe -Path $driveRel -InputPaths @($absB) | Should -Not -BeNullOrEmpty
+
+            $bkDir = Join-Path $TestDrive 'fs01-drive-bk'
+            New-Item -ItemType Directory -Force -Path $bkDir | Out-Null
+            $bak = Join-Path $bkDir 'hosts-20260101-000000-aaaaaaaa.bak'
+            [IO.File]::WriteAllText($bak, 'PREVIOUS')
+            $hPrev = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('PREVIOUS'))
+            $hCur = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('CURRENT'))
+            @{
+                createdAt    = '2026-01-01T00:00:00.0000000+08:00'
+                hostsPath    = $absB
+                preHash      = $hPrev
+                intendedHash = $hCur
+                postHash     = $hCur
+                state        = 'committed'
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+
+            $r = Invoke-HostsRollback -HostsPath $driveRel -BackupDir $bkDir -BackupPath $bak
+            $r.Unchanged | Should -BeFalse
+            (Get-Content -LiteralPath $absB -Raw).Trim() | Should -Be 'PREVIOUS'
+            (Get-Content -LiteralPath (Join-Path $a 'sub\hosts.fixture') -Raw).Trim() | Should -Be 'OTHER_FILE'
+        } finally {
+            [Environment]::CurrentDirectory = $oldCwd
+            Pop-Location
+        }
+    }
 }

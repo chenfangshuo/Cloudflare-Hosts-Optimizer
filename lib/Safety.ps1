@@ -20,11 +20,31 @@
 function Resolve-InputPath {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
-    if ([IO.Path]::IsPathRooted($Path)) { return $Path }
+    if (-not $Path) { return $Path }
+
+    # 用 PowerShell provider 解析，和 Get-Content/Out-File 使用同一个基准目录；
+    # 也能正确处理 C:sub（盘符相对）这类 IsPathRooted 为 True 但并非完全限定的路径。
+    try {
+        $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+        if ($resolved) { return [IO.Path]::GetFullPath($resolved) }
+    } catch { }
+
+    if ([IO.Path]::IsPathFullyQualified($Path)) { return [IO.Path]::GetFullPath($Path) }
+
+    # 盘符相对路径：用该盘符在 PowerShell 里的当前位置补齐
+    if ($Path -match '^([A-Za-z]):(.*)$') {
+        try {
+            $driveBase = (Get-Location -PSDrive $matches[1]).ProviderPath
+            if ($driveBase) {
+                return [IO.Path]::GetFullPath((Join-Path $driveBase $matches[2].TrimStart('\')))
+            }
+        } catch { }
+    }
+
     $base = ''
     try { $base = (Get-Location).ProviderPath } catch { $base = [Environment]::CurrentDirectory }
-    if ($base) { return (Join-Path $base $Path) }
-    return $Path
+    if ($base) { return [IO.Path]::GetFullPath((Join-Path $base $Path)) }
+    return [IO.Path]::GetFullPath($Path)
 }
 
 function Get-NormalizedPath {
