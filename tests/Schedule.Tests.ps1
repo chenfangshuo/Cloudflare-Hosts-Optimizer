@@ -262,8 +262,50 @@ Describe 'D03 入口模式按宿主参数识别' {
         Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeFalse
     }
 
-    It '宿主 -File 在 -Command 之前时仍按 -File 识别' {
+    It '正常的宿主 -File 入口仍可识别' {
         $t = New-TaskObj2 -Arguments '-NoProfile -File "C:\Moved\Cloudflare-Hosts-Optimizer.ps1" -DryRun'
         Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeTrue
+    }
+
+    It '-File 之后的 -Command 只是脚本自己的参数' {
+        $t = New-TaskObj2 -Arguments '-NoProfile -File "C:\Moved\Cloudflare-Hosts-Optimizer.ps1" -Command something'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript2 | Should -BeTrue
+    }
+}
+
+Describe 'E01 隐式脚本入口与其他执行模式' {
+    BeforeAll {
+        $script:TaskScript3 = Join-Path $script:RepoRoot 'Cloudflare-Hosts-Optimizer.ps1'
+        function New-TaskObj3 {
+            param([string]$Arguments)
+            return [pscustomobject]@{
+                TaskName = 'Cloudflare-Hosts-Optimizer DryRun'
+                Actions  = @([pscustomobject]@{ Execute = 'C:\Program Files\PowerShell\7\pwsh.exe'; Arguments = $Arguments })
+            }
+        }
+    }
+
+    It '隐式脚本入口后面的 -File 只是那个脚本的参数' {
+        $t = New-TaskObj3 -Arguments '-NoProfile "C:\OtherTool\OtherTool.ps1" -File C:\Moved\Cloudflare-Hosts-Optimizer.ps1 -Label data'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript3 | Should -BeFalse
+    }
+
+    It 'CommandWithArgs 后面的 -File 也是数据参数' {
+        $t = New-TaskObj3 -Arguments '-NoProfile -CommandWithArgs "Write-Output OTHER" -File C:\Moved\Cloudflare-Hosts-Optimizer.ps1 -Label data'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript3 | Should -BeFalse
+    }
+
+    It '不认识的宿主开关保守拒绝' {
+        $t = New-TaskObj3 -Arguments '-NoProfile -SomeFutureSwitch x -File C:\Moved\Cloudflare-Hosts-Optimizer.ps1'
+        Test-OptimizerTaskOwnership -Task $t -ScriptPath $script:TaskScript3 | Should -BeFalse
+    }
+
+    It '误认的任务在卸载流程里也不会被删除' {
+        $script:e01Task = New-TaskObj3 -Arguments '-NoProfile "C:\OtherTool\OtherTool.ps1" -File C:\Moved\Cloudflare-Hosts-Optimizer.ps1 -Label data'
+        Mock Get-ScheduledTask { $script:e01Task }
+        Mock Remove-OptimizerTask { }
+        $rows = @(Uninstall-OptimizerTask -TaskName 'Cloudflare-Hosts-Optimizer DryRun' -WhatIf)
+        $rows[0].Removed | Should -BeFalse
+        Should -Invoke Remove-OptimizerTask -Times 0
     }
 }

@@ -226,21 +226,47 @@ function Split-NativeArgumentList {
     return @($out)
 }
 
-# 判断 pwsh 这次到底用什么入口：第一个出现的 -File / -Command / -EncodedCommand 决定。
-# -Command 字符串里出现的 "-File xxx" 只是传给那个脚本的数据，不是宿主的入口。
+# 判断 pwsh 这次到底用什么入口。只接受“本工具实际会生成的那套宿主参数”：
+#   -NoProfile -ExecutionPolicy Bypass -File <脚本> [脚本自己的参数...]
+# 在到达 -File 之前，遇到其他执行模式、隐式脚本路径或任何不认识 token，一律保守判定
+# “不是本工具的任务”——绝不能跳过去、把后面别的工具的 -File 当成宿主入口。
 function Get-PwshEntryTarget {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Arguments)
     $tokens = @(Split-NativeArgumentList -Text $Arguments)
+
+    # 这些入口模式后面跟的是“代码/命令字符串”，不是脚本路径
+    $stopSwitches = @('-command', '-c', '-encodedcommand', '-e', '-ec', '-commandwithargs', '-cwa')
+    # 宿主开关：带一个值的
+    $valueSwitches = @(
+        '-executionpolicy', '-windowstyle', '-workingdirectory', '-configurationname',
+        '-psconsolefile', '-version', '-inputformat', '-outputformat', '-settingsfile',
+        '-custompipename'
+    )
+    # 宿主开关：不取值
+    $flagSwitches = @(
+        '-noprofile', '-nologo', '-noninteractive', '-noexit', '-sta', '-mta', '-login',
+        '-noprofileloadtime', '-interactive'
+    )
+
     for ($i = 0; $i -lt $tokens.Count; $i++) {
-        $t = $tokens[$i]
-        if ($t -ieq '-File' -or $t -ieq '-f') {
+        $lower = $tokens[$i].ToLowerInvariant()
+        if ($lower -in $stopSwitches) {
+            return [pscustomobject]@{ Mode = 'Command'; Target = '' }
+        }
+        if ($lower -eq '-file' -or $lower -eq '-f') {
             $target = if ($i + 1 -lt $tokens.Count) { $tokens[$i + 1] } else { '' }
             return [pscustomobject]@{ Mode = 'File'; Target = $target }
         }
-        if ($t -ieq '-Command' -or $t -ieq '-c' -or $t -ieq '-EncodedCommand' -or $t -ieq '-e' -or $t -ieq '-ec') {
-            return [pscustomobject]@{ Mode = 'Command'; Target = '' }
+        if ($lower -in $valueSwitches) {
+            if ($i + 1 -ge $tokens.Count) { return [pscustomobject]@{ Mode = 'None'; Target = '' } }
+            $i++
+            continue
         }
+        if ($lower -in $flagSwitches) { continue }
+
+        # 隐式脚本入口（不带 -File 直接给 .ps1）或无法解释的参数：保守拒绝
+        return [pscustomobject]@{ Mode = 'Unknown'; Target = '' }
     }
     return [pscustomobject]@{ Mode = 'None'; Target = '' }
 }
