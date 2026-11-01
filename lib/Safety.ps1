@@ -185,9 +185,9 @@ function Get-ProtectedInputPaths {
         [string]$RollbackFrom
     )
     $list = @((Get-SystemHostsPath))
-    if ($HostsPath) { $list += $HostsPath }
-    if ($DomainsFile) { $list += $DomainsFile }
-    if ($RollbackFrom) { $list += $RollbackFrom }
+    if ($HostsPath) { $list += Resolve-InputPath -Path $HostsPath }
+    if ($DomainsFile) { $list += Resolve-InputPath -Path $DomainsFile }
+    if ($RollbackFrom) { $list += Resolve-InputPath -Path $RollbackFrom }
     return @($list)
 }
 

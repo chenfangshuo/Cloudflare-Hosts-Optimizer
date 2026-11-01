@@ -224,9 +224,11 @@ function Get-TaskScriptPath {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Arguments = '')
     if (-not $Arguments) { return '' }
-    $m = [regex]::Match($Arguments, '-File\s+"([^"]+)"')
-    if (-not $m.Success) { $m = [regex]::Match($Arguments, '-File\s+(\S+)') }
-    if ($m.Success) { return $m.Groups[1].Value }
+    # 与卸载归属使用同一套入口解析，避免 Doctor 把 -Command 里的 -File、
+    # 隐式脚本入口或闭引号后拼接的后缀当成真实目标。
+    if (-not (Get-Command Get-PwshEntryTarget -ErrorAction SilentlyContinue)) { return '' }
+    $entry = Get-PwshEntryTarget -Arguments $Arguments
+    if ($entry.Mode -eq 'File' -and $entry.Target) { return $entry.Target }
     return ''
 }
 

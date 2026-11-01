@@ -199,8 +199,10 @@ BitTorrent 的 IPv6 对等连接不受影响；tracker 专用子域名建议不�
 ### 备份与清单
 
 - **系统 hosts**：备份只放在 `%ProgramData%\Cloudflare-Hosts-Optimizer\backup`。
-  应用根和备份目录必须是管理员/SYSTEM 独占写；创建时设成"管理员/系统可写、
-  普通用户只读"。目录不可用或不可信时**直接中止写入**，不回退到项目目录。
+  应用根要求 owner 受信、普通用户不能删除/替换其子项（ProgramData 允许普通用户在
+  应用根下创建自己的子目录，这是正常权限，不据此判死）；**备份目录本身**要求
+  管理员/SYSTEM 独占写、普通用户只读。目录不可用或不可信时**直接中止写入**，
+  不回退到项目目录。
 - **沙箱 `-HostsPath`**：只用项目目录下的 `backup\targets\<路径哈希>`，不碰 ProgramData；
   回滚时校验 manifest 的 `hostsPath`，避免沙箱备份被系统 hosts 的回滚选中。
 - **来源检查**：系统 hosts 自动挑选时检查

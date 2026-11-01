@@ -354,7 +354,7 @@ function Invoke-Doctor {
         })
 
     # ---- hosts ----
-    $doctorHostsPath = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
+    $doctorHostsPath = if ($HostsPath) { Resolve-InputPath -Path $HostsPath } else { Get-SystemHostsPath }
     $hostsInfo = Get-HostsDoctorInfo -HostsPath $doctorHostsPath
     if ($hostsInfo.Error) {
         & $add 'hosts' '文件与结构' 'FAIL' $hostsInfo.Error
@@ -495,7 +495,7 @@ function Invoke-Doctor {
         }
     }
 
-    $cacheFile = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    $cacheFile = if ($ColoCachePath) { Resolve-InputPath -Path $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
     if (-not (Test-Path -LiteralPath $cacheFile)) {
         & $add '存储' '机房缓存' 'SKIP' "尚未生成：$cacheFile（首次运行会全量探测）"
     } else {
@@ -526,6 +526,9 @@ function Invoke-Doctor {
             if ($t.ScriptExists -eq $false) {
                 $status = 'WARN'
                 $detail += "；任务指向的脚本不存在：$($t.ScriptPath)（移动过目录后需要重新注册）"
+            } elseif ($null -eq $t.ScriptExists) {
+                $status = 'WARN'
+                $detail += '；无法识别任务的 -File 入口，请手动检查'
             }
             # 267011 = SCHED_S_TASK_HAS_NOT_RUN，刚注册还没跑过的任务不该报警
             if ($t.LastResult -ne $null -and $t.LastResult -ne 0 -and $t.LastResult -ne 267011 -and $t.LastRun) {
@@ -671,12 +674,12 @@ function Invoke-Main {
     if ($UninstallTask) { return (Invoke-TaskUninstall) }
 
     $script:RunWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $hostsPathResolved = if ($HostsPath) { $HostsPath } else { Join-Path $env:SystemRoot 'System32\drivers\etc\hosts' }
-    $domainsFileResolved = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
+    $hostsPathResolved = if ($HostsPath) { Resolve-InputPath -Path $HostsPath } else { Get-SystemHostsPath }
+    $domainsFileResolved = if ($DomainsFile) { Resolve-InputPath -Path $DomainsFile } else { Join-Path $Root 'domains.txt' }
 
     $planMode = [bool]$Plan -or [bool]$PlanPath
     $readOnly = [bool]$DryRun -or $planMode
-    $planFile = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
+    $planFile = if ($PlanPath) { Resolve-InputPath -Path $PlanPath } else { Join-Path $Root 'plan.json' }
     if ($Rollback -and $readOnly) { Fail '-Rollback 不能与 -DryRun/-Plan 同时使用。' 2 }
     if ($RollbackFrom -and -not $Rollback) { Fail '-RollbackFrom 只能与 -Rollback 一起使用。' 2 }
     if ($AllowUntrustedBackup -and -not $Rollback) { Fail '-AllowUntrustedBackup 只能与 -Rollback 一起使用。' 2 }
@@ -687,7 +690,7 @@ function Invoke-Main {
     # 报告/计划/缓存/摘要都是“旁路输出”，不经过 hosts 事务；一旦和 hosts 撞车就会绕开保护。
     # 系统 hosts 永远在保护集合里，即使本次用的是沙箱 -HostsPath。
     $script:SafeInputPaths = @(Get-ProtectedInputPaths -HostsPath $hostsPathResolved -DomainsFile $domainsFileResolved -RollbackFrom $RollbackFrom)
-    $coloCacheResolved = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    $coloCacheResolved = if ($ColoCachePath) { Resolve-InputPath -Path $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
     $mainOutputs = @($script:ReportPathResolved, $planFile, $coloCacheResolved, (Join-Path $Root 'last-run.json'))
     $mainConflicts = @(Get-OutputPathConflicts -Outputs $mainOutputs -InputPaths $script:SafeInputPaths)
     if ($mainConflicts.Count -gt 0) { Fail $mainConflicts[0] 2 }
@@ -858,7 +861,7 @@ function Invoke-Main {
 
     # 上次探测到的区域；覆盖这些区域后可以提前结束，省掉几分钟的重复探测
     $useCache = -not $NoColoCache -and $ColoCacheMaxAgeDays -gt 0
-    $cacheFile = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+    $cacheFile = if ($ColoCachePath) { Resolve-InputPath -Path $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
     $cachedColos = @()
     if ($useCache) {
         $cached = Read-ColoCache -Path $cacheFile -MaxAgeDays $ColoCacheMaxAgeDays
@@ -1366,7 +1369,7 @@ function Invoke-Main {
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
-$script:ReportPathResolved = $ReportPath
+$script:ReportPathResolved = if ($ReportPath) { Resolve-InputPath -Path $ReportPath } else { '' }
 if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not $PlanPath -and -not $Version -and -not $Rollback -and -not $Doctor -and -not $InstallTask -and -not $UninstallTask) {
     $script:ReportPathResolved = Join-Path $Root 'last-report.txt'
 }
@@ -1374,9 +1377,9 @@ if (-not $script:ReportPathResolved -and -not $DryRun -and -not $Plan -and -not 
 # ---- 入口先做一次路径碰撞检查 ----
 # 参数错误时尾部也会写报告（在 catch 之后），所以必须在这里拦下，不能只靠 Invoke-Main。
 $script:SafeInputPaths = @()
-$entryDomains = if ($DomainsFile) { $DomainsFile } else { Join-Path $Root 'domains.txt' }
-$entryPlan = if ($PlanPath) { $PlanPath } else { Join-Path $Root 'plan.json' }
-$entryColo = if ($ColoCachePath) { $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
+$entryDomains = if ($DomainsFile) { Resolve-InputPath -Path $DomainsFile } else { Join-Path $Root 'domains.txt' }
+$entryPlan = if ($PlanPath) { Resolve-InputPath -Path $PlanPath } else { Join-Path $Root 'plan.json' }
+$entryColo = if ($ColoCachePath) { Resolve-InputPath -Path $ColoCachePath } else { Get-ColoCacheDefaultPath -Root $Root }
 $entryInputs = @(Get-ProtectedInputPaths -HostsPath $HostsPath -DomainsFile $entryDomains -RollbackFrom $RollbackFrom)
 $entryOutputs = @($script:ReportPathResolved, $entryPlan, $entryColo, (Join-Path $Root 'last-run.json'))
 $entryErrors = @(Get-OutputPathConflicts -Outputs $entryOutputs -InputPaths $entryInputs)

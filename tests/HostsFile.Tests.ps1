@@ -1122,12 +1122,26 @@ Describe 'R1-01 已有备份目录先检查再加固' {
         Should -Invoke Set-BackupDirectoryAcl -Times 0
     }
 
-    It 'R2-01 新建冲突时中止，不进入加固' {
+    It 'R2-01 应用根创建冲突时中止，不进入加固' {
         $app = Join-Path $TestDrive 'r201-race-app'
+        New-Item -ItemType Directory -Path $app | Out-Null
         $backup = Join-Path $app 'backup'
         $plan = New-R101Plan -App $app -Backup $backup
+        # 只模拟“检查时不存在”的窗口；New-Item 保持真实，验证它不会 -Force 复用已存在的目录
         Mock Test-Path { $false }
-        Mock New-Item { throw '另一个进程抢先创建了路径' }
+        Mock Set-BackupDirectoryAcl { }
+
+        { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw
+        Should -Invoke Set-BackupDirectoryAcl -Times 0
+    }
+
+    It 'R2-01 backup 创建冲突时中止，不进入加固' {
+        $app = Join-Path $TestDrive 'r201-race-backup-app'
+        $backup = Join-Path $app 'backup'
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $plan = New-R101Plan -App $app -Backup $backup
+        Mock Test-Path { param($LiteralPath) return ($LiteralPath -ne $backup) }
+        Mock Test-BackupPathTrusted { $true }
         Mock Set-BackupDirectoryAcl { }
 
         { Initialize-HostsBackupDirectory -Plan $plan } | Should -Throw
@@ -1235,5 +1249,47 @@ Describe 'R1-02 显式恢复的来源目录' {
 
         { Invoke-HostsRollback -HostsPath $h -BackupDir @() -BackupPath $bak } | Should -Throw '*ProgramData*'
         (Get-Content -LiteralPath $h -Raw).Trim() | Should -Be 'CURRENT'
+    }
+}
+
+Describe 'FS-01 相对 hosts 路径按 PowerShell 位置解析' {
+    It '读取和回滚只作用于 Set-Location 指向的文件' {
+        $a = Join-Path $TestDrive 'fs01-a'
+        $b = Join-Path $TestDrive 'fs01-b'
+        New-Item -ItemType Directory -Force -Path $a, $b | Out-Null
+        [IO.File]::WriteAllText((Join-Path $a 'hosts.fixture'), 'OTHER_FILE')
+        [IO.File]::WriteAllText((Join-Path $b 'hosts.fixture'), 'CURRENT')
+
+        $oldCwd = [Environment]::CurrentDirectory
+        Push-Location $b
+        try {
+            # 进程 CWD 指向 A，PowerShell 位置指向 B：两者必须不再混用
+            [Environment]::CurrentDirectory = $a
+            $doc = Read-HostsDocument -Path '.\hosts.fixture'
+            Test-SamePath -Left $doc.Path -Right (Join-Path $b 'hosts.fixture') | Should -BeTrue
+
+            $bkDir = Join-Path $TestDrive 'fs01-bk'
+            New-Item -ItemType Directory -Force -Path $bkDir | Out-Null
+            $bak = Join-Path $bkDir 'hosts-20260101-000000-aaaaaaaa.bak'
+            [IO.File]::WriteAllText($bak, 'PREVIOUS')
+            $hPrev = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('PREVIOUS'))
+            $hCur = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes('CURRENT'))
+            @{
+                createdAt    = '2026-01-01T00:00:00.0000000+08:00'
+                hostsPath    = (Join-Path $b 'hosts.fixture')
+                preHash      = $hPrev
+                intendedHash = $hCur
+                postHash     = $hCur
+                state        = 'committed'
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$bak.json" -Encoding utf8
+
+            $r = Invoke-HostsRollback -HostsPath '.\hosts.fixture' -BackupDir $bkDir -BackupPath $bak
+            $r.Unchanged | Should -BeFalse
+            (Get-Content -LiteralPath (Join-Path $b 'hosts.fixture') -Raw).Trim() | Should -Be 'PREVIOUS'
+            (Get-Content -LiteralPath (Join-Path $a 'hosts.fixture') -Raw).Trim() | Should -Be 'OTHER_FILE'
+        } finally {
+            [Environment]::CurrentDirectory = $oldCwd
+            Pop-Location
+        }
     }
 }

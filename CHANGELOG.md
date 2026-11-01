@@ -43,6 +43,13 @@
 - 回滚路径的全局互斥锁现在会 `Dispose()`。
 - 备份目录不再只在新建时加固；已存在的备份目录每次使用前都复查 ACL。
 - 备份根路径比较带目录分隔符边界，`Cloudflare-Hosts-Optimizer-evil` 不会混入。
+- 相对 `-HostsPath` / `-RollbackFrom` 以及报告、计划、缓存、域名文件路径现在按
+  PowerShell 当前位置解析一次，读取、写入、替换和清单记录使用同一个绝对路径，
+  不会因为进程 CWD 与 PowerShell 位置不同而改到另一个同名文件。
+- 新建备份目录不再使用 `New-Item -Force` 复用竞态中出现的路径；创建冲突直接中止，
+  并在调用 takeown/icacls 之前再次拒绝 ReparsePoint。
+- Doctor 的任务脚本检测复用宿主入口解析：支持 `-f`，`-Command` 内容里的 `-File`
+  和闭引号后拼接的后缀不会被误认；无法识别入口时显示 WARN 而不是正常。
 
 ## 0.5.6 - 2026-11-01
 

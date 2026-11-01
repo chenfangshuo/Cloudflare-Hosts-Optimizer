@@ -5,6 +5,7 @@ BeforeAll {
     . (Join-Path $repoRoot 'lib\HostsFile.ps1')
     . (Join-Path $repoRoot 'lib\Probe.ps1')
     . (Join-Path $repoRoot 'lib\Doctor.ps1')
+    . (Join-Path $repoRoot 'lib\Schedule.ps1')
 
     function New-HostsFixture {
         param([string]$Path, [string[]]$Lines)
@@ -217,6 +218,21 @@ Describe 'Get-TaskScriptPath' {
 
     It '没有 -File 时返回空' {
         Get-TaskScriptPath -Arguments '-NoProfile -Command "x"' | Should -Be ''
+    }
+
+    It '识别 -f 别名' {
+        Get-TaskScriptPath -Arguments '-NoProfile -f "C:\Moved\Cloudflare-Hosts-Optimizer.ps1"' |
+            Should -Be 'C:\Moved\Cloudflare-Hosts-Optimizer.ps1'
+    }
+
+    It '-Command 内容里的 -File 不算入口' {
+        Get-TaskScriptPath -Arguments '-NoProfile -Command "& C:\Other\x.ps1 -File C:\Moved\y.ps1"' |
+            Should -Be ''
+    }
+
+    It '闭引号后拼接后缀不算入口' {
+        Get-TaskScriptPath -Arguments '-NoProfile -File "C:\tmp\Cloudflare-Hosts-Optimizer.ps1".other.ps1' |
+            Should -Be ''
     }
 }
 

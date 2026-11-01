@@ -30,6 +30,9 @@ function Read-HostsDocument {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
 
+    # 相对路径按 PowerShell 当前位置解析一次；后续 [IO.File] 使用同一个绝对路径，
+    # 避免“读取用 PS 位置、写入用进程 CWD”改到另一个同名文件。
+    $Path = Resolve-InputPath -Path $Path
     if (-not (Test-Path -LiteralPath $Path)) { throw "hosts 文件不存在：$Path" }
     $bytes = [IO.File]::ReadAllBytes($Path)
 
@@ -560,6 +563,7 @@ function Get-HostsBackupPlan {
         [string]$FallbackRoot,
         [string[]]$BaseCandidates
     )
+    if ($HostsPath) { $HostsPath = Resolve-InputPath -Path $HostsPath }
     $isSystem = $true
     if ($HostsPath) { $isSystem = Test-SystemHostsPath -Path $HostsPath }
 
@@ -965,6 +969,7 @@ function Invoke-HostsRollback {
         [switch]$AllowUntrustedBackup
     )
 
+    $HostsPath = Resolve-InputPath -Path $HostsPath
     $mutexState = Enter-GlobalMutex
     try {
     # 这个开关只授权“用户点名的那一份”，不能变成“在所有不可信目录里自动挑最新”
@@ -1062,6 +1067,7 @@ function Invoke-HostsRollback {
     $committed = @($candidates | Where-Object { $_.Committed } | Sort-Object -Property $sortKeys)
 
     if ($BackupPath) {
+        $BackupPath = Resolve-InputPath -Path $BackupPath
         if (Test-Path -LiteralPath $BackupPath -PathType Container) {
             $names = if ($byName.Count -gt 0) { ($byName | ForEach-Object { "  $($_.File.FullName)" }) -join "`n" } else { '（该目标的备份目录里没有可用备份）' }
             throw "指定的路径是目录，需要用具体的 .bak 文件。可用备份：`n$names"
