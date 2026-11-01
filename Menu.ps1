@@ -31,10 +31,23 @@ $CfstDir = Join-Path $Root 'cfst'
 . (Join-Path $Root 'lib\Doctor.ps1')
 
 function Get-PwshPath {
-    $p = [Environment]::ProcessPath
+    # [Environment]::ProcessPath 从 .NET 6 才有；PowerShell 7.0（.NET Core 3.1）上访问会抛错，
+    # 所以必须先 try/catch，再退回命令查找和常见安装位置。
+    $p = ''
+    try { $p = [Environment]::ProcessPath } catch { $p = '' }
     if ($p -and (Test-Path -LiteralPath $p) -and ([IO.Path]::GetFileName($p) -match '^pwsh(-preview)?\.exe$')) { return $p }
     $c = Get-Command pwsh -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
+    $candidates = @()
+    try { $candidates += Join-Path $PSHOME 'pwsh.exe' } catch { }
+    if ($env:ProgramFiles) {
+        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe'
+    }
+    if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe' }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
     throw '找不到 pwsh.exe。'
 }
 
@@ -272,12 +285,14 @@ function Show-TuiMenu {
 }
 
 function Read-MenuChoice {
-    param([string]$Menu, [string[]]$ExtraHeader = @())
+    param([string]$Menu, [string[]]$ExtraHeader = @(), [switch]$Returning)
     Clear-MenuScreen
     $st = Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
     $header = @(Get-MenuHeader -Status $st -Color:$script:Tui) + @($ExtraHeader)
     if ($script:Tui) {
-        $initial = if ($Menu -eq 'Main') { Get-MenuInitialIndex -Menu $Menu -DomainCount $st.Listed } else { 0 }
+        $initial = if ($Menu -eq 'Main') {
+            Get-MenuInitialIndex -Menu $Menu -DomainCount $st.Listed -Returning:$Returning
+        } else { 0 }
         return Show-TuiMenu -Menu $Menu -Header $header -InitialIndex $initial
     }
     Write-Host ''
@@ -467,42 +482,59 @@ function Show-CfstMenu {
 
 function Show-TaskMenu {
     while ($true) {
-        $info = Get-ScheduledTaskDoctorInfo
+        # 查询失败只影响状态显示，不能把异常抛到主菜单导致整个菜单退出
+        $info = Get-TaskMenuInfo -Query { Get-ScheduledTaskDoctorInfo }
         $status = @(Get-TaskStatusLines -Info $info)
         $spec = Read-MenuChoice -Menu Task -ExtraHeader $status
         if (-not $spec -or $spec.Kind -eq 'Back') { return }
 
-        # 安装：同名任务已存在时确认，确认后加 -TaskForce
+        # 安装：AutoApply 的“自动写入”确认和同名任务覆盖确认合并成一次提问；
+        # 任何一个必要确认被拒绝都不执行（提权与非提权路径一致）。
         if ($spec.Arguments -contains '-InstallTask') {
+            $existsKnown = -not [bool]$info.QueryFailed
             $mode = if ($spec.Arguments -contains 'DryRun') { 'DryRun' } else { 'AutoApply' }
             $name = "Cloudflare-Hosts-Optimizer $mode"
-            $exists = [bool]($info.Available -and @($info.Tasks | Where-Object { $_.TaskName -eq $name }).Count -gt 0)
-            $confirmed = $false
-            if ($exists) {
-                $confirmed = Confirm-Action "覆盖已存在的任务「$name」"
-            }
-            $plan = Get-TaskInstallPlan -Arguments @($spec.Arguments) -TaskExists $exists -Confirmed $confirmed
+            $exists = [bool]($existsKnown -and @($info.Tasks | Where-Object { $_.TaskName -eq $name }).Count -gt 0)
+            $prompt = Get-TaskInstallPrompt -Arguments @($spec.Arguments) -Required ([bool]$spec.Confirm) `
+                -TaskExists $exists -ExistsKnown $existsKnown
+            if ($prompt.NeedConfirm -and -not (Confirm-Action $prompt.Text)) { continue }
+            $plan = Get-TaskInstallPlan -Arguments @($spec.Arguments) -TaskExists $exists -Confirmed $true
             if (-not $plan) { continue }
-            if ($spec.RequiresAdmin -and -not $script:IsAdmin) {
-                $p = Invoke-Elevated -Arguments $plan.Arguments
-                if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
-            } else {
-                $exit = Invoke-Child -FilePath $MainScript -Arguments $plan.Arguments
-                Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+            try {
+                if (-not $existsKnown) {
+                    Write-Host '提示：查询计划任务失败，无法确认是否已存在同名任务；本次不带 -TaskForce。' -ForegroundColor Yellow
+                }
+                if ($spec.RequiresAdmin -and -not $script:IsAdmin) {
+                    $p = Invoke-Elevated -Arguments $plan.Arguments
+                    if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
+                } else {
+                    $exit = Invoke-Child -FilePath $MainScript -Arguments $plan.Arguments
+                    Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+                }
+            } catch {
+                Write-Host "安装任务失败：$($_.Exception.Message)" -ForegroundColor Red
             }
             Pause-Action
             continue
         }
 
-        # 卸载：存在 AutoApply 任务且不是管理员时，走提权
+        # 卸载：存在 AutoApply 任务且不是管理员时，走提权；失败不退出菜单
         if ($spec.Arguments -contains '-UninstallTask') {
-            $hasAuto = [bool]($info.Available -and @($info.Tasks | Where-Object { $_.TaskName -like '*AutoApply' }).Count -gt 0)
-            if ($hasAuto -and -not $script:IsAdmin) {
-                $p = Invoke-Elevated -Arguments @('-UninstallTask')
-                if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
-            } else {
-                $exit = Invoke-Child -FilePath $MainScript -Arguments @('-UninstallTask')
-                Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+            $hasAuto = [bool](-not $info.QueryFailed -and
+                @($info.Tasks | Where-Object { $_.TaskName -like '*AutoApply' }).Count -gt 0)
+            try {
+                if ($hasAuto -and -not $script:IsAdmin) {
+                    $p = Invoke-Elevated -Arguments @('-UninstallTask')
+                    if ($p -and $p.ExitCode -ne 0) { Write-Host '管理员窗口返回非 0，请查看输出。' -ForegroundColor Yellow }
+                } else {
+                    if ($info.QueryFailed -and -not $script:IsAdmin) {
+                        Write-Host '提示：无法确认任务状态；卸载 AutoApply 任务需要管理员，可能失败。' -ForegroundColor Yellow
+                    }
+                    $exit = Invoke-Child -FilePath $MainScript -Arguments @('-UninstallTask')
+                    Write-Host "退出码：$exit" -ForegroundColor $(if ($exit -eq 0) { 'Green' } else { 'Yellow' })
+                }
+            } catch {
+                Write-Host "卸载任务失败：$($_.Exception.Message)" -ForegroundColor Red
             }
             Pause-Action
             continue
@@ -554,7 +586,8 @@ if ($Elevated) {
     $argsLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $MainScript
     $extra = ConvertTo-ArgumentString -Arguments $runArgs
     if ($extra) { $argsLine += ' ' + $extra }
-    $p = Start-Process -FilePath ([Environment]::ProcessPath) -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argsLine
+    # 统一用启动时解析好的 pwsh；[Environment]::ProcessPath 在 PowerShell 7.0 上不存在
+    $p = Start-Process -FilePath $script:Pwsh -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argsLine
     Write-Host ''
     Write-Host "执行完毕（退出码 $($p.ExitCode)），按 Enter 关闭此窗口并返回主菜单。" -ForegroundColor Green
     [void](Read-Host)
@@ -572,8 +605,12 @@ if ($Action) {
 }
 
 try {
+    $firstMenu = $true
     while ($true) {
-        $spec = Read-MenuChoice -Menu Main
+        # 首次打开按状态定位；执行过动作或从子菜单返回后默认停在“退出”，
+        # 避免连续按 Enter 重复启动 DryRun/写入。
+        $spec = Read-MenuChoice -Menu Main -Returning:(-not $firstMenu)
+        $firstMenu = $false
         if (-not $spec -or $spec.Kind -eq 'Exit') { break }
         $keep = Invoke-Choice -Spec $spec
         if (-not $keep) { break }

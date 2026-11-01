@@ -425,7 +425,8 @@ function Backup-HostsDocument {
         [int]$Keep = 10
     )
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    # 带毫秒：同一秒内发生两次提交时，文件名排序仍能反映先后
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
     $id = [guid]::NewGuid().ToString('N').Substring(0, 8)
     $name = "hosts-$stamp-$id.bak"
     $path = Join-Path $BackupDir $name
@@ -469,7 +470,7 @@ function Write-HostsDocument {
     )
 
     if (-not $Update.Changed) {
-        return [pscustomobject]@{ Changed = $false; Backup = $null }
+        return [pscustomobject]@{ Changed = $false; Backup = $null; CommittedAt = $null }
     }
 
     $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
@@ -528,11 +529,45 @@ function Write-HostsDocument {
         $manifest.domains = @($Update.FinalMap.Keys)
         $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $backup.ManifestPath -Encoding utf8
 
-        return [pscustomobject]@{ Changed = $true; Backup = $backup.Path; NewHash = $newHash }
+        # 提交时间必须在事务锁内、读写校验之后取，才是“这次替换真正完成”的时间
+        return [pscustomobject]@{
+            Changed = $true; Backup = $backup.Path; NewHash = $newHash; CommittedAt = (Get-Date)
+        }
     } finally {
         if ($acquired) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
     }
+}
+
+# manifest 的 createdAt 是 ISO 8601（含偏移）。解析失败返回 $null，退回按文件名排序。
+# 注意：PowerShell 7.5+ 的 ConvertFrom-Json 会把它直接转成 DateTime；转回字符串会丢毫秒，
+# 所以 DateTime 要原样使用。
+function ConvertTo-BackupTimestamp {
+    [CmdletBinding()]
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value }
+    $text = [string]$Value
+    if (-not $text) { return $null }
+    try {
+        return [datetime]::Parse($text, [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind)
+    } catch { return $null }
+}
+
+# 从备份文件名解析时间（hosts-yyyyMMdd-HHmmss[fff]-...）；解析失败返回 $null。
+function ConvertTo-BackupTimestampFromName {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Name = '')
+    if (-not $Name) { return $null }
+    $m = [regex]::Match($Name, '^hosts-(\d{8})-(\d{6,9})-')
+    if (-not $m.Success) { return $null }
+    $stamp = $m.Groups[1].Value + '-' + $m.Groups[2].Value
+    $format = if ($m.Groups[2].Value.Length -eq 9) { 'yyyyMMdd-HHmmssfff' } else { 'yyyyMMdd-HHmmss' }
+    try {
+        return [datetime]::ParseExact($stamp, $format,
+            [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None)
+    } catch { return $null }
 }
 
 function Invoke-HostsRollbackLocked {
@@ -571,20 +606,34 @@ function Invoke-HostsRollbackLocked {
                 $same = $false
                 try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
                 if (-not $same) { continue }
+                # 缺 createdAt 的旧 manifest：退回文件名里的时间，而不是 MinValue，
+                # 否则它会排到所有带时间的备份后面（R6）。
+                $sortAt = ConvertTo-BackupTimestamp -Value $m.createdAt
+                if (-not $sortAt) { $sortAt = ConvertTo-BackupTimestampFromName -Name $bak.Name }
                 $candidates += [pscustomobject]@{
                     File = $bak; Manifest = $m; Committed = [bool]$m.postHash; Legacy = $false
+                    SortAt = $sortAt; SortName = $bak.Name
                 }
             } catch { continue }
         } else {
             $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
                 ([IO.Path]::GetFullPath($bak.DirectoryName) -ieq [IO.Path]::GetFullPath($LegacyBackupDir))
             if (-not ($isLegacy -and $isSystem)) { continue }
-            $candidates += [pscustomobject]@{ File = $bak; Manifest = $null; Committed = $false; Legacy = $true }
+            $candidates += [pscustomobject]@{
+                File = $bak; Manifest = $null; Committed = $false; Legacy = $true
+                SortAt = (ConvertTo-BackupTimestampFromName -Name $bak.Name); SortName = $bak.Name
+            }
         }
     }
 
-    $byName = @($candidates | Sort-Object { $_.File.Name } -Descending)
-    $committed = @($candidates | Where-Object { $_.Committed } | Sort-Object { $_.File.Name } -Descending)
+    # 同一秒内的多次提交，文件名里的 GUID 是随机的；优先按 manifest 的 createdAt 排序，
+    # 没有 createdAt（旧格式/无 manifest）才退回文件名。
+    $sortKeys = @(
+        @{ Expression = { if ($_.SortAt) { $_.SortAt } else { [datetime]::MinValue } }; Descending = $true }
+        @{ Expression = { $_.SortName }; Descending = $true }
+    )
+    $byName = @($candidates | Sort-Object -Property $sortKeys)
+    $committed = @($candidates | Where-Object { $_.Committed } | Sort-Object -Property $sortKeys)
 
     if ($BackupPath) {
         if (Test-Path -LiteralPath $BackupPath -PathType Container) {
@@ -629,7 +678,8 @@ function Invoke-HostsRollbackLocked {
     # 当前内容已经等于备份内容：无变化成功，不重复替换
     if ($currentHash -eq $backupHash) {
         return [pscustomobject]@{
-            Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime; Unchanged = $true
+            Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime
+            Unchanged = $true; CommittedAt = $null
         }
     }
 
@@ -666,7 +716,8 @@ function Invoke-HostsRollbackLocked {
     }
 
     return [pscustomobject]@{
-        Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime; Unchanged = $false
+        Restored = $selected.File.FullName; RestoredAt = $selected.File.CreationTime
+        Unchanged = $false; CommittedAt = (Get-Date)
     }
 }
 

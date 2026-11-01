@@ -93,16 +93,19 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
-# 菜单初始焦点：没有域名时停在“导入”，已有域名时停在“DryRun”（不是正式写入）。
+# 菜单初始焦点：
+#   * 首次打开：没有域名停在“导入”，已有域名停在“DryRun”（不是正式写入）；
+#   * 执行动作或从子菜单返回：停在“退出”，避免连续按 Enter 重复启动扫描。
 function Get-MenuInitialIndex {
     [CmdletBinding()]
     param(
         [ValidateSet('Main', 'Import', 'Cfst', 'Task')][string]$Menu = 'Main',
-        [int]$DomainCount = 0
+        [int]$DomainCount = 0,
+        [switch]$Returning
     )
     $items = @(Get-MenuItems -Menu $Menu)
     if ($Menu -eq 'Main') {
-        $key = if ($DomainCount -gt 0) { '8' } else { '1' }
+        $key = if ($Returning) { '0' } elseif ($DomainCount -gt 0) { '8' } else { '1' }
         for ($i = 0; $i -lt $items.Count; $i++) {
             if ($items[$i].Key -eq $key) { return $i }
         }
@@ -115,6 +118,11 @@ function Get-TaskStatusLines {
     [CmdletBinding()]
     param($Info)
     if (-not $Info -or -not $Info.Available) { return @('任务状态：未知（缺少 ScheduledTasks 模块）') }
+    if ($Info.QueryFailed) {
+        $reason = ([string]$Info.Error).Trim()
+        if ($reason.Length -gt 120) { $reason = $reason.Substring(0, 120) + '…' }
+        return @("任务状态：未知（查询失败$(if ($reason) { "：$reason" })）")
+    }
     if (@($Info.Tasks).Count -eq 0) { return @('已注册任务：无') }
     return @($Info.Tasks | ForEach-Object {
             $detail = "$($_.TaskName)：$($_.State)"
@@ -122,6 +130,58 @@ function Get-TaskStatusLines {
             if ($_.LastRun) { $detail += "，上次 $($_.LastRun)（结果 $($_.LastResult)）" }
             $detail
         })
+}
+
+# 查询计划任务；查询本身抛错时也返回一个可展示的对象，不能把异常抛进主菜单。
+function Get-TaskMenuInfo {
+    [CmdletBinding()]
+    param([scriptblock]$Query)
+    if (-not $Query) { $Query = { Get-ScheduledTaskDoctorInfo } }
+    try {
+        $info = & $Query
+        if (-not $info) {
+            return [pscustomobject]@{ Available = $true; QueryFailed = $true; Error = '查询没有返回结果'; Tasks = @() }
+        }
+        return [pscustomobject]@{
+            Available   = [bool]$info.Available
+            QueryFailed = [bool]$info.QueryFailed
+            Error       = [string]$info.Error
+            Tasks       = @($info.Tasks)
+        }
+    } catch {
+        return [pscustomobject]@{ Available = $true; QueryFailed = $true; Error = $_.Exception.Message; Tasks = @() }
+    }
+}
+
+# 安装任务前的确认文案。两种必要确认合并成一次提问：
+#   * Required（AutoApply 的 Spec.Confirm）：允许安装会自动写入 hosts 的任务；
+#   * TaskExists：允许覆盖已存在的同名任务。
+# 两者都不满足时不会执行；查询失败（ExistsKnown=false）时按“不存在”处理，
+# 不自动加 -TaskForce，也不要谎称没有任务。
+function Get-TaskInstallPrompt {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [bool]$Required = $false,
+        [bool]$TaskExists = $false,
+        [bool]$ExistsKnown = $true
+    )
+    $auto = $Arguments -contains 'AutoApply'
+    $name = if ($auto) { 'Cloudflare-Hosts-Optimizer AutoApply' } else { 'Cloudflare-Hosts-Optimizer DryRun' }
+    $need = [bool]$Required -or [bool]$TaskExists
+    $text = ''
+    if ($TaskExists) {
+        $text = if ($auto) { "覆盖已存在的任务「$name」（该任务会自动写入 hosts）" } else { "覆盖已存在的任务「$name」" }
+    } elseif ($Required) {
+        $text = "安装任务「$name」（会按计划自动写入 hosts）"
+    }
+    return [pscustomobject]@{
+        NeedConfirm = $need
+        Text        = $text
+        TaskExists  = [bool]$TaskExists
+        ExistsKnown = [bool]$ExistsKnown
+        AutoApply   = [bool]$auto
+    }
 }
 
 # 安装任务前决定参数：任务已存在但用户取消 → 返回 $null（不执行）；

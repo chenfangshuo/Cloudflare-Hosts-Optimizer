@@ -233,11 +233,24 @@ function Get-TaskScriptPath {
 function Get-ScheduledTaskDoctorInfo {
     [CmdletBinding()]
     param([string]$NamePattern = 'Cloudflare-Hosts-Optimizer*')
-    # 用对象包一层：直接返回空数组时，函数输出会被折叠成 $null，和「模块缺失」区分不开
+    # 用对象包一层：直接返回空数组时，函数输出会被折叠成 $null，和「模块缺失」区分不开。
+    # QueryFailed 与「没有任务」严格区分：查询失败时不能当成空列表。
     if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
-        return [pscustomobject]@{ Available = $false; Tasks = @() }
+        return [pscustomobject]@{ Available = $false; QueryFailed = $false; Error = ''; Tasks = @() }
     }
-    $tasks = @(Get-ScheduledTask -TaskName $NamePattern -ErrorAction SilentlyContinue)
+    try {
+        # 不用 -TaskName 过滤：没有匹配任务时该参数会写一条错误，和真正的查询失败混在一起。
+        # 取全部任务再按名字过滤，空结果就是“没有任务”。
+        $tasks = @(Get-ScheduledTask -ErrorAction Stop |
+            Where-Object { $_.TaskName -like $NamePattern })
+    } catch {
+        return [pscustomobject]@{
+            Available   = $true
+            QueryFailed = $true
+            Error       = $_.Exception.Message
+            Tasks       = @()
+        }
+    }
     $rows = foreach ($t in $tasks) {
         $info = $null
         try { $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop } catch { }
@@ -261,5 +274,5 @@ function Get-ScheduledTaskDoctorInfo {
             ScriptExists = if ($scriptPath) { Test-Path -LiteralPath $scriptPath } else { $null }
         }
     }
-    return [pscustomobject]@{ Available = $true; Tasks = @($rows) }
+    return [pscustomobject]@{ Available = $true; QueryFailed = $false; Error = ''; Tasks = @($rows) }
 }

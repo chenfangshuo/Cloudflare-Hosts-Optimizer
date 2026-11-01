@@ -1,6 +1,7 @@
 #Requires -Version 7.0
 BeforeAll {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+    $script:RepoRoot = $repoRoot
     . (Join-Path $repoRoot 'lib\Domains.ps1')
     . (Join-Path $repoRoot 'lib\HostsFile.ps1')
     . (Join-Path $repoRoot 'lib\Menu.ps1')
@@ -9,6 +10,21 @@ BeforeAll {
         param([string]$Path, [string[]]$Lines)
         Set-Content -LiteralPath $Path -Value $Lines -Encoding ascii
         return $Path
+    }
+
+    # 从 Menu.ps1 里取出单个函数定义，供直接调用测试（Menu.ps1 顶层有菜单入口，不能整体 dot-source）
+    function Get-MenuFunctionSource {
+        param([string]$Name)
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $script:RepoRoot 'Menu.ps1'), [ref]$tokens, [ref]$errors)
+        $fn = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name
+            }, $true) | Select-Object -First 1
+        if (-not $fn) { throw "找不到函数 $Name" }
+        return $fn.Extent.Text
     }
 }
 
@@ -221,6 +237,19 @@ Describe 'Get-MenuInitialIndex' {
     It '子菜单默认第一项' {
         Get-MenuInitialIndex -Menu Import -DomainCount 9 | Should -Be 0
     }
+
+    It '执行动作后返回主菜单默认停在退出' {
+        $items = @(Get-MenuItems -Menu Main)
+        $exitIndex = 0
+        for ($i = 0; $i -lt $items.Count; $i++) { if ($items[$i].Key -eq '0') { $exitIndex = $i } }
+        Get-MenuInitialIndex -Menu Main -DomainCount 5 -Returning | Should -Be $exitIndex
+        Get-MenuInitialIndex -Menu Main -DomainCount 0 -Returning | Should -Be $exitIndex
+    }
+
+    It '编号模式空输入不会匹配任何动作' {
+        Get-MenuActionSpec -Menu Main -Key '' | Should -BeNullOrEmpty
+        Get-MenuActionSpec -Menu Main -Key '   ' | Should -BeNullOrEmpty
+    }
 }
 
 Describe '任务菜单纯逻辑' {
@@ -243,6 +272,29 @@ Describe '任务菜单纯逻辑' {
         $line | Should -Match '2026-11-15'
     }
 
+    It '查询异常显示未知，不谎称没有任务' {
+        $line = (@(Get-TaskStatusLines -Info ([pscustomobject]@{ Available = $true; QueryFailed = $true; Error = 'CIM 错误'; Tasks = @() })))[0]
+        $line | Should -Match '未知'
+        $line | Should -Match '查询失败'
+        $line | Should -Not -Match '无'
+    }
+
+    It 'AutoApply 安装始终需要确认，DryRun 新建不需要' {
+        (Get-TaskInstallPrompt -Arguments @('-InstallTask', '-TaskMode', 'AutoApply') -Required $true).NeedConfirm | Should -BeTrue
+        (Get-TaskInstallPrompt -Arguments @('-InstallTask', '-TaskMode', 'DryRun')).NeedConfirm | Should -BeFalse
+        $p = Get-TaskInstallPrompt -Arguments @('-InstallTask', '-TaskMode', 'AutoApply') -Required $true
+        $p.Text | Should -Match '自动写入'
+    }
+
+    It '同名任务覆盖需要确认，查询失败时不加 TaskForce' {
+        $p = Get-TaskInstallPrompt -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $true -ExistsKnown $false
+        $p.NeedConfirm | Should -BeTrue
+        $p.Text | Should -Match '覆盖'
+        $unknown = Get-TaskInstallPrompt -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -ExistsKnown $false
+        $unknown.NeedConfirm | Should -BeFalse
+        $unknown.ExistsKnown | Should -BeFalse
+    }
+
     It '覆盖确认取消时不执行，确认后才带 -TaskForce' {
         Get-TaskInstallPlan -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $true -Confirmed $false | Should -BeNullOrEmpty
         $plan = Get-TaskInstallPlan -Arguments @('-InstallTask', '-TaskMode', 'DryRun') -TaskExists $true -Confirmed $true
@@ -255,5 +307,135 @@ Describe '任务菜单纯逻辑' {
         Format-ElevatedResult -ExitCode 0 | Should -Match '退出码 0'
         Format-ElevatedResult -ExitCode 3 | Should -Match '退出码 3'
         Format-ElevatedResult -ExitCode $null -Cancelled $true | Should -Match '取消'
+    }
+}
+
+Describe 'Show-TaskMenu 行为（直接调用）' {
+    BeforeAll {
+        # Menu.ps1 顶层会进入菜单循环，只能取出 Show-TaskMenu 单独定义
+        . ([scriptblock]::Create((Get-MenuFunctionSource -Name 'Show-TaskMenu')))
+        $script:MainScript = 'C:\fake\Cloudflare-Hosts-Optimizer.ps1'
+
+        function Get-ScheduledTaskDoctorInfo { & $script:TaskQuery }
+        function Read-MenuChoice {
+            param([string]$Menu, [string[]]$ExtraHeader = @())
+            $script:Observed.Headers = @($ExtraHeader)
+            if ($script:Choices.Count -eq 0) { return Get-MenuActionSpec -Menu Task -Key '0' }
+            $next = $script:Choices[0]
+            $script:Choices = @($script:Choices | Select-Object -Skip 1)
+            return $next
+        }
+        function Confirm-Action {
+            param([string]$Label)
+            $script:Observed.Confirms = @($script:Observed.Confirms) + $Label
+            return [bool]$script:Observed.ConfirmAnswer
+        }
+        function Invoke-Child {
+            param([string]$FilePath, [string[]]$Arguments = @())
+            $script:Observed.Child.Add(@($Arguments))
+            return 0
+        }
+        function Invoke-Elevated {
+            param([string[]]$Arguments = @())
+            $script:Observed.Elevated.Add(@($Arguments))
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+        function Pause-Action { }
+    }
+
+    BeforeEach {
+        $script:Observed = @{
+            Headers       = @()
+            Confirms      = @()
+            ConfirmAnswer = $false
+            Child         = [System.Collections.Generic.List[object]]::new()
+            Elevated      = [System.Collections.Generic.List[object]]::new()
+        }
+        $script:Choices = @()
+        $script:IsAdmin = $false
+        $script:TaskQuery = { [pscustomobject]@{ Available = $true; QueryFailed = $false; Error = ''; Tasks = @() } }
+    }
+
+    It '查询抛错时显示未知并可以返回，不会结束菜单' {
+        $script:TaskQuery = { throw 'CIM 查询失败' }
+        { Show-TaskMenu } | Should -Not -Throw
+        $headers = $script:Observed.Headers -join "`n"
+        $headers | Should -Match '未知'
+        $headers | Should -Match '查询失败'
+        $script:Observed.Child.Count | Should -Be 0
+        $script:Observed.Elevated.Count | Should -Be 0
+    }
+
+    It '首次安装 AutoApply 拒绝确认时不启动子进程（普通权限）' {
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '2')
+        Show-TaskMenu
+        $script:Observed.Confirms.Count | Should -Be 1
+        $script:Observed.Child.Count | Should -Be 0
+        $script:Observed.Elevated.Count | Should -Be 0
+    }
+
+    It '首次安装 AutoApply 拒绝确认时不启动子进程（管理员）' {
+        $script:IsAdmin = $true
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '2')
+        Show-TaskMenu
+        $script:Observed.Confirms.Count | Should -Be 1
+        $script:Observed.Child.Count | Should -Be 0
+    }
+
+    It '管理员确认后安装 AutoApply，确认只问一次且不带 -TaskForce' {
+        $script:IsAdmin = $true
+        $script:Observed.ConfirmAnswer = $true
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '2')
+        Show-TaskMenu
+        $script:Observed.Confirms.Count | Should -Be 1
+        $script:Observed.Child.Count | Should -Be 1
+        $args = @($script:Observed.Child[0])
+        $args | Should -Contain '-InstallTask'
+        $args | Should -Contain 'AutoApply'
+        $args | Should -Not -Contain '-TaskForce'
+    }
+
+    It '同名任务覆盖拒绝时不执行' {
+        $script:IsAdmin = $true
+        $script:TaskQuery = {
+            [pscustomobject]@{
+                Available = $true; QueryFailed = $false; Error = ''
+                Tasks     = @([pscustomobject]@{
+                        TaskName = 'Cloudflare-Hosts-Optimizer AutoApply'; State = 'Ready'
+                        NextRun = ''; LastRun = ''; LastResult = $null
+                    })
+            }
+        }
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '2')
+        Show-TaskMenu
+        $script:Observed.Confirms.Count | Should -Be 1
+        $script:Observed.Child.Count | Should -Be 0
+    }
+
+    It '同名任务覆盖确认后带 -TaskForce' {
+        $script:IsAdmin = $true
+        $script:Observed.ConfirmAnswer = $true
+        $script:TaskQuery = {
+            [pscustomobject]@{
+                Available = $true; QueryFailed = $false; Error = ''
+                Tasks     = @([pscustomobject]@{
+                        TaskName = 'Cloudflare-Hosts-Optimizer DryRun'; State = 'Ready'
+                        NextRun = ''; LastRun = ''; LastResult = $null
+                    })
+            }
+        }
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '1')
+        Show-TaskMenu
+        $script:Observed.Child.Count | Should -Be 1
+        @($script:Observed.Child[0]) | Should -Contain '-TaskForce'
+    }
+
+    It '查询失败时不确定是否存在，不加 -TaskForce 也不跳过安装' {
+        $script:IsAdmin = $true
+        $script:TaskQuery = { [pscustomobject]@{ Available = $true; QueryFailed = $true; Error = 'boom'; Tasks = @() } }
+        $script:Choices = @(Get-MenuActionSpec -Menu Task -Key '1')
+        Show-TaskMenu
+        $script:Observed.Child.Count | Should -Be 1
+        @($script:Observed.Child[0]) | Should -Not -Contain '-TaskForce'
     }
 }

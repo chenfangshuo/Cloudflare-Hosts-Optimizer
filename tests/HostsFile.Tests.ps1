@@ -211,9 +211,11 @@ Describe '写入与回滚' {
 
         $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $backupDir -Version 'test'
         $w.Changed | Should -BeTrue
+        $w.CommittedAt | Should -Not -BeNullOrEmpty
         (Get-Content $tmp -Raw) | Should -Match '10\.0\.0\.1'
 
         $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $backupDir
+        $r.CommittedAt | Should -Not -BeNullOrEmpty
         (Get-Content $tmp -Raw) | Should -Match '203\.0\.113\.10 cf\.example\.net'
         (Get-Content $tmp -Raw) | Should -Not -Match '10\.0\.0\.1'
     }
@@ -241,6 +243,68 @@ Describe '写入与回滚' {
 
         Invoke-HostsRollback -HostsPath $tmp -BackupDir $backupDir | Out-Null
         (Get-Content $tmp -Raw).Trim() | Should -Be 'new'
+    }
+
+    It '同一秒内的提交按 manifest 时间选最新，不按随机 GUID' {
+        $tmp = Join-Path $TestDrive 'w2b.txt'
+        [IO.File]::WriteAllText($tmp, "v2`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-w2b'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # 名字里的 GUID 排序与实际先后相反：先写的那份名字更大
+        $older = Join-Path $dir 'hosts-20260101-000000-ffffffff.bak'
+        $newer = Join-Path $dir 'hosts-20260101-000000-00000000.bak'
+        [IO.File]::WriteAllText($older, "v0`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($newer, "v1`r`n", [Text.ASCIIEncoding]::new())
+        $currentHash = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+        $manifests = @(
+            @{ File = $older; Data = @{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($older))
+                    postHash  = Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes("v1`r`n"))
+                    createdAt = '2026-01-01T10:00:00.1000000+08:00'
+                } }
+            @{ File = $newer; Data = @{
+                    hostsPath = $tmp
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($newer))
+                    postHash  = $currentHash
+                    createdAt = '2026-01-01T10:00:00.9000000+08:00'
+                } }
+        )
+        foreach ($m in $manifests) {
+            [IO.File]::WriteAllText("$($m.File).json", ($m.Data | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        }
+
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'v1'
+    }
+
+    It '缺 createdAt 的较新备份按文件名时间参与排序（R6）' {
+        $tmp = Join-Path $TestDrive 'w2c.txt'
+        [IO.File]::WriteAllText($tmp, "v2`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-w2c'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # 较早的备份有 createdAt；较新的备份缺该字段，只能靠文件名判断
+        $older = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        $newer = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($older, "v0`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText($newer, "v1`r`n", [Text.ASCIIEncoding]::new())
+        $currentHash = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp))
+        $olderManifest = @{
+            hostsPath = $tmp
+            preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($older))
+            postHash  = Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes("v1`r`n"))
+            createdAt = '2026-01-01T00:00:00.1000000+08:00'
+        }
+        $newerManifest = @{
+            hostsPath = $tmp
+            preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($newer))
+            postHash  = $currentHash
+        }
+        [IO.File]::WriteAllText("$older.json", ($olderManifest | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$newer.json", ($newerManifest | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'v1'
     }
 
     It '回滚只使用匹配 hostsPath 的备份' {
@@ -464,6 +528,7 @@ Describe '回滚异常组合（v0.5.4）' {
 
         $r = Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir
         $r.Unchanged | Should -BeTrue
+        $r.CommittedAt | Should -BeNullOrEmpty
     }
 
     It '-Force 不能绕过损坏的备份' {

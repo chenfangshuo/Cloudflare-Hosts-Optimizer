@@ -25,12 +25,24 @@ $script:TaskPassThroughParams = @(
 function Get-OptimizerPwshPath {
     [CmdletBinding()]
     param()
-    $p = [Environment]::ProcessPath
+    # [Environment]::ProcessPath 从 .NET 6 才有；PowerShell 7.0 上访问会抛错。
+    $p = ''
+    try { $p = [Environment]::ProcessPath } catch { $p = '' }
     if ($p -and (Test-Path -LiteralPath $p) -and ([IO.Path]::GetFileName($p) -match '^pwsh(-preview)?\.exe$')) {
         return $p
     }
     $c = Get-Command pwsh -ErrorAction SilentlyContinue
     if ($c) { return $c.Source }
+    $candidates = @()
+    try { $candidates += Join-Path $PSHOME 'pwsh.exe' } catch { }
+    if ($env:ProgramFiles) {
+        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        $candidates += Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe'
+    }
+    if ($env:LOCALAPPDATA) { $candidates += Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe' }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+    }
     throw '找不到 pwsh.exe。请用 PowerShell 7 运行本脚本。'
 }
 

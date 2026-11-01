@@ -196,7 +196,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.4'
+$ScriptVersion = '0.5.5'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -499,6 +499,8 @@ function Invoke-Doctor {
     $taskInfo = Get-ScheduledTaskDoctorInfo
     if (-not $taskInfo.Available) {
         & $add '计划' '计划任务' 'SKIP' '缺少 ScheduledTasks 模块，无法查询'
+    } elseif ($taskInfo.QueryFailed) {
+        & $add '计划' '计划任务' 'WARN' ("查询计划任务失败：{0}" -f $taskInfo.Error)
     } elseif (@($taskInfo.Tasks).Count -eq 0) {
         & $add '计划' '计划任务' 'SKIP' '未注册（可选：-InstallTask -TaskMode DryRun）'
     } else {
@@ -652,6 +654,7 @@ function Invoke-Main {
         else { Say "已恢复 hosts：$($r.Restored)" 'Green' }
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
         $script:RunChanged = -not $r.Unchanged
+        $script:RunCommittedAt = $r.CommittedAt
         $script:RunSummaryLine = if ($r.Unchanged) { '无变化（hosts 已是该备份内容）' } else { '已恢复 hosts' }
         return 0
     }
@@ -1192,6 +1195,7 @@ function Invoke-Main {
             Say 'hosts 内容无变化，未写入。' 'Green'
         }
         $script:RunChanged = [bool]$write.Changed
+        $script:RunCommittedAt = $write.CommittedAt
         $flush = Clear-DnsCache
         if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
     }
@@ -1276,6 +1280,7 @@ $script:RunStarted = Get-Date
 $script:RunMode = ''
 $script:RunHostsPath = ''
 $script:RunChanged = $false
+$script:RunCommittedAt = $null
 $script:RunCounts = @{ updated = 0; kept = 0; unverified = 0 }
 $script:RunSummaryLine = ''
 
@@ -1318,9 +1323,9 @@ if ($script:RunMode) {
             -StartedAt $script:RunStarted -FinishedAt (Get-Date) -ExitCode $script:ExitCode `
             -Changed ([bool]$script:RunChanged) -Updated ([int]$script:RunCounts.updated) `
             -Kept ([int]$script:RunCounts.kept) -Unverified ([int]$script:RunCounts.unverified) `
-            -RunId $script:RunId
+            -RunId $script:RunId -CommittedAt $script:RunCommittedAt
         $null = Write-RunSummary -Path (Join-Path $Root 'last-run.json') -Run $run `
-            -Committed:([bool]$script:RunChanged) -CommitMode $script:RunMode
+            -Committed:([bool]$script:RunChanged -and $null -ne $script:RunCommittedAt) -CommitMode $script:RunMode
     } catch { }
 }
 

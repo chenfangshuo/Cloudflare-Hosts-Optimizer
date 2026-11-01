@@ -30,8 +30,9 @@
 - 目录：`%ProgramData%\Cloudflare-Hosts-Optimizer\backup`（不可写时回退项目目录）。
 - 非系统 `-HostsPath` 使用 `targets\<路径哈希>` 子目录；回滚时校验 manifest 的 `hostsPath`，
   避免沙箱备份被系统 hosts 的回滚选中。
-- 文件名含时间戳和 GUID，附带 JSON 清单（pre/post 哈希）；按文件名选最近，
-  不依赖 LastWriteTime。
+- 文件名含时间戳（带毫秒）和 GUID，附带 JSON 清单（pre/post 哈希）；
+  选择“最近”时优先按 manifest 的 `createdAt`（同一秒内的多次提交也不会被随机 GUID 打乱），
+  没有该字段的备份退回文件名里的时间，不依赖 LastWriteTime。
 - 保留最近 10 份 + 一份首次接管快照。
 
 ## 写入与回滚
