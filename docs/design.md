@@ -30,7 +30,7 @@
 5. **逐域名选择（基线对比）**：见下面的设计决策。每域名最多 `-TopN` 个 IP（默认 1），
    多 IP 时额外 IP 需与主 IP 同类且 TTFB 不超过主 IP 的 1.5 倍。
 6. **写入 hosts**：读取并严格解析；任何结构/编码/冲突问题直接中止。增量合并后走
-   备份 → 临时文件 → 原子替换 → 读回校验 → 刷新 DNS。
+   备份 → 临时文件 → 原子替换 → 读回校验 → 刷新 DNS（仅系统 hosts）。
 
 ## 关键设计决策
 
@@ -228,7 +228,8 @@ BitTorrent 的 IPv6 对等连接不受影响；tracker 专用子域名建议不�
 - 提交前重新读文件算哈希，与运行时读到的不一致 → 中止，不写。
 - 先写备份和清单（`state=pending`，记录 `preHash` 与这次准备写入的 `intendedHash`，
   `postHash` 为空），再写临时文件 → 读回校验 → `File.Replace` 原子替换 → 读回确认 →
-  原子地把清单升级为 `state=committed`（写入实际 `postHash`）→ 刷新 DNS。
+  原子地把清单升级为 `state=committed`（写入实际 `postHash`）→ 刷新 DNS（仅系统 hosts；
+  沙箱 `-HostsPath` 不参与系统解析，也不需要管理员）。
 - 回滚挑选时：`committed` 才算已完成；`pending` 只有在"当前 hosts 的哈希正好等于它的
   `intendedHash`"时才当作已替换（说明 Replace 成功、只是完成标记没写成），当前内容等于
   `preHash` 则一律不算完成；`aborted`（替换根本没发生）直接跳过。

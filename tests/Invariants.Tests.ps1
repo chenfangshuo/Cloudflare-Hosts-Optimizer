@@ -35,6 +35,14 @@ Describe 'F07 每 IP 请求预算' {
     }
 }
 
+Describe '沙箱写入不刷新系统 DNS' {
+    It '写入和回滚都只在系统 hosts 上调用 Clear-DnsCache' {
+        $script:MainSource | Should -Match 'Test-SystemHostsPath -Path \$hostsPathResolved\) \{\s*\$flush = Clear-DnsCache'
+        ([regex]::Matches($script:MainSource, 'Test-SystemHostsPath -Path \$hostsPathResolved\) \{')).Count |
+            Should -BeGreaterOrEqual 2
+    }
+}
+
 Describe 'F05 两阶段提交接线' {
     It '备份 manifest 先写 pending，完成后再升级' {
         $hostsLib = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'lib\HostsFile.ps1') -Raw

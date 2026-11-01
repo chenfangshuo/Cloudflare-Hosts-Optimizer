@@ -34,7 +34,7 @@
 ### 首次启动
 
 ```text
-Cloudflare-Hosts-Optimizer 0.6.0
+Cloudflare-Hosts-Optimizer 0.6.1
 域名 12 个 · hosts 已写入 10 个 · CFST 已安装
 上次运行：2026-11-01 10:28 · 写入 · 退出码 0
 最近提交：写入 · 2026-11-01 10:28

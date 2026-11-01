@@ -203,7 +203,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.6.0'
+$ScriptVersion = '0.6.1'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -702,10 +702,13 @@ function Invoke-Main {
             Say '警告：-AllowUntrustedBackup 已启用；会接受普通用户可写目录里的备份，请确认来源。' 'Yellow'
         }
         $r = Invoke-HostsRollback -HostsPath $hostsPathResolved -BackupDir $backupDirs -BackupPath $RollbackFrom -Force:$Force -AllowUntrustedBackup:$AllowUntrustedBackup
-        $flush = Clear-DnsCache
         if ($r.Unchanged) { Say "hosts 已经是该备份的内容，无需恢复：$($r.Restored)" 'Green' }
         else { Say "已恢复 hosts：$($r.Restored)" 'Green' }
-        if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        # 沙箱 -HostsPath 不参与系统 DNS 解析，也不需要管理员；只对系统 hosts 刷新
+        if (Test-SystemHostsPath -Path $hostsPathResolved) {
+            $flush = Clear-DnsCache
+            if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        }
         $script:RunChanged = -not $r.Unchanged
         $script:RunCommittedAt = $r.CommittedAt
         $script:RunSummaryLine = if ($r.Unchanged) { '无变化（hosts 已是该备份内容）' } else { '已恢复 hosts' }
@@ -1285,15 +1288,20 @@ function Invoke-Main {
             Fail $_.Exception.Message 4
         }
         if ($write.Changed) {
-            Say "已写入 hosts（备份：$($write.Backup)）" 'Green'
+            # 控制台只显示文件名，避免超长绝对路径把输出拉得很宽；完整路径进报告日志
+            Say "已写入 hosts（备份：$([IO.Path]::GetFileName($write.Backup))）" 'Green'
+            $script:Log.Add("备份路径：$($write.Backup)")
             if ($write.Warning) { Say "警告：$($write.Warning)" 'Yellow' }
         } else {
             Say 'hosts 内容无变化，未写入。' 'Green'
         }
         $script:RunChanged = [bool]$write.Changed
         $script:RunCommittedAt = $write.CommittedAt
-        $flush = Clear-DnsCache
-        if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        # 沙箱 -HostsPath 不参与系统 DNS 解析，也不需要管理员；只对系统 hosts 刷新
+        if (Test-SystemHostsPath -Path $hostsPathResolved) {
+            $flush = Clear-DnsCache
+            if (-not $flush.Ok) { Say "警告：flushdns 失败：$($flush.Output)" 'Yellow' }
+        }
     }
     Complete-Step
 
