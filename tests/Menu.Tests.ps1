@@ -439,3 +439,40 @@ Describe 'Show-TaskMenu 行为（直接调用）' {
         @($script:Observed.Child[0]) | Should -Not -Contain '-TaskForce'
     }
 }
+
+Describe '菜单头部状态栏' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'lib\RunSummary.ps1')
+        Invoke-Expression (Get-MenuFunctionSource -Name 'Get-MenuHeader')
+        $script:Version = '0.5.5'
+        $script:Root = $TestDrive
+        $script:HostsPath = Join-Path $TestDrive 'hosts'
+        $script:ReportPath = Join-Path $TestDrive 'last-report.txt'
+    }
+
+    It '彩色模式下普通权限提示不会被变量名吞掉' {
+        # 陷阱："$dim当前是普通权限" 会被解析成变量 $dim当前是普通权限（CJK 是合法变量名字符）
+        $script:IsAdmin = $false
+        $st = [pscustomobject]@{ Listed = 0; Cfst = '未安装'; Invalid = 0; HostsError = ''; Managed = 0 }
+        $text = (Get-MenuHeader -Status $st -Color) -join "`n"
+        $text | Should -Match ([regex]::Escape("$([char]27)[90m当前是普通权限"))
+        $text | Should -Match ([regex]::Escape("$([char]27)[33m0 个"))
+    }
+
+    It 'hosts 结构异常时保留 hosts 字样和红色' {
+        $script:IsAdmin = $true
+        $st = [pscustomobject]@{ Listed = 3; Cfst = '已安装'; Invalid = 0; HostsError = 'bad markers'; Managed = 0 }
+        $text = (Get-MenuHeader -Status $st -Color) -join "`n"
+        $text | Should -Match ([regex]::Escape("$([char]27)[31mhosts 结构异常"))
+    }
+
+    It '纯文本模式也不丢字' {
+        $script:IsAdmin = $false
+        $st = [pscustomobject]@{ Listed = 0; Cfst = '未安装'; Invalid = 2; HostsError = ''; Managed = 0 }
+        $text = (Get-MenuHeader -Status $st) -join "`n"
+        $text | Should -Match '当前是普通权限'
+        $text | Should -Match '0 个'
+        $text | Should -Match '2 个非法'
+        $text | Should -Not -Match ([regex]::Escape([string][char]27))
+    }
+}

@@ -1,7 +1,7 @@
 # Cloudflare-Hosts-Optimizer
 
-Pick the fastest Cloudflare edge IPs and safely write them into the Windows hosts file,
-so any Cloudflare-proxied site (PT forums, etc.) loads faster.
+Pick the fastest Cloudflare edge IPs and safely write them into the Windows hosts file, so any
+Cloudflare-proxied site (PT forums, etc.) loads faster.
 
 > No proxy, no login, no egress IP change. Strict hosts validation, incremental updates,
 > one-click rollback.
@@ -10,270 +10,131 @@ Windows 10/11 · PowerShell 7+ · built-in `curl.exe` · CFST optional
 
 [中文说明](README.md) · [Releases](https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/releases)
 
-> Detailed docs under `docs/` are currently in Chinese; commands and option names are
-> language-neutral.
+**Why this exists.** Most PT sites on my line took over ten seconds to open. Picking IPs with
+[CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) and editing hosts by hand did
+help, but two things kept biting: the lowest-ping IP sometimes returned Error 1034 (the site
+refuses that IP and the page simply won't load), and CFST's default speed-test URL is no longer
+maintained. So this chains the whole thing into one run: latency scan → throughput test →
+per-domain verification → hosts write → one-click rollback. **One PT site here went from >10s to
+about 3s; a single-site run measured TTFB 1.75s → 0.69s.**
 
-**Why this exists.** On my line most PT sites took over ten seconds to open. Picking IPs with
-[CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) (CFST) and editing hosts by
-hand did help — but the lowest-ping IP sometimes came back as Error 1034 (the site refuses that
-IP and the page simply won't load), and CFST's default speed-test URL is no longer maintained.
-So this chains it into one run: latency scan → throughput test → per-domain verification →
-hosts write → one-click rollback. **One PT site here went from >10s to about 3s; a single-site
-run measured TTFB 1.75s → 0.69s.**
+## Quick start (30 seconds)
 
-## Quick start
+No commands — download, extract, double-click:
 
-**Prefer clicking?** Extract the release and double-click `Start.bat`. It finds PowerShell 7
-or offers to install it with winget, then shows a menu: Doctor, import/edit domains, domain
-overview, DryRun, apply, rollback, CFST download and scheduled tasks. See
-[docs/launcher.md](docs/launcher.md) (Chinese).
+<img src="docs/images/menu.png" width="860" alt="Cloudflare-Hosts-Optimizer menu: domain count, last run and last commit, numbered items 1–10">
 
-**1) Prepare domains**
+1. **Download and fully extract** the release, enter the inner `Cloudflare-Hosts-Optimizer\`
+   folder and **double-click `Start.bat`**. It finds PowerShell 7, or offers to install it with winget.
+2. **Press `1` to import / edit domains** (see the next section), then close the editor.
+3. **(Optional) Press `3` to download / update CFST**: wider candidate coverage and usually a
+   better result; without it the built-in scanner is used, but it can miss good IPs.
+4. **(Optional) Press `8` for a dry run**: no hosts changes, just a preview of what would switch.
+5. **Press `9` to apply**, confirm the UAC prompt — and press `10` to roll back at any time.
 
-Copy `domains.example.txt` to `domains.txt`; one domain per line. Prefer sites you have
-confirmed are proxied by Cloudflare — a wrong entry won't corrupt anything, per-domain
-validation simply skips it, but the run is wasted:
+Keys: `↑`/`↓` to move, `1`–`9` jump to the first nine items, item 10 ("roll back") with the arrow
+keys, `0` to exit / go back, `Enter` to confirm, `Esc` to go back. The first run takes about
+**8–15 minutes** and prints `[n/6] step · estimate` plus a spinner (e.g. `| 96/256 · 45s`); it is
+not stuck. Menu details, elevation and the full option list are in
+[the guide](docs/guide.md) (Chinese).
+
+Steps 3 and 4 are optional. Note that **a dry run still sends real requests**: running it right
+before applying means every site is probed twice — see [the notes](#notes).
+
+## Domains and notes
+
+`domains.txt` takes one domain per line; `#` starts a comment. Three ways to fill it:
+
+- menu `1` → `5 手动编辑 domains.txt` and type them in Notepad, one per line;
+- menu `1` to import from a PT-Depiler backup, the Windows proxy bypass list, text or the
+  clipboard, then review the result;
+- the command line: `.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip' -Merge` —
+  the four sources and merge rules are in [the guide](docs/guide.md#域名导入与合并) (Chinese).
+
+What to put in: **web hostnames only** — never tracker subdomains like `tracker.example.com` —
+and **only sites you have confirmed are proxied by Cloudflare**. A wrong entry does no harm, the
+per-domain check just skips it. When unsure, look at the headers:
 
 ```powershell
 curl.exe -sI https://example.com | findstr /i "server:"
 ```
 
-`server: cloudflare` is a hint, not proof. Non-CF sites are skipped during per-domain
-validation.
+`server: cloudflare` is a hint, not proof. Keep uncertain domains in the list and run `-DryRun`.
 
-List web hostnames only. **Do not list tracker-only hostnames** such as
-`tracker.example.com`: an announce is a few dozen bytes every 30 minutes, so there is nothing to
-gain, while a stale mapping or an Error 1034 would break announcements and turn torrents red.
+### Notes
 
-**2) Optional: add CFST (better coverage)**
+1. The first run takes about **8–15 minutes**; writing hosts needs administrator rights;
+   **hosts only affects this machine** and does not change the origin the site sees, nor P2P or
+   IPv6 peer connections.
+2. Each run sends only a handful of HEAD requests to each site (headers only, no page body):
+   typically 6–10, at most 11, at most twice per IP during the pre-switch check, 400ms apart —
+   do not raise it. The script **does not log in, send cookies, read passkeys, touch announce
+   URLs or connect to tracker ports**; bulk speed tests only hit `speed.cloudflare.com`; **it
+   only processes the domains in `domains.txt`** and never crawls or discovers sites.
+   **A dry run also sends real requests**: running one right before applying probes every site
+   twice, doubling the exposure. If you intend to apply, press `9` directly; if you want a
+   preview, run the dry run some other time.
+3. **The egress IP does not change**: only the CF edge node changes, and only for domains in your
+   proxy bypass list. The script checks the WinINET bypass list and TUN adapters, but cannot fully
+   detect PAC/WPAD, WinHTTP, app-level proxies or WFP transparent redirection. Never use VPNs,
+   online IP-picking services or public reverse proxies to access PT sites.
+4. By default it only adds/updates domains in your list and **does not delete other managed
+   entries**; `-Prune` is required to drop mappings that are no longer listed.
+5. **Clash can stay on** while the script runs (every curl call uses `--noproxy '*'` and CFST
+   clears proxy environment variables); but **for browsing through hosts, turn the proxy off or
+   put the domains in the bypass list**. A TUN adapter aborts the run unless you add `-Force`.
+6. Picked IPs drift over time — **re-run every 1–2 weeks**, or use a
+   [scheduled task](docs/guide.md#定时运行). hosts only changes name resolution; IPv6 is not
+   optimised yet.
+7. Avoid tracker-only subdomains: an announce is a few dozen bytes every 30 minutes, there is
+   nothing to gain, and a stale mapping or an Error 1034 breaks announcements and turns torrents
+   red. Same-host setups (`example.com/announce.php`) cannot be separated, so they rely on
+   periodic re-runs and rollback. [Why](docs/faq.md#要不要把-tracker-域名加进-domainstxt).
 
-Download [CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest/releases) and put
-`cfst.exe` and `ip.txt` into the `cfst\` folder next to the script (the release archive already
-creates this folder with a `PUT-CFST-HERE.txt` note you can delete):
-
-```text
-Cloudflare-Hosts-Optimizer\
-  cfst\
-    cfst.exe
-    ip.txt
-```
-
-Without it the built-in scanner is used automatically.
-
-The release archive extracts to exactly this layout. Windows Explorer's "Extract All" first
-creates a folder named after the zip, with `Cloudflare-Hosts-Optimizer\` inside it; run the
-script from the inner folder.
-
-**3) Dry run** (no admin, no hosts changes)
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -DryRun
-```
-
-**4) Apply** (elevated PowerShell)
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1
-```
-
-**5) Roll back**
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Rollback
-```
-
-**6) Diagnose problems first**
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -Doctor
-```
-
-Read-only: checks the environment, hosts structure, CFST, probe/speed endpoints, proxy/TUN,
-backups and scheduled tasks. No admin, no requests to the target sites; exit code 1 if any
-check fails.
-
-**7) Schedule it (optional)**
-
-Run a DryRun every 14 days (writes `last-report.txt` only, no hosts changes, no admin):
-
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\Cloudflare-Hosts-Optimizer.ps1 -InstallTask -TaskMode DryRun
-```
-
-Use `-TaskMode AutoApply` to apply automatically (needs admin), `-UninstallTask` to remove it.
-See [docs/scheduling.md](docs/scheduling.md).
-
-A full run takes about **8–15 minutes**. The `probing candidate colos (256)` phase takes
-several minutes by itself; it prints progress every 32 candidates, so it is not stuck.
-
-For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts.
+Full rules and the request budget: [design notes](docs/design.md#安全与请求预算) (Chinese).
 
 ## What a run looks like
 
-Real numbers from my line: TTFB 1.75s → 0.69s on a single-site run. The output below is a
-multi-domain example; domains and some numbers are placeholders, and a real run also prints
-the scan and throughput tables.
+A single-site run measured TTFB 1.75s → 0.69s (−60%). Below is one complete run (demo data,
+domains replaced), from the environment check through latency screening, colo sampling,
+throughput and per-domain verification to the hosts write and final decision table:
 
-```text
-==== Cloudflare IP optimization -> hosts ====
-hosts: C:\Windows\System32\drivers\etc\hosts
-domains: 12
+<img src="docs/images/run.png" width="880" alt="Complete run: environment check, latency screening, colo sampling, throughput, per-domain verification, hosts write, result and decision table">
 
-proxy: WinINET system proxy is enabled -> 127.0.0.1:7890
-  Note: all curl calls use --noproxy * and CFST clears proxy env vars; probes always go direct.
+How the choice is made, how 1034 falls back to DNS, and how hosts writes stay reversible:
+[design notes](docs/design.md) (Chinese).
 
-probing candidate colos (256, may take a few minutes; progress every 32)...
-  probed 32/256 (38s)
-  probed 64/256 (79s)
-...
-per-domain validation (baseline = current hosts/DNS path)...
-  pt.example.com      switch 104.17.143.151 -> 162.159.160.5  [confirmed]
-  forum.example.org   keep   104.17.131.149  [below-threshold]
+## Command line & automation
 
-hosts written (backup: C:\ProgramData\Cloudflare-Hosts-Optimizer\backup\hosts-...bak)
+Same features from a terminal (short form; the real invocation is
+`pwsh -File .\Cloudflare-Hosts-Optimizer.ps1 ...`):
+
+```powershell
+.\Cloudflare-Hosts-Optimizer.ps1 -DryRun      # scan and verify, no hosts changes
+.\Cloudflare-Hosts-Optimizer.ps1              # apply (elevated)
+.\Cloudflare-Hosts-Optimizer.ps1 -Rollback    # restore the latest backup
+.\Cloudflare-Hosts-Optimizer.ps1 -Doctor      # read-only self-check
 ```
 
-## How it picks IPs
+For automation, `-Plan -PlanPath .\plan.json` emits a JSON plan without touching hosts; schedule a
+recurring run with `-InstallTask -TaskMode DryRun` (AutoApply needs admin). Every option,
+scheduled-task detail and import command: [the guide](docs/guide.md) (Chinese).
 
-1. CFST (or the built-in scanner) filters candidates by latency/loss.
-2. Stratified sampling across edge colos, so candidates are not all HKG.
-3. Independent throughput test plus a 3 × 2MB final; only final results count.
-4. Each domain is checked with HEAD against its current hosts/DNS baseline; the baseline and
-   the chosen candidate are re-checked before switching.
-5. Switch only when the candidate is ≥15% and ≥30ms faster, or the baseline is broken or a
-   worse class (WAF/restricted).
+## Docs & credits
 
-Design notes, 1034 fallback and the IPv4-only decision are in
-[docs/how-it-works.md](docs/how-it-works.md) (Chinese).
-
-## Domains, import and merge
-
-`domains.txt` is one domain per line; `#` starts a comment. It is gitignored, so your site
-list stays local. You can also import from:
-
-| Source | Command |
+| Document | When to read it |
 | --- | --- |
-| PT-Depiler backup (recommended) | `.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip'` |
-| Windows proxy bypass | `.\Import-Domains.ps1 -Source ProxyBypass` |
-| Text file | `.\Import-Domains.ps1 -Source Text -Path .\sites.txt` |
-| Clipboard | `.\Import-Domains.ps1 -Source Clipboard` |
+| [docs/guide.md](docs/guide.md) | Menu details, domain import, CFST download, scheduled tasks, all options, data locations |
+| [docs/design.md](docs/design.md) | The five selection stages, CFST comparison, 1034 handling, hosts transaction and rollback rules |
+| [docs/faq.md](docs/faq.md) | Startup troubleshooting, ban boundaries, error meanings, uninstall |
 
-The importer never accesses the network. PT-Depiler import only opens `metadata.json` and
-never reads `cookies.json`, `userInfo.json` or `downloadHistory.json`. See
-[docs/importing.md](docs/importing.md) for options.
+Development: `Invoke-Pester -Path .\tests` (fully offline, never touches the real hosts file).
+See [CONTRIBUTING.md](CONTRIBUTING.md) (includes the release process); report security issues
+through [SECURITY.md](SECURITY.md), not a public issue.
 
-### Review and merge (important)
+Credits: [XIU2/CloudflareSpeedTest](https://github.com/XIU2/CloudflareSpeedTest) (the screening
+engine, GPL-3.0, not bundled), [PT-Depiler](https://github.com/pt-plugins/PT-depiler) (backup
+schema reference), [cmliu/CF-Workers-SpeedTestURL](https://github.com/cmliu/CF-Workers-SpeedTestURL)
+(self-hosted speed-test URL).
 
-Imports go to `domains.imported.txt`; **`domains.txt` is never overwritten**. Review the
-file first: keep only Cloudflare-proxied sites, and remember that a proxy bypass list may
-contain non-PT domains. Merge with:
-
-```powershell
-.\Import-Domains.ps1 -Source Depiler -Path '.\PTD_backup.zip' -Merge
-```
-
-`-Merge` backs up `domains.txt`, appends new domains and deduplicates; it is idempotent.
-Do not merge an entire backup or bypass list without reviewing it.
-
-## Runtime
-
-| Phase | Typical | Notes |
-| --- | --- | --- |
-| CFST latency/loss scan | 1–3 min | `-NoCfst` built-in scan is faster but has less coverage |
-| Probe 256 candidate colos | 2–6 min | 6s timeout, 16 parallel; progress every 32 |
-| ↳ with a cache younger than 14 days | about 1 min | Stops early once last run's colos are covered; falls back to a full probe when stale or the colos changed |
-| Throughput quick test + final | 1–3 min | about 70MB of downloads |
-| Per-domain validation and re-check | 1–3 min | ~6–10 HEADs per domain, 400ms apart |
-
-To shorten a run:
-
-```powershell
-.\Cloudflare-Hosts-Optimizer.ps1 -ThroughputCandidates 16 -MaxDomainProbes 4
-.\Cloudflare-Hosts-Optimizer.ps1 -NoCfst -MaxCandidates 128
-```
-
-## Safety
-
-- No login, no cookies, no announce URLs, no passkeys. Only a small number of HEAD requests
-  per domain (typically 6–10, at most 11; one IP is probed at most twice during the
-  pre-switch confirmation). The budget grows with the candidate count and `-MaxDomainProbes`,
-  so raising it is not recommended.
-- **Egress IP is unchanged** as long as these domains are in your proxy bypass list. The
-  script checks the WinINET bypass list and TUN adapters, but cannot detect every
-  PAC/WPAD/WinHTTP/WFP setup.
-- Clash/proxy can stay on: every curl call uses `--noproxy '*'` and CFST clears proxy
-  environment variables. Probes and speed tests always go direct.
-- Do not use VPNs, online IP-picking services or public reverse proxies to access PT sites.
-- hosts only changes name resolution for these domains' web pages; announces do not get
-  faster, and tracker hostnames should not be listed (see the FAQ, Chinese); **P2P and IPv6
-  peer connections are unaffected**.
-
-See [docs/faq.md](docs/faq.md) for more.
-
-## CFST vs built-in scanner
-
-| | CFST (`cfst\cfst.exe`) | Built-in (`-NoCfst` / not found) |
-| --- | --- | --- |
-| Candidate source | 25 CIDRs from `ip.txt`; does not cover 172.68–172.71 (the built-in list does), and includes 104.28.0.0/14 (needs `-ExperimentalRanges`) | random sample of `-MaxCandidates` (default 192) |
-| Latency measurement | TCPing | HTTPS `cdn-cgi/trace` (includes TLS) |
-| Coverage | wider | limited sample |
-| Dependency | third-party GPL-3.0 binary | PowerShell + system `curl.exe` |
-
-**Why not just write CFST's ranking into hosts.** CFST ranks IPs for your line; it does not tell
-you whether an IP works for a given site — the same IP can serve site A and return 1034 on site
-B. Its download test also depends on `-url`, and the default URL is no longer maintained
-([issue #168](https://github.com/XIU2/CloudflareSpeedTest/issues/168)); the current version scores
-non-200 responses as failures. This tool borrows CFST's latency/loss screening only, measures
-throughput itself, and verifies every domain.
-
-Both share the same colo sampling, throughput final and per-domain selection. CFST is used
-for latency/loss only; its download test is not used.
-
-## Common options
-
-| Option | Default | Description |
-| --- | --- | --- |
-| `-DryRun` | | Scan and verify only; do not modify hosts |
-| `-Plan` / `-PlanPath` | `.\plan.json` | Emit a JSON plan without modifying hosts |
-| `-Rollback` | | Restore hosts from the latest backup |
-| `-RollbackFrom` | latest | With `-Rollback`, restore a specific `hosts-*.bak` |
-| `-Prune` | | Remove managed entries no longer in the domain list |
-| `-Doctor` | | Read-only self-check (no hosts changes, no admin) |
-| `-InstallTask` | | Register a scheduled task (DryRun, every 14 days) |
-| `-UninstallTask` | | Remove scheduled tasks |
-| `-NoCfst` | | Force the built-in scanner |
-| `-TopN` | 1 | Maximum IPs written per domain |
-| `-MinImprovementPct` | 15 | Minimum percentage improvement to switch |
-| `-MinImprovementMs` | 30 | Minimum absolute improvement (ms) to switch |
-| `-MaxDomainProbes` | 6 | Hard cap on candidate probes per domain |
-| `-NoColoCache` | | Ignore the colo cache and probe every candidate |
-| `-CfstPath` | auto | Path to `cfst.exe` (file or folder) |
-
-Full parameter list: [docs/parameters.md](docs/parameters.md).
-
-## hosts safety
-
-- Only zero or exactly one BEGIN/END block is accepted; malformed markers abort the run.
-- Only ASCII/UTF-8 hosts files are supported. Multi-alias lines, IPv6 mappings and other
-  tools' managed blocks abort with a line number.
-- Failed domains keep their previous mapping; only explicit 1034/1003 drops it. Entries not
-  in the current list are kept unless `-Prune` is used.
-- Writes use a mutex, a pre-commit hash check, a backup manifest, atomic replace and
-  read-back verification. `-Rollback` restores the latest backup; `-RollbackFrom` goes back
-  to an earlier one.
-
-Full rules: [docs/hosts-safety.md](docs/hosts-safety.md).
-
-## Development
-
-```powershell
-Import-Module Pester -MinimumVersion 5.0
-Invoke-Pester -Path .\tests -Output Detailed
-```
-
-All tests are offline; CI runs the parse check, PSScriptAnalyzer and Pester on Windows.
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
-
-## License
-
-[MIT](LICENSE). The repository does not include CloudflareSpeedTest code or binaries.
+License: [MIT](LICENSE). This repository does not include CloudflareSpeedTest code or binaries.

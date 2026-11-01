@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: 使用指南
+    url: https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/blob/main/docs/guide.md
+    about: 菜单、域名导入、CFST、定时任务和全部参数。
   - name: 使用问题 / FAQ
     url: https://github.com/chenfangshuo/Cloudflare-Hosts-Optimizer/blob/main/docs/faq.md
     about: 先看 README 和 FAQ；提问时不要贴真实站点清单或 passkey。

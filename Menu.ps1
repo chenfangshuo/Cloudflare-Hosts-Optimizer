@@ -168,12 +168,12 @@ function Get-MenuHeader {
         $dim = "`e[90m"
         $sep = "`e[90m$dot`e[0m"
         $titleLine = "`e[1;36m$title`e[0m"
-        $listedValue = if ($st.Listed -gt 0) { "$green$($st.Listed) 个$reset" } else { "$yellow0 个$reset" }
+        $listedValue = if ($st.Listed -gt 0) { "$green$($st.Listed) 个$reset" } else { "${yellow}0 个$reset" }
         $invalidText = if ($st.Invalid -gt 0) { " $yellow（$($st.Invalid) 个非法）$reset" } else { '' }
         if ($st.HostsError) {
-            $hostsText = "$redhosts 结构异常$reset"
+            $hostsText = "${red}hosts 结构异常$reset"
         } else {
-            $managedValue = if ($st.Managed -gt 0) { "$green$($st.Managed) 个$reset" } else { "$yellow0 个$reset" }
+            $managedValue = if ($st.Managed -gt 0) { "$green$($st.Managed) 个$reset" } else { "${yellow}0 个$reset" }
             $hostsText = "hosts 已写入 $managedValue"
         }
         $cfstValue = if ($st.Cfst -eq '已安装') { "$green$($st.Cfst)$reset" } else { "$yellow$($st.Cfst)$reset" }
@@ -187,7 +187,7 @@ function Get-MenuHeader {
             $lines.Add("$hintColor$hint$reset")
         }
         if (-not $script:IsAdmin) {
-            $lines.Add("$dim当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。$reset")
+            $lines.Add("${dim}当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。$reset")
         }
         return @($lines)
     }

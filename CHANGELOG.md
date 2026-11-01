@@ -1,5 +1,19 @@
 # Changelog
 
+## 未发布
+
+### Fixed
+
+- 菜单状态栏：`"$dim当前是普通权限…"`、`"$yellow0 个"`、`"$redhosts 结构异常"` 会被 PowerShell
+  当成一个变量名解析（CJK 和数字都是合法的变量名字符），导致普通权限提示整段丢失、0 的计数
+  变成空白、hosts 结构异常时丢掉 "hosts" 字样和红色。改用 `${var}` 形式，并补三条回归测试。
+
+### Changed
+
+- 文档：`docs/` 由 8 个文件合并为 `guide.md`（用法与参数）、`design.md`（原理与 hosts 安全）、
+  `faq.md`；发布流程并入 `CONTRIBUTING.md`；README 中英文改为 6 节漏斗，并加菜单截图、
+  逐站决策表截图和流程图。
+
 ## 0.5.5 - 2026-11-01
 
 ### Fixed
