@@ -54,13 +54,22 @@ try {
             if ($entries -notcontains ($prefix + $r)) { throw "zip 中缺少 $r。" }
         }
 
-        # Start.bat 必须是纯 ASCII + CRLF，否则 cmd 可能解析失败
+        # Start.bat：UTF-8 无 BOM、无 NUL、CRLF，且显式 chcp 65001
         $bat = $archive.GetEntry("${prefix}Start.bat")
         if ($bat) {
-            $sr = [IO.StreamReader]::new($bat.Open())
-            try { $batText = $sr.ReadToEnd() } finally { $sr.Dispose() }
-            if ($batText -match '[^\x00-\x7F]') { throw 'Start.bat 含非 ASCII 字符（cmd 可能乱码）。' }
+            $ms = [IO.MemoryStream]::new()
+            $s = $bat.Open()
+            try { $s.CopyTo($ms) } finally { $s.Dispose() }
+            $bytes = $ms.ToArray()
+            $ms.Dispose()
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+                throw 'Start.bat 带 UTF-8 BOM，cmd 可能解析失败。'
+            }
+            if (@($bytes | Where-Object { $_ -eq 0 }).Count -gt 0) { throw 'Start.bat 含 NUL 字节。' }
+            $utf8 = [Text.UTF8Encoding]::new($false, $true)
+            try { $batText = $utf8.GetString($bytes) } catch { throw 'Start.bat 不是合法的 UTF-8。' }
             if ($batText -notmatch "`r`n") { throw 'Start.bat 不是 CRLF 换行。' }
+            if ($batText -notmatch 'chcp 65001') { throw 'Start.bat 缺少 chcp 65001（中文提示会乱码）。' }
         }
 
         # 包内所有 .ps1 至少能通过语法解析

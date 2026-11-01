@@ -31,11 +31,26 @@ Describe '菜单定义' {
     }
 
     It '写入和回滚需要管理员并要确认' {
-        $apply = Get-MenuActionSpec -Menu Main -Key '5'
+        $apply = Get-MenuActionSpec -Menu Main -Key '9'
         $apply.RequiresAdmin | Should -BeTrue
         $apply.Confirm | Should -BeTrue
-        (Get-MenuActionSpec -Menu Main -Key '6').RequiresAdmin | Should -BeTrue
-        (Get-MenuActionSpec -Menu Main -Key '4').RequiresAdmin | Should -BeFalse
+        (Get-MenuActionSpec -Menu Main -Key '10').RequiresAdmin | Should -BeTrue
+        (Get-MenuActionSpec -Menu Main -Key '8').RequiresAdmin | Should -BeFalse
+    }
+
+    It '主菜单按使用顺序排列，1-9 都能直达' {
+        $items = @(Get-MenuItems -Menu Main)
+        $items[0].Label | Should -Match '导入'
+        $items[1].Label | Should -Match '查看域名'
+        $items[7].Key | Should -Be '8'
+        $items[7].Label | Should -Match 'DryRun'
+        $items[8].Key | Should -Be '9'
+        $items[8].Label | Should -Match '正式写入'
+        $items[9].Key | Should -Be '10'
+        $items[10].Key | Should -Be '0'
+        foreach ($i in 1..9) {
+            Get-MenuActionSpec -Menu Main -Key "$i" | Should -Not -BeNullOrEmpty
+        }
     }
 
     It 'AutoApply 任务需要管理员' {
@@ -155,7 +170,7 @@ Describe 'Format-MenuFrame' {
         $lines[1] | Should -Be '状态'
         $lines[2] | Should -Be ''
         $lines[3] | Should -Be '  第一项'
-        $lines[4] | Should -Be '> 第二项'
+        $lines[4] | Should -Be '❯ 第二项'
         $lines[-1] | Should -Be '↑↓ 选择'
     }
 

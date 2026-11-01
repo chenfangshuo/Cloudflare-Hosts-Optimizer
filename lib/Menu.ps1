@@ -39,16 +39,16 @@ function Get-MenuItems {
     switch ($Menu) {
         'Main' {
             return @(
-                (New-MenuSpec '1' '环境自检 (Doctor)' 'Script' @('-Doctor')),
-                (New-MenuSpec '2' '导入 / 编辑域名' 'Submenu' -Target 'Import'),
-                (New-MenuSpec '3' '查看域名（列表与已写入）' 'DomainOverview'),
-                (New-MenuSpec '4' '只看结果 (DryRun，不改 hosts)' 'Script' @('-DryRun')),
-                (New-MenuSpec '5' '正式写入 hosts' 'Script' -RequiresAdmin -Confirm),
-                (New-MenuSpec '6' '回滚到上次备份' 'Script' @('-Rollback') -RequiresAdmin -Confirm),
-                (New-MenuSpec '7' '下载 / 更新 CFST' 'Submenu' -Target 'Cfst'),
-                (New-MenuSpec '8' '定时任务' 'Submenu' -Target 'Task'),
-                (New-MenuSpec '9' '查看上次报告' 'ViewReport'),
-                (New-MenuSpec '10' '打开 README' 'OpenReadme'),
+                (New-MenuSpec '1' '导入 / 编辑域名' 'Submenu' -Target 'Import'),
+                (New-MenuSpec '2' '查看域名（列表与已写入）' 'DomainOverview'),
+                (New-MenuSpec '3' '下载 / 更新 CFST' 'Submenu' -Target 'Cfst'),
+                (New-MenuSpec '4' '定时任务' 'Submenu' -Target 'Task'),
+                (New-MenuSpec '5' '查看上次报告' 'ViewReport'),
+                (New-MenuSpec '6' '打开 README' 'OpenReadme'),
+                (New-MenuSpec '7' '环境自检 (Doctor)' 'Script' @('-Doctor')),
+                (New-MenuSpec '8' '只看结果 (DryRun，不改 hosts)' 'Script' @('-DryRun')),
+                (New-MenuSpec '9' '正式写入 hosts' 'Script' -RequiresAdmin -Confirm),
+                (New-MenuSpec '10' '回滚到上次备份' 'Script' @('-Rollback') -RequiresAdmin -Confirm),
                 (New-MenuSpec '0' '退出' 'Exit')
             )
         }
@@ -93,7 +93,7 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
-# 生成一屏文字；选中的那一行用 "> " 标记。Menu.ps1 再给它加反显。
+# 生成一屏文字；选中的那一行用 "❯ " 标记。Menu.ps1 再给它上色。
 function Format-MenuFrame {
     [CmdletBinding()]
     param(
@@ -106,7 +106,7 @@ function Format-MenuFrame {
     foreach ($h in $Header) { $lines.Add($h) }
     $lines.Add('')
     for ($i = 0; $i -lt @($Items).Count; $i++) {
-        $marker = if ($i -eq $SelectedIndex) { '>' } else { ' ' }
+        $marker = if ($i -eq $SelectedIndex) { '❯' } else { ' ' }
         $lines.Add(('{0} {1}' -f $marker, @($Items)[$i].Label))
     }
     if ($Footer) {

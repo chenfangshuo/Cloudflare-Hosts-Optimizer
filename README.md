@@ -17,8 +17,9 @@ Windows 10/11 · PowerShell 7+ · 系统自带 `curl.exe` · CFST 可选
 ## 快速开始
 
 **不想敲命令：** 下载发布包解压后双击 `Start.bat`。它会检查 PowerShell 7（没有就用
-winget 安装），然后给出上下箭头选择的菜单：Doctor、导入/编辑域名、查看域名、DryRun、
-写入 hosts、回滚、下载 CFST、定时任务。详见 [docs/launcher.md](docs/launcher.md)。
+winget 安装），然后给出可以用上下箭头或 1–9 数字键选择的菜单：导入/编辑域名、查看域名、
+下载/更新 CFST、定时任务、Doctor、DryRun、写入 hosts、回滚。详见
+[docs/launcher.md](docs/launcher.md)。
 
 下面的命令行走法是同样的功能，适合脚本化和排查。
 

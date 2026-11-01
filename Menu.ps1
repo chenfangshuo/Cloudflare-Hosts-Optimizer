@@ -1,16 +1,16 @@
 #Requires -Version 7.0
 <#
-    双击 Start.bat 后进入的菜单（TUI：上下箭头选择）。
+    双击 Start.bat 后进入的菜单（TUI：上下箭头选择，1-9 直达）。
 
-    - 交互终端里使用备用屏幕缓冲区（ESC[?1049h）画菜单，退出后原样恢复滚动内容；
-      动作执行前会先退出备用屏幕，输出留在正常屏幕上。
+    - 菜单就地重绘；选定后先擦掉整块菜单，动作输出从干净的位置开始。
     - 输出/输入被重定向、或终端不支持 VT 时，自动退回编号输入。
       `$env:CFO_PLAIN_MENU='1'` 可强制使用编号输入。
     - 不能用 dot-source 调主脚本——它末尾有 exit，会把菜单一起结束。
-    - 写入 hosts / 回滚 / AutoApply 任务需要管理员时，用 Start-Process -Verb RunAs 单独提权。
+    - 写入 hosts / 回滚 / AutoApply 任务需要管理员时，用 Start-Process -Verb RunAs
+      打开 Menu.ps1 -ElevatedKey <key>，子窗口跑完按 Enter 自动关闭。
 #>
 [CmdletBinding()]
-param([string]$Action)
+param([string]$Action, [string]$ElevatedArgs)
 
 $ErrorActionPreference = 'Stop'
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -105,9 +105,10 @@ function Invoke-Child {
 
 function Invoke-Elevated {
     param([string[]]$Arguments = @())
-    $argLine = '-NoProfile -ExecutionPolicy Bypass -NoExit -File "{0}"' -f $MainScript
-    if ($Arguments.Count -gt 0) { $argLine += ' ' + ($Arguments -join ' ') }
-    Write-Host '会先弹出 UAC，然后打开一个管理员窗口；完成后关闭那个窗口即可回到菜单。' -ForegroundColor Yellow
+    $menuScript = Join-Path $Root 'Menu.ps1'
+    $joined = ($Arguments -join ' ')
+    $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ElevatedArgs "{1}"' -f $menuScript, $joined
+    Write-Host '会先弹出 UAC；请在管理员窗口中查看进度，结束后按 Enter 关闭该窗口。' -ForegroundColor Yellow
     try {
         Start-Process -FilePath $script:Pwsh -Verb RunAs -Wait -WorkingDirectory $Root -ArgumentList $argLine
         return $true
@@ -124,9 +125,34 @@ function Invoke-Elevated {
 }
 
 function Get-MenuHeader {
+    param([switch]$Color)
     $st = Get-MenuStatus -DomainsFile $DomainsFile -HostsPath $HostsPath -CfstDir $CfstDir -ReportPath $ReportPath
     $dot = [string][char]0x00B7
     $title = if ($script:Version) { "Cloudflare-Hosts-Optimizer $($script:Version)" } else { 'Cloudflare-Hosts-Optimizer' }
+    if ($Color) {
+        $green = "`e[32m"; $yellow = "`e[33m"; $red = "`e[31m"; $reset = "`e[0m"
+        $sep = "`e[90m$dot`e[0m"
+        $titleLine = "`e[1;36m$title`e[0m"
+        $listedValue = if ($st.Listed -gt 0) { "$green$($st.Listed) 个$reset" } else { "$yellow0 个$reset" }
+        $invalidText = if ($st.Invalid -gt 0) { " $yellow（$($st.Invalid) 个非法）$reset" } else { '' }
+        if ($st.HostsError) {
+            $hostsText = "$redhosts 结构异常$reset"
+        } else {
+            $managedValue = if ($st.Managed -gt 0) { "$green$($st.Managed) 个$reset" } else { "$yellow0 个$reset" }
+            $hostsText = "hosts 已写入 $managedValue"
+        }
+        $cfstValue = if ($st.Cfst -eq '已安装') { "$green$($st.Cfst)$reset" } else { "$yellow$($st.Cfst)$reset" }
+        $lastText = if ($st.LastRun) { " $sep 上次运行 $($st.LastRun)" } else { '' }
+        $lines = @(
+            $titleLine
+            "域名 $listedValue$invalidText$sep $hostsText$sep CFST $cfstValue$lastText"
+        )
+        if (-not $script:IsAdmin) {
+            $lines += "`e[90m当前是普通权限；写入 hosts / 回滚时会单独弹出 UAC。`e[0m"
+        }
+        return $lines
+    }
+
     $hostsText = if ($st.HostsError) { 'hosts 结构异常' } else { "hosts 已写入 $($st.Managed) 个" }
     $invalidText = if ($st.Invalid -gt 0) { "（$($st.Invalid) 个非法）" } else { '' }
     $lastText = if ($st.LastRun) { "$dot 上次运行 $($st.LastRun)" } else { '' }
@@ -159,9 +185,10 @@ function Show-TuiMenu {
     $frameCount = 0
     try {
         while ($true) {
-            $footer = '↑↓ 选择 · Enter 确认 · Esc 返回'
+            $footer = '↑↓ 选择 · 1-9 直达 · Enter 确认 · Esc 返回'
             $lines = @(Format-MenuFrame -Header $Header -Items $items -SelectedIndex $selected -Footer $footer)
             $selLine = $Header.Count + 1 + $selected
+            $footerLine = $lines.Count - 1
             # 回到菜单块顶部重画；窗口缩放等导致位置失效时退回“从当前位置画”
             if ($top -ge 0) {
                 try { [Console]::SetCursorPosition(0, $top) }
@@ -171,13 +198,30 @@ function Show-TuiMenu {
                 try { $top = [Console]::CursorTop } catch { $top = 0 }
             }
             for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($i -eq $selLine) { [Console]::Write("`e[7m" + $lines[$i] + "`e[K`e[0m`r`n") }
-                else { [Console]::Write($lines[$i] + "`e[K`r`n") }
+                if ($i -eq $selLine) {
+                    $text = $lines[$i]
+                    $label = if ($text.StartsWith('❯ ')) { $text.Substring(2) } else { $text }
+                    [Console]::Write("`e[96m❯`e[0m `e[1;97m" + $label + "`e[0m`e[K`r`n")
+                } elseif ($i -eq $footerLine) {
+                    [Console]::Write("`e[90m" + $lines[$i] + "`e[0m`e[K`r`n")
+                } else {
+                    [Console]::Write($lines[$i] + "`e[K`r`n")
+                }
             }
             [Console]::Write("`e[J")
             $frameCount = $lines.Count
             try { $top = [Math]::Max(0, [Console]::CursorTop - $frameCount) } catch { }
             $key = [Console]::ReadKey($true)
+            # 数字键直达：1-9 对应菜单里的 key，0 是退出/返回
+            $keyName = $key.Key.ToString()
+            if ($keyName -match '^(?:D|NumPad)([0-9])$') {
+                $digitSpec = Get-MenuActionSpec -Menu $Menu -Key $Matches[1]
+                if ($digitSpec) {
+                    try { [Console]::SetCursorPosition(0, $top) } catch { }
+                    [Console]::Write("`e[J")
+                    return $digitSpec
+                }
+            }
             switch ($key.Key) {
                 'UpArrow' { $selected = ($selected - 1 + $items.Count) % $items.Count }
                 'DownArrow' { $selected = ($selected + 1) % $items.Count }
@@ -206,7 +250,7 @@ function Show-TuiMenu {
 function Read-MenuChoice {
     param([string]$Menu, [string[]]$ExtraHeader = @())
     Clear-MenuScreen
-    $header = @(Get-MenuHeader) + @($ExtraHeader)
+    $header = @(Get-MenuHeader -Color:$script:Tui) + @($ExtraHeader)
     if ($script:Tui) {
         return Show-TuiMenu -Menu $Menu -Header $header
     }
@@ -411,10 +455,28 @@ function Invoke-Choice {
     return $true
 }
 
+if ($Action -and $ElevatedArgs) {
+    Write-Host '-Action 和 -ElevatedArgs 不能同时使用。' -ForegroundColor Red
+    exit 2
+}
+
+# 提权子窗口专用：跑完指定参数后提示按 Enter，窗口随即关闭
+if ($ElevatedArgs) {
+    $runArgs = @($ElevatedArgs -split '\s+' | Where-Object { $_ })
+    $argsLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $MainScript
+    $extra = ConvertTo-ArgumentString -Arguments $runArgs
+    if ($extra) { $argsLine += ' ' + $extra }
+    $p = Start-Process -FilePath ([Environment]::ProcessPath) -NoNewWindow -Wait -PassThru -WorkingDirectory $Root -ArgumentList $argsLine
+    Write-Host ''
+    Write-Host "执行完毕（退出码 $($p.ExitCode)），按 Enter 关闭此窗口并返回主菜单。" -ForegroundColor Green
+    [void](Read-Host)
+    exit $p.ExitCode
+}
+
 if ($Action) {
     $spec = Get-MenuActionSpec -Menu Main -Key $Action
     if (-not $spec -or $spec.Kind -in @('Exit', 'Submenu')) {
-        Write-Host "不支持的 -Action：$Action（可用：1/3/4/5/6/9/10）" -ForegroundColor Red
+        Write-Host "不支持的 -Action：$Action（可用：2/5/6/7/8/9/10）" -ForegroundColor Red
         exit 2
     }
     [void](Invoke-Choice -Spec $spec)
