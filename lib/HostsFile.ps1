@@ -13,6 +13,19 @@ if (-not $script:BeginMarker) { $script:BeginMarker = '# >>> Cloudflare-Hosts-Op
 if (-not $script:EndMarker) { $script:EndMarker = '# <<< Cloudflare-Hosts-Optimizer END <<<' }
 if (-not $script:LegacyTag) { $script:LegacyTag = '# [Cloudflare-Hosts-Optimizer] ' }
 
+# 兼容 PowerShell 7.0（.NET Core 3.1）：不要用 SHA256.HashData / Convert.ToHexString。
+# 返回值与 Get-FileHash 一致，都是大写十六进制。
+function Get-Sha256Hex {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][byte[]]$Bytes = @())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToUpperInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
 function Read-HostsDocument {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -47,7 +60,8 @@ function Read-HostsDocument {
     }
 
     $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    # 哈希必须来自刚读到的字节快照，不能重新读文件——两次读取之间文件可能被改
+    $hash = Get-Sha256Hex -Bytes $bytes
 
     return [pscustomobject]@{
         Path       = $Path
@@ -367,7 +381,7 @@ function Get-HostsBackupDir {
     $targetId = $null
     if ($HostsPath -and -not $isSystem) {
         $normalized = [IO.Path]::GetFullPath($HostsPath).ToLowerInvariant()
-        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
+        $hash = (Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($normalized))).ToLowerInvariant()
         $targetId = $hash.Substring(0, 16)
     }
 
@@ -473,7 +487,16 @@ function Write-HostsDocument {
         $backup = Backup-HostsDocument -Document $Document -BackupDir $BackupDir -Version $Version
 
         $enc = if ($Document.Encoding -eq 'UTF8') { [Text.UTF8Encoding]::new($Document.HasBom) } else { [Text.ASCIIEncoding]::new() }
-        $bytes = $enc.GetBytes($Update.Text)
+        $payload = $enc.GetBytes($Update.Text)
+        if ($Document.Encoding -eq 'UTF8' -and $Document.HasBom) {
+            # GetBytes 不会自动带 BOM，必须显式拼上前导字节
+            $preamble = $enc.GetPreamble()
+            $bytes = [byte[]]::new($preamble.Length + $payload.Length)
+            [Array]::Copy($preamble, 0, $bytes, 0, $preamble.Length)
+            [Array]::Copy($payload, 0, $bytes, $preamble.Length, $payload.Length)
+        } else {
+            $bytes = $payload
+        }
 
         $dir = Split-Path -Parent $Document.Path
         $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer.' + [guid]::NewGuid().ToString('N') + '.tmp')
@@ -493,7 +516,7 @@ function Write-HostsDocument {
         }
 
         $newHash = (Get-FileHash -LiteralPath $Document.Path -Algorithm SHA256).Hash
-        $expectedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        $expectedHash = Get-Sha256Hex -Bytes $bytes
         if ($newHash -ne $expectedHash) {
             # 内容不一致，自动还原
             Copy-Item -LiteralPath $backup.Path -Destination $Document.Path -Force
@@ -512,7 +535,7 @@ function Write-HostsDocument {
     }
 }
 
-function Invoke-HostsRollback {
+function Invoke-HostsRollbackLocked {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$HostsPath,
@@ -543,18 +566,17 @@ function Invoke-HostsRollback {
         if (Test-Path -LiteralPath $manifestPath) {
             try {
                 $m = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-                if ($m.hostsPath) {
-                    $same = $false
-                    try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
-                    if (-not $same) { continue }
-                }
+                if (-not $m.hostsPath) { continue }
+                $same = $false
+                try { $same = ([IO.Path]::GetFullPath($m.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $same = $false }
+                if (-not $same) { continue }
                 $valid += $bak
             } catch { continue }
         } else {
-            # 旧版无 manifest 的备份：只允许系统 hosts 从 legacy 目录使用
+            # 无 manifest 的旧版备份：只允许系统 hosts 从 legacy 目录使用
             $isLegacy = $LegacyBackupDir -and (Test-Path -LiteralPath $LegacyBackupDir) -and
                 ([IO.Path]::GetFullPath($bak.DirectoryName) -ieq [IO.Path]::GetFullPath($LegacyBackupDir))
-            if ($isLegacy -and -not $isSystem) { continue }
+            if (-not ($isLegacy -and $isSystem)) { continue }
             $valid += $bak
         }
     }
@@ -574,39 +596,82 @@ function Invoke-HostsRollback {
         if (-not (Test-Path -LiteralPath $manifestPath)) {
             throw "该备份缺少 manifest，无法确认它属于哪个 hosts 目标，已拒绝：$($latest.FullName)"
         }
-        $sm = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
         $sameTarget = $false
-        if ($sm.hostsPath) {
-            try { $sameTarget = ([IO.Path]::GetFullPath($sm.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
+        if ($manifest.hostsPath) {
+            try { $sameTarget = ([IO.Path]::GetFullPath($manifest.hostsPath) -ieq [IO.Path]::GetFullPath($HostsPath)) } catch { $sameTarget = $false }
         }
         if (-not $sameTarget) {
-            throw "该备份的目标是 '$($sm.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
+            throw "该备份的目标是 '$($manifest.hostsPath)'，不是当前 hosts '$HostsPath'，已拒绝。"
         }
     } else {
         if ($baks.Count -eq 0) { throw "没有找到匹配当前 hosts 目标的备份文件：$($dirs -join ', ')" }
         $latest = $baks[0]
         $manifestPath = "$($latest.FullName).json"
+        $manifest = $null
         if (Test-Path -LiteralPath $manifestPath) {
             $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
-            if ($manifest.postHash) {
-                $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
-                if ($currentHash -ne $manifest.postHash -and -not $Force) {
-                    throw 'hosts 在最后一次写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
-                }
-            }
+        }
+    }
+
+    # 备份内容必须与 manifest 的 preHash 一致；损坏/被替换的备份不能用来覆盖 hosts
+    $backupBytes = [IO.File]::ReadAllBytes($latest.FullName)
+    $backupHash = Get-Sha256Hex -Bytes $backupBytes
+    if ($manifest) {
+        if (-not $manifest.preHash) {
+            throw "备份 manifest 缺少 preHash，无法确认内容完整，已拒绝：$($latest.FullName)"
+        }
+        if ($backupHash -ne [string]$manifest.preHash) {
+            throw "备份内容与 manifest 不一致（可能已损坏或被替换），已拒绝：$($latest.FullName)"
+        }
+    }
+
+    # 当前 hosts 在最后一次写入后被其他程序改过时，默认不覆盖
+    if ($manifest -and $manifest.postHash -and -not $Force) {
+        $currentHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
+        if ($currentHash -ne [string]$manifest.postHash) {
+            throw 'hosts 在最后一次写入后被其他程序修改过。为避免覆盖这些改动，已拒绝回滚；确认要覆盖请加 -Force。'
         }
     }
 
     $dir = Split-Path -Parent $HostsPath
     $temp = Join-Path $dir ('.Cloudflare-Hosts-Optimizer-rollback.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
-        [IO.File]::WriteAllBytes($temp, [IO.File]::ReadAllBytes($latest.FullName))
+        [IO.File]::WriteAllBytes($temp, $backupBytes)
+        if ((Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($temp))) -ne $backupHash) {
+            throw '回滚临时文件校验失败，已中止。'
+        }
         [IO.File]::Replace($temp, $HostsPath, [NullString]::Value)
+        $afterHash = (Get-FileHash -LiteralPath $HostsPath -Algorithm SHA256).Hash
+        if ($afterHash -ne $backupHash) {
+            throw '恢复后校验失败，请检查 hosts。'
+        }
     } finally {
         if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
     }
 
     return [pscustomobject]@{ Restored = $latest.FullName; RestoredAt = $latest.CreationTime }
+}
+
+# 回滚与写入共用同一个全局互斥锁，避免“检查后又被另一个实例提交”的窗口
+function Invoke-HostsRollback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HostsPath,
+        [Parameter(Mandatory)][string]$BackupDir,
+        [string]$LegacyBackupDir,
+        [string]$BackupPath,
+        [switch]$Force
+    )
+    $mutex = [Threading.Mutex]::new($false, 'Global\Cloudflare-Hosts-Optimizer')
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw '另一个 Cloudflare-Hosts-Optimizer 实例正在运行，已中止。' }
+        return Invoke-HostsRollbackLocked @PSBoundParameters
+    } finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+    }
 }
 
 function Clear-DnsCache {

@@ -203,3 +203,18 @@ Describe 'Get-CfstDoctorInfo' {
         $r.ExtraInIpFile | Should -Be 1
     }
 }
+
+Describe 'Get-TaskScriptPath' {
+    It '解析带引号、含空格的路径' {
+        Get-TaskScriptPath -Arguments '-NoProfile -ExecutionPolicy Bypass -File "C:\My Tools\Cloudflare-Hosts-Optimizer.ps1" -DryRun' |
+            Should -Be 'C:\My Tools\Cloudflare-Hosts-Optimizer.ps1'
+    }
+
+    It '解析不带引号的路径' {
+        Get-TaskScriptPath -Arguments '-File C:\Tools\x.ps1 -DryRun' | Should -Be 'C:\Tools\x.ps1'
+    }
+
+    It '没有 -File 时返回空' {
+        Get-TaskScriptPath -Arguments '-NoProfile -Command "x"' | Should -Be ''
+    }
+}

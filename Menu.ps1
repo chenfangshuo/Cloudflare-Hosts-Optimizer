@@ -10,7 +10,7 @@
       打开 Menu.ps1 -ElevatedKey <key>，子窗口跑完按 Enter 自动关闭。
 #>
 [CmdletBinding()]
-param([string]$Action, [string]$ElevatedArgs)
+param([string]$Action, [switch]$Elevated, [string]$ElevatedArgs)
 
 $ErrorActionPreference = 'Stop'
 $Root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -106,8 +106,7 @@ function Invoke-Child {
 function Invoke-Elevated {
     param([string[]]$Arguments = @())
     $menuScript = Join-Path $Root 'Menu.ps1'
-    $joined = ($Arguments -join ' ')
-    $argLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ElevatedArgs "{1}"' -f $menuScript, $joined
+    $argLine = New-ElevatedArgumentLine -MenuScript $menuScript -Arguments $Arguments
     Write-Host '会先弹出 UAC；请在管理员窗口中查看进度，结束后按 Enter 关闭该窗口。' -ForegroundColor Yellow
     try {
         Start-Process -FilePath $script:Pwsh -Verb RunAs -Wait -WorkingDirectory $Root -ArgumentList $argLine
@@ -454,13 +453,13 @@ function Invoke-Choice {
     return $true
 }
 
-if ($Action -and $ElevatedArgs) {
-    Write-Host '-Action 和 -ElevatedArgs 不能同时使用。' -ForegroundColor Red
+if ($Action -and $Elevated) {
+    Write-Host '-Action 和 -Elevated 不能同时使用。' -ForegroundColor Red
     exit 2
 }
 
 # 提权子窗口专用：跑完指定参数后提示按 Enter，窗口随即关闭
-if ($ElevatedArgs) {
+if ($Elevated) {
     $runArgs = @($ElevatedArgs -split '\s+' | Where-Object { $_ })
     $argsLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $MainScript
     $extra = ConvertTo-ArgumentString -Arguments $runArgs

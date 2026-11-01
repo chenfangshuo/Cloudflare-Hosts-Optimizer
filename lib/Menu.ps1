@@ -93,6 +93,18 @@ function Get-MenuActionSpec {
     return @(Get-MenuItems -Menu $Menu | Where-Object { $_.Key -eq $k })[0]
 }
 
+# 提权子窗口的命令行。用显式 -Elevated 开关：正式写入没有参数，不能靠
+# "-ElevatedArgs 非空" 来判断。
+function New-ElevatedArgumentLine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$MenuScript,
+        [AllowEmptyCollection()][string[]]$Arguments = @()
+    )
+    $joined = ($Arguments -join ' ')
+    return '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Elevated -ElevatedArgs "{1}"' -f $MenuScript, $joined
+}
+
 # 生成一屏文字；每项前面显示序号（1-9 可直达）。选中样式由 Menu.ps1 负责。
 function Format-MenuFrame {
     [CmdletBinding()]

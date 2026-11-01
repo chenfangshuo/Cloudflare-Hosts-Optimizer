@@ -218,6 +218,18 @@ function Get-CfstDoctorInfo {
     return $result
 }
 
+# 从计划任务的 Arguments 里取出 -File 指向的脚本路径。
+# 先按双引号解析（路径可能含空格），再退回不带引号的形式。
+function Get-TaskScriptPath {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Arguments = '')
+    if (-not $Arguments) { return '' }
+    $m = [regex]::Match($Arguments, '-File\s+"([^"]+)"')
+    if (-not $m.Success) { $m = [regex]::Match($Arguments, '-File\s+(\S+)') }
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
 function Get-ScheduledTaskDoctorInfo {
     [CmdletBinding()]
     param([string]$NamePattern = 'Cloudflare-Hosts-Optimizer*')
@@ -236,8 +248,7 @@ function Get-ScheduledTaskDoctorInfo {
             if ($act.Count -gt 0) { $exec = [string]$act[0].Execute; $argText = [string]$act[0].Arguments }
         } catch { }
         # 任务注册后移动过目录时，任务仍指向旧路径，会静默失效
-        $m = [regex]::Match($argText, '-File\s+"?([^"\s]+)"?')
-        $scriptPath = if ($m.Success) { $m.Groups[1].Value } else { '' }
+        $scriptPath = Get-TaskScriptPath -Arguments $argText
         [pscustomobject]@{
             TaskName     = $t.TaskName
             State        = [string]$t.State

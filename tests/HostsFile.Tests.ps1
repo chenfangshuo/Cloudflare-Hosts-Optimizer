@@ -227,6 +227,13 @@ Describe '写入与回滚' {
         $new = Join-Path $backupDir 'hosts-20260201-000000-bbbbbbbb.bak'
         [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
+        foreach ($f in @($old, $new)) {
+            $mf = @{
+                hostsPath = $tmp
+                preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($f))
+            }
+            [IO.File]::WriteAllText("$f.json", ($mf | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        }
         # 故意把新备份的 LastWriteTime 设得更早
         (Get-Item $new).LastWriteTime = (Get-Date).AddYears(-1)
 
@@ -245,8 +252,14 @@ Describe '写入与回滚' {
         $bakB = Join-Path $dir 'hosts-20260201-000000-bbbbbbbb.bak'
         [IO.File]::WriteAllText($bakA, "backup-a`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText($bakB, "backup-b`r`n", [Text.ASCIIEncoding]::new())
-        [IO.File]::WriteAllText("$bakA.json", (@{ hostsPath = $hostsA } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-        [IO.File]::WriteAllText("$bakB.json", (@{ hostsPath = $hostsB } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$bakA.json", (@{
+                    hostsPath = $hostsA
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bakA))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText("$bakB.json", (@{
+                    hostsPath = $hostsB
+                    preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bakB))
+                } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
         Invoke-HostsRollback -HostsPath $hostsB -BackupDir $dir | Out-Null
         (Get-Content $hostsB -Raw).Trim() | Should -Be 'backup-b'
@@ -263,7 +276,11 @@ Describe '写入与回滚' {
         [IO.File]::WriteAllText($old, "old`r`n", [Text.ASCIIEncoding]::new())
         [IO.File]::WriteAllText($new, "new`r`n", [Text.ASCIIEncoding]::new())
         foreach ($f in @($old, $new)) {
-            [IO.File]::WriteAllText("$f.json", (@{ hostsPath = $tmp } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+            $mf = @{
+                hostsPath = $tmp
+                preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($f))
+            }
+            [IO.File]::WriteAllText("$f.json", ($mf | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
         }
 
         Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $old | Out-Null
@@ -309,5 +326,76 @@ Describe '写入与回滚' {
         $w = Write-HostsDocument -Document $doc -Update $u -BackupDir $backupDir -Version 'test'
         $w.Changed | Should -BeFalse
         @(Get-ChildItem $backupDir -Filter 'hosts-*.bak').Count | Should -Be 0
+    }
+}
+
+Describe '事务与回滚校验（评审修复）' {
+    It 'OriginalHash 来自读取时的字节快照' {
+        $tmp = Join-Path $TestDrive 'snap.txt'
+        New-HostsFixture $tmp
+        $doc = Read-HostsDocument -Path $tmp
+        $doc.OriginalHash | Should -Be (Get-Sha256Hex -Bytes $doc.Bytes)
+        Add-Content -LiteralPath $tmp -Value '# changed after read' -Encoding ascii
+        $doc.OriginalHash | Should -Be (Get-Sha256Hex -Bytes $doc.Bytes)
+        $doc.OriginalHash | Should -Not -Be (Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($tmp)))
+    }
+
+    It 'UTF-8 BOM 在写入后保留' {
+        $tmp = Join-Path $TestDrive 'bom-write.txt'
+        $lines = "127.0.0.1 localhost`r`n203.0.113.10 cf.example.net`r`n"
+        $bytes = [byte[]](0xEF, 0xBB, 0xBF) + [Text.Encoding]::UTF8.GetBytes($lines)
+        [IO.File]::WriteAllBytes($tmp, $bytes)
+        $doc = Read-HostsDocument -Path $tmp
+        $u = Update-HostsDocument -Document $doc -VerifiedMap @{ 'cf.example.net' = @('10.0.0.1') } -ManagedDomains $script:AllDomains
+        $backupDir = Join-Path $TestDrive 'backup-bom'
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+        $null = Write-HostsDocument -Document $doc -Update $u -BackupDir $backupDir -Version 'test'
+        $after = [IO.File]::ReadAllBytes($tmp)
+        $after[0] | Should -Be 0xEF
+        $after[1] | Should -Be 0xBB
+        $after[2] | Should -Be 0xBF
+    }
+
+    It '备份内容与 preHash 不一致时拒绝回滚' {
+        $tmp = Join-Path $TestDrive 'rb-corrupt.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-corrupt'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-aaaaaaaa.bak'
+        [IO.File]::WriteAllText($bak, "good`r`n", [Text.ASCIIEncoding]::new())
+        $pre = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+        [IO.File]::WriteAllText($bak, "corrupted`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{ hostsPath = $tmp; preHash = $pre } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir } | Should -Throw '*不一致*'
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'current'
+    }
+
+    It '-BackupPath 时也检查 postHash，-Force 才覆盖' {
+        $tmp = Join-Path $TestDrive 'rb-post.txt'
+        [IO.File]::WriteAllText($tmp, "changed`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-post'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-bbbbbbbb.bak'
+        [IO.File]::WriteAllText($bak, "restored`r`n", [Text.ASCIIEncoding]::new())
+        $mf = @{
+            hostsPath = $tmp
+            preHash   = Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($bak))
+            postHash  = Get-Sha256Hex -Bytes ([Text.Encoding]::ASCII.GetBytes("something else`r`n"))
+        }
+        [IO.File]::WriteAllText("$bak.json", ($mf | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $bak } | Should -Throw '*修改过*'
+        Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $bak -Force | Out-Null
+        (Get-Content $tmp -Raw).Trim() | Should -Be 'restored'
+    }
+
+    It 'manifest 缺少 preHash 的备份被拒绝' {
+        $tmp = Join-Path $TestDrive 'rb-nopre.txt'
+        [IO.File]::WriteAllText($tmp, "current`r`n", [Text.ASCIIEncoding]::new())
+        $dir = Join-Path $TestDrive 'backup-nopre'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $bak = Join-Path $dir 'hosts-20260101-000000-cccccccc.bak'
+        [IO.File]::WriteAllText($bak, "x`r`n", [Text.ASCIIEncoding]::new())
+        [IO.File]::WriteAllText("$bak.json", (@{ hostsPath = $tmp } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        { Invoke-HostsRollback -HostsPath $tmp -BackupDir $dir -BackupPath $bak } | Should -Throw '*preHash*'
     }
 }

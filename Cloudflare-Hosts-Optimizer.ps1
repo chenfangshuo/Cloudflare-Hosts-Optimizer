@@ -196,7 +196,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5.2'
+$ScriptVersion = '0.5.3'
 # 脚本级参数在 Invoke-Main 里取不到 $PSBoundParameters，提前记下来：
 # 用户显式给的 -ProbeUrl 失败时不自动回退到备用端点；-InstallTask 用它决定透传哪些参数。
 $script:ScriptBoundParameters = @{}
@@ -1034,6 +1034,7 @@ function Invoke-Main {
                 $confirm = Resolve-SwitchConfirmation -BaseTtfb $baseline.Ttfb -BestTtfb $best[0].Ttfb `
                     -BaseSamples $baseSamples -CandidateSamples $candSamples `
                     -CandidateFlaky:(-not $c2.Ok) -BaselineRetestFailed:(-not $b2.Ok) `
+                    -BaselineClass $b2.Class -CandidateClass $c2.Class `
                     -Reason $decision.Reason `
                     -MinImprovementPct $MinImprovementPct -MinImprovementMs $MinImprovementMs
 

@@ -292,3 +292,36 @@ Describe 'Get-CfstInstallState' {
         (Get-CfstInstallState -Destination $dest).Installed | Should -BeTrue
     }
 }
+
+Describe 'Test-Ipv4Cidr / ip.txt 严格校验' {
+    It '接受合法 CIDR' {
+        Test-Ipv4Cidr -Text '173.245.48.0/20' | Should -BeTrue
+        Test-Ipv4Cidr -Text '0.0.0.0/0' | Should -BeTrue
+        Test-Ipv4Cidr -Text '255.255.255.255/32' | Should -BeTrue
+    }
+
+    It '拒绝越界八位组和前缀' {
+        Test-Ipv4Cidr -Text '999.999.999.999/99' | Should -BeFalse
+        Test-Ipv4Cidr -Text '1.2.3.256/24' | Should -BeFalse
+        Test-Ipv4Cidr -Text '1.2.3.4/33' | Should -BeFalse
+        Test-Ipv4Cidr -Text '1.2.3/24' | Should -BeFalse
+    }
+
+    It 'ip.txt 所有非注释行都合法才通过' {
+        $p = Join-Path $TestDrive 'ip-ok.txt'
+        Set-Content -LiteralPath $p -Value @('# ranges', '173.245.48.0/20', '', '104.16.0.0/13') -Encoding ascii
+        Test-CfstIpListFile -Path $p | Should -BeTrue
+    }
+
+    It '混入一行非法就整体拒绝' {
+        $p = Join-Path $TestDrive 'ip-mixed.txt'
+        Set-Content -LiteralPath $p -Value @('173.245.48.0/20', '999.999.999.999/99') -Encoding ascii
+        Test-CfstIpListFile -Path $p | Should -BeFalse
+    }
+
+    It '空文件或只有注释时拒绝' {
+        $p = Join-Path $TestDrive 'ip-empty.txt'
+        Set-Content -LiteralPath $p -Value @('# nothing') -Encoding ascii
+        Test-CfstIpListFile -Path $p | Should -BeFalse
+    }
+}

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.3 - 2026-11-01
+
+### Fixed
+
+- hosts 的 `OriginalHash` 改为直接由已读到的字节计算，避免读取后文件被改时提交检查误判。
+- 回滚与写入共用全局互斥锁；恢复前校验备份 SHA256 与 manifest 的 `preHash`，恢复后读回校验；
+  `-BackupPath` 也会检查当前 hosts 的 `postHash`；缺 `hostsPath`/`preHash` 的 manifest
+  不再参与自动回滚，无 manifest 的旧备份只允许从 legacy 目录恢复。
+- 普通权限点「正式写入」时参数为空，不会再打开另一个菜单：提权改为显式 `-Elevated` 开关。
+- 去掉 `SHA256.HashData` / `Convert.ToHexString`，兼容声明的 PowerShell 7.0。
+- HEAD 403/503 的诊断 GET 失败或拿到空响应时，该 IP 判为 `unverified`（不可用），
+  避免漏过 1034 受限 IP。
+- 切换复核同时比较类别：候选从 ok 退化为 waf 时不再切换。
+- 带 BOM 的 hosts 写入后保留 BOM。
+- CFST 安装器逐行校验 IPv4 CIDR（四段 ≤255、前缀 0–32），任一行非法即拒绝。
+- Doctor 能正确解析带空格/引号的计划任务脚本路径。
+
 ## 0.5.2 - 2026-11-01
 
 ### Changed

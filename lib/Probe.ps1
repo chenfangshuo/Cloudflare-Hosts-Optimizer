@@ -595,6 +595,33 @@ function Get-CfErrorClass {
     return ''
 }
 
+# 按 HEAD 状态和诊断响应判断单个 IP 对该域名的可用类别。
+# unverified 表示 HEAD 403 但诊断请求没拿到可用响应，不能当作可用。
+function Get-DomainProbeClass {
+    [CmdletBinding()]
+    param(
+        [int]$HeadExit = 0,
+        [AllowEmptyString()][string]$HeadHttp = '',
+        [bool]$RemoteOk = $true,
+        [int]$DiagExit = -1,
+        [AllowEmptyString()][string]$DiagHttp = '',
+        [AllowEmptyString()][string]$Body = ''
+    )
+    if ($HeadExit -ne 0 -or -not $RemoteOk) { return 'bad' }
+    switch -Regex ($HeadHttp) {
+        '^(200|204|301|302|303|307|308|401)$' { return 'ok' }
+        '^(403|503)$' {
+            $diagOk = ($DiagExit -eq 0 -and $DiagHttp -in @('200', '206', '403', '503'))
+            if (-not $diagOk -or -not $Body) { return 'unverified' }
+            $cf = Get-CfErrorClass -Body $Body
+            if ($cf -eq 'restricted') { return 'restricted' }
+            if ($HeadHttp -eq '403') { return 'waf' }
+            return 'bad'
+        }
+        default { return 'bad' }
+    }
+}
+
 # 可接受的 HTTP 状态：2xx/3xx + 401/403（登录墙/WAF）
 # 但 403/503 会进一步取响应体，排除 CF 的 Edge IP Restricted。
 function Test-DomainIp {
@@ -611,35 +638,34 @@ function Test-DomainIp {
     $r = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" -Resolve $resolveArg -Head -MaxTime $MaxTime
 
     $remoteOk = $NoResolve -or ($Ip -and $r.RemoteIp -eq $Ip)
-    $class = 'bad'
-    if ($r.ExitCode -eq 0 -and $remoteOk) {
-        switch -Regex ($r.Http) {
-            '^(200|204|301|302|303|307|308|401)$' { $class = 'ok' }
-            '^(403|503)$' {
-                $tmp = Join-Path ([IO.Path]::GetTempPath()) ('cf-body-' + [guid]::NewGuid().ToString('N') + '.txt')
-                try {
-                    $null = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" `
-                        -Resolve $resolveArg -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191' -MaxFileSize 65536
-                    $body = ''
-                    if (Test-Path -LiteralPath $tmp) {
-                        # 只读前 16KB，避免错误页异常大时占用内存
-                        $bytes = [IO.File]::ReadAllBytes($tmp)
-                        $take = [math]::Min($bytes.Length, 16384)
-                        if ($take -gt 0) { $body = [Text.Encoding]::UTF8.GetString($bytes, 0, $take) }
-                    }
-                    $cf = Get-CfErrorClass -Body $body
-                    if ($cf -eq 'restricted') { $class = 'restricted' }
-                    elseif ($r.Http -eq '403') { $class = 'waf' }
-                    else { $class = 'bad' }
-                } catch {
-                    if ($r.Http -eq '403') { $class = 'waf' } else { $class = 'bad' }
-                } finally {
-                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-                }
+    $diagExit = -1
+    $diagHttp = ''
+    $body = ''
+
+    if ($r.ExitCode -eq 0 -and $remoteOk -and $r.Http -match '^(403|503)$') {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('cf-body-' + [guid]::NewGuid().ToString('N') + '.txt')
+        try {
+            $diag = Invoke-CurlProbe -CurlExe $CurlExe -Url "https://$Domain/" `
+                -Resolve $resolveArg -MaxTime ([math]::Min($MaxTime, 6)) -Output $tmp -Range '0-8191' -MaxFileSize 65536
+            $diagExit = $diag.ExitCode
+            $diagHttp = $diag.Http
+            if ($diagExit -eq 0 -and $diagHttp -in @('200', '206', '403', '503') -and (Test-Path -LiteralPath $tmp)) {
+                # 只读前 16KB，避免错误页异常大时占用内存
+                $bytes = [IO.File]::ReadAllBytes($tmp)
+                $take = [math]::Min($bytes.Length, 16384)
+                if ($take -gt 0) { $body = [Text.Encoding]::UTF8.GetString($bytes, 0, $take) }
             }
-            default { $class = 'bad' }
+        } catch {
+            $diagExit = -1
+            $diagHttp = ''
+            $body = ''
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
     }
+
+    $class = Get-DomainProbeClass -HeadExit $r.ExitCode -HeadHttp $r.Http -RemoteOk $remoteOk `
+        -DiagExit $diagExit -DiagHttp $diagHttp -Body $body
 
     $ok = ($class -in @('ok', 'waf'))
     return [pscustomobject]@{
@@ -739,6 +765,7 @@ function Get-ReasonText {
         'baseline-failed-on-retest' = '复核时基线失败'
         'confirmed-class'         = '复核确认（状态）'
         'not-confirmed'           = '复核未通过'
+        'candidate-degraded'      = '复核时候选变差'
         'confirmed'               = '复核确认'
         'dns'                     = '交还 DNS'
     }
@@ -780,6 +807,17 @@ function Get-PreviousAction {
     return 'keep-unreachable'
 }
 
+# 类别优先级：ok 最好，waf 次之，restricted/bad/unverified 最差
+function Get-CfClassRank {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Class = '')
+    switch ($Class) {
+        'ok' { return 0 }
+        'waf' { return 1 }
+        default { return 2 }
+    }
+}
+
 # 切换前复核：只比较"基线"和"准备切换到的那个候选"，不再在全部候选里重选；
 # 候选任意一次复测失败都不切换。
 function Resolve-SwitchConfirmation {
@@ -791,6 +829,8 @@ function Resolve-SwitchConfirmation {
         [AllowEmptyCollection()][double[]]$CandidateSamples = @(),
         [switch]$CandidateFlaky,
         [switch]$BaselineRetestFailed,
+        [AllowEmptyString()][string]$BaselineClass = '',
+        [AllowEmptyString()][string]$CandidateClass = '',
         [ValidateSet('improved', 'better-class', 'baseline-no-ttfb', 'baseline-failed')][string]$Reason = 'improved',
         [ValidateRange(0, 100)][int]$MinImprovementPct = 15,
         [ValidateRange(0, 5000)][int]$MinImprovementMs = 30
@@ -801,6 +841,11 @@ function Resolve-SwitchConfirmation {
     }
     if ($BaselineRetestFailed) {
         return [pscustomobject]@{ Switch = $true; Reason = 'baseline-failed-on-retest'; Pct = $null; BaseMs = $null; BestMs = $null }
+    }
+    # 复核时候选类别比基线差（例如 ok -> waf）：不切换
+    if ($BaselineClass -and $CandidateClass -and
+        (Get-CfClassRank -Class $CandidateClass) -gt (Get-CfClassRank -Class $BaselineClass)) {
+        return [pscustomobject]@{ Switch = $false; Reason = 'candidate-degraded'; Pct = $null; BaseMs = $null; BestMs = $null }
     }
     if ($Reason -ne 'improved') {
         return [pscustomobject]@{ Switch = $true; Reason = 'confirmed-class'; Pct = $null; BaseMs = $null; BestMs = $null }

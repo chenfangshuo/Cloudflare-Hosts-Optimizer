@@ -480,3 +480,59 @@ Describe 'Get-ReasonText / Get-ActionText' {
         Get-ActionText -Action '' | Should -Be ''
     }
 }
+
+Describe 'Get-DomainProbeClass' {
+    It '2xx/3xx/401 是 ok' {
+        foreach ($h in @('200', '204', '301', '302', '303', '307', '308', '401')) {
+            Get-DomainProbeClass -HeadHttp $h | Should -Be 'ok'
+        }
+    }
+
+    It 'HEAD 403 + 诊断超时 -> unverified' {
+        Get-DomainProbeClass -HeadHttp 403 -DiagExit 28 -DiagHttp '000' | Should -Be 'unverified'
+    }
+
+    It 'HEAD 403 + 空 body -> unverified' {
+        Get-DomainProbeClass -HeadHttp 403 -DiagExit 0 -DiagHttp 403 -Body '' | Should -Be 'unverified'
+    }
+
+    It 'HEAD 403 + 1034 body -> restricted' {
+        Get-DomainProbeClass -HeadHttp 403 -DiagExit 0 -DiagHttp 403 -Body 'error code: 1034' | Should -Be 'restricted'
+    }
+
+    It 'HEAD 403 + 普通页 -> waf' {
+        Get-DomainProbeClass -HeadHttp 403 -DiagExit 0 -DiagHttp 403 -Body '<html>403 Forbidden</html>' | Should -Be 'waf'
+    }
+
+    It 'HEAD 503 + 非限制页 -> bad' {
+        Get-DomainProbeClass -HeadHttp 503 -DiagExit 0 -DiagHttp 503 -Body '<html>503</html>' | Should -Be 'bad'
+    }
+
+    It 'HEAD 失败或 remote 不匹配 -> bad' {
+        Get-DomainProbeClass -HeadExit 28 -HeadHttp '000' | Should -Be 'bad'
+        Get-DomainProbeClass -HeadHttp 200 -RemoteOk $false | Should -Be 'bad'
+    }
+}
+
+Describe 'Get-CfClassRank / 复核降级' {
+    It '类别排序' {
+        Get-CfClassRank -Class 'ok' | Should -Be 0
+        Get-CfClassRank -Class 'waf' | Should -Be 1
+        Get-CfClassRank -Class 'bad' | Should -Be 2
+        Get-CfClassRank -Class 'unverified' | Should -Be 2
+    }
+
+    It '候选复核变差时拒绝切换' {
+        $r = Resolve-SwitchConfirmation -BaseTtfb 0.5 -BestTtfb 0.2 -BaselineClass 'ok' -CandidateClass 'waf'
+        $r.Switch | Should -BeFalse
+        $r.Reason | Should -Be 'candidate-degraded'
+    }
+
+    It '基线复测失败时仍然切换' {
+        (Resolve-SwitchConfirmation -BaseTtfb 0.5 -BestTtfb 0.5 -BaselineRetestFailed -BaselineClass 'bad' -CandidateClass 'waf').Switch | Should -BeTrue
+    }
+
+    It '候选类别更好时按原逻辑确认' {
+        (Resolve-SwitchConfirmation -BaseTtfb 0.5 -BestTtfb 0.5 -BaselineClass 'waf' -CandidateClass 'ok' -Reason 'better-class').Switch | Should -BeTrue
+    }
+}

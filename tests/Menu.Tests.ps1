@@ -191,3 +191,17 @@ Describe 'Format-MenuFrame' {
         @(Format-MenuFrame -Header @() -Items $items -Footer '').Count | Should -Be 2
     }
 }
+
+Describe 'New-ElevatedArgumentLine' {
+    It '空参数（正式写入）也带 -Elevated' {
+        $line = New-ElevatedArgumentLine -MenuScript 'C:\My Tools\Menu.ps1'
+        $line | Should -Match '-Elevated '
+        $line | Should -Match '-ElevatedArgs ""'
+        $line.Contains('"C:\My Tools\Menu.ps1"') | Should -BeTrue
+    }
+
+    It '参数按顺序拼接' {
+        $line = New-ElevatedArgumentLine -MenuScript 'C:\Menu.ps1' -Arguments @('-InstallTask', '-TaskMode', 'AutoApply')
+        $line | Should -Match '-ElevatedArgs "-InstallTask -TaskMode AutoApply"'
+    }
+}

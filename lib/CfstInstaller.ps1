@@ -195,16 +195,32 @@ function Test-CfstExecutableFile {
     }
 }
 
+# 校验单个 IPv4 CIDR：四段 0–255，前缀 0–32
+function Test-Ipv4Cidr {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text = '')
+    $m = [regex]::Match($Text.Trim(), '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$')
+    if (-not $m.Success) { return $false }
+    for ($i = 1; $i -le 4; $i++) {
+        if ([int]$m.Groups[$i].Value -gt 255) { return $false }
+    }
+    $prefix = [int]$m.Groups[5].Value
+    return ($prefix -ge 0 -and $prefix -le 32)
+}
+
 function Test-CfstIpListFile {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $count = 0
     foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
         $t = $line.Trim()
         if (-not $t -or $t.StartsWith('#')) { continue }
-        if ($t -match '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') { return $true }
+        # 任何一条非注释行不合法就整体拒绝，不能靠“有一行能匹配”通过
+        if (-not (Test-Ipv4Cidr -Text $t)) { return $false }
+        $count++
     }
-    return $false
+    return ($count -gt 0)
 }
 
 # 只解根级 cfst.exe 和 ip.txt；校验通过后才移进目标目录。
