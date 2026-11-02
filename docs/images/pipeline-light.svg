@@ -12,31 +12,31 @@
   <text class="num" x="75" y="26" text-anchor="middle">1</text>
   <rect class="box" x="21" y="36" width="108" height="60" rx="8"/>
   <text class="lbl" x="75" y="71" text-anchor="middle">延迟筛选</text>
-  <polygon class="arrow" points="136,66 143,61 143,71"/>
+  <polygon class="arrow" points="136,61 136,71 143,66"/>
 
   <!-- 2 -->
   <text class="num" x="197" y="26" text-anchor="middle">2</text>
   <rect class="box" x="143" y="36" width="108" height="60" rx="8"/>
   <text class="lbl" x="197" y="71" text-anchor="middle">机房分层抽样</text>
-  <polygon class="arrow" points="258,66 265,61 265,71"/>
+  <polygon class="arrow" points="258,61 258,71 265,66"/>
 
   <!-- 3 -->
   <text class="num" x="319" y="26" text-anchor="middle">3</text>
   <rect class="box" x="265" y="36" width="108" height="60" rx="8"/>
   <text class="lbl" x="319" y="71" text-anchor="middle">吞吐初赛/决赛</text>
-  <polygon class="arrow" points="380,66 387,61 387,71"/>
+  <polygon class="arrow" points="380,61 380,71 387,66"/>
 
   <!-- 4 -->
   <text class="num" x="441" y="26" text-anchor="middle">4</text>
   <rect class="box" x="387" y="36" width="108" height="60" rx="8"/>
   <text class="lbl" x="441" y="71" text-anchor="middle">逐域名验证</text>
-  <polygon class="arrow" points="502,66 509,61 509,71"/>
+  <polygon class="arrow" points="502,61 502,71 509,66"/>
 
   <!-- 5 -->
   <text class="num" x="563" y="26" text-anchor="middle">5</text>
   <rect class="box" x="509" y="36" width="108" height="60" rx="8"/>
   <text class="lbl" x="563" y="71" text-anchor="middle">写入 hosts</text>
-  <polygon class="arrow" points="624,66 631,61 631,71"/>
+  <polygon class="arrow" points="624,61 624,71 631,66"/>
 
   <!-- 6 -->
   <text class="num" x="697" y="26" text-anchor="middle">随时</text>
