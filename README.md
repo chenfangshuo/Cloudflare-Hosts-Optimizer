@@ -59,7 +59,7 @@ curl.exe -sI https://example.com | findstr /i "server:"
 1. 第一次运行约 **8–15 分钟**；写入 hosts 需要管理员权限；**hosts 只影响本机**，不改变站点
    看到的来源，也不影响 P2P 和 IPv6 对等连接。
 2. 每次运行只对每个站点发少量首页 **HEAD**（只取响应头，不下载页面），典型 6–10 次、最坏
-   11 次，准备切换时同一 IP 最多 2 次，间隔 400ms，不建议调高。脚本**不登录、不带 Cookie、
+   11 次，同一个边缘 IP 最多 2 次，间隔 400ms，不建议调高。脚本**不登录、不带 Cookie、
    不读 passkey、不访问 announce、不连 tracker 端口**，批量测速只打 `speed.cloudflare.com`；
    **只处理你写进 `domains.txt` 的域名，不会自动发现或爬取站点**。
    **DryRun 也会真实请求一轮**：紧接着再正式写入，等于每个站点被请求两次、风险翻倍。确认
@@ -78,7 +78,7 @@ curl.exe -sI https://example.com | findstr /i "server:"
    （`example.com/announce.php`）分不开，只能靠定期重跑和回滚兜底。
    [为什么](docs/faq.md#要不要把-tracker-域名加进-domainstxt)。
 
-完整规则与请求预算见 [工作原理与安全机制](docs/design.md#安全与请求预算)。
+完整规则与请求预算见 [安全边界](docs/design.md#安全边界) 与 [请求预算](docs/design.md#请求预算)。
 
 ## 运行效果
 

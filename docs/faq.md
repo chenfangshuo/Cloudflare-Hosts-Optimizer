@@ -45,7 +45,7 @@
 前提是这些域名在代理旁路里；脚本会检查 WinINET 的 `ProxyOverride`，缺失时报警，也会检测
 TUN。但它无法完整识别 PAC/WPAD、WinHTTP、应用级代理和 WFP 透明转发。请不要用 VPN、机场、
 在线优选网站或公共反向代理访问 PT。完整边界见
-[design.md 的安全与请求预算](design.md#安全与请求预算)。具体规则以各站为准。
+[design.md 的请求预算](design.md#请求预算)。具体规则以各站为准。
 
 ## 要不要把 tracker 域名加进 domains.txt？
 

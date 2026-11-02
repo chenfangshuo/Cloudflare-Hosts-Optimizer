@@ -213,7 +213,8 @@ Cloudflare-Hosts-Optimizer\
 - 延迟扫描：每个候选几十字节的 trace 请求。
 - 吞吐初测：32 × 1MB ≈ 32MB；决赛 6 × 3 × 2MB ≈ 36MB。
 - 站点验证：每域名典型 6–10 次、最坏 11 次 HEAD；每个返回 403/503 的 HEAD 都可能再补
-  1 次 ≤64KB 的 GET（不是整域名只补一次）。同一物理 IP 最多 2 次 HEAD。
+  1 次 ≤64KB 的 GET（不是整域名只补一次）。同一个 CF 边缘 IP 最多 2 次 HEAD。完整计算见
+  [请求预算](design.md#请求预算)。
 
 合计约 **70MB**，可用 `-ThroughputCandidates`、`-ThroughputBytes`、`-RefineTop` 调整。
 

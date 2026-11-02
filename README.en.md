@@ -68,7 +68,7 @@ curl.exe -sI https://example.com | findstr /i "server:"
    **hosts only affects this machine** and does not change the origin the site sees, nor P2P or
    IPv6 peer connections.
 2. Each run sends only a handful of HEAD requests to each site (headers only, no page body):
-   typically 6–10, at most 11, at most twice per IP during the pre-switch check, 400ms apart —
+   typically 6–10, at most 11, at most twice per edge IP per domain, 400ms apart —
    do not raise it. The script **does not log in, send cookies, read passkeys, touch announce
    URLs or connect to tracker ports**; bulk speed tests only hit `speed.cloudflare.com`; **it
    only processes the domains in `domains.txt`** and never crawls or discovers sites.
@@ -92,7 +92,7 @@ curl.exe -sI https://example.com | findstr /i "server:"
    red. Same-host setups (`example.com/announce.php`) cannot be separated, so they rely on
    periodic re-runs and rollback. [Why](docs/faq.md#要不要把-tracker-域名加进-domainstxt).
 
-Full rules and the request budget: [design notes](docs/design.md#安全与请求预算) (Chinese).
+Full rules and the request budget: [security boundaries](docs/design.md#安全边界), [request budget](docs/design.md#请求预算) (Chinese).
 
 ## What a run looks like
 
