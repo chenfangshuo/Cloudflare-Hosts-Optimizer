@@ -11,6 +11,9 @@ CLAUDE.md
 # 本地 review 记录
 review-local.md
 
+# 本地私有导读（不公开）
+NOTES-FOR-OWNER.md
+
 # 运行产物
 backup/
 last-report.txt
